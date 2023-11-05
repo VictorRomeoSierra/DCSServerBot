@@ -4,7 +4,7 @@ import time
 from psycopg.rows import dict_row
 from contextlib import closing
 
-from core import EventListener, Server, event, chat_command, Player
+from core import EventListener, Server, event, chat_command, Player, DEFAULT_TAG
 
 
 class CsarEventListener(EventListener):
@@ -19,6 +19,11 @@ class CsarEventListener(EventListener):
     sample(data)
         Called whenever ".sample" is called in discord (see commands.py).
     """
+    @event(name="registerDCSServer")
+    async def registerDCSServer(self, server: Server, data: dict) -> None:
+        self.log.debug(f"CSAR: reading number of lives from csar.yaml")
+        self.lives = self.locals.get(DEFAULT_TAG, {}).get('lives')
+
 
     def get_csar_wounded(self) -> list[dict]:
         with self.pool.connection() as conn:
@@ -116,6 +121,13 @@ class CsarEventListener(EventListener):
             })
         return
 
+    @event(name="csarGetLives")
+    async def csarGetLives(self, server: Server, data: dict):
+        server.send_to_dcs({
+                'command': 'csarSetLives',
+                'data': self.lives
+            })
+
     @chat_command(name="csar", roles=['DCS Admin'], help="A sample command")
     async def csar(self, server: Server, player: Player, params: list[str]):
         player.sendChatMessage("This is a csar command!")
@@ -126,7 +138,9 @@ class CsarEventListener(EventListener):
         playername = data['playername']
         typename = data['typename']
         pilotname = data['pilotname']
-        ucid, name = self.bot.get_ucid_by_name(playername)
-        player: Player = server.get_player(id=ucid)
+        # ucid, name = self.bot.get_ucid_by_name(playername)
+        player: Player = server.get_player(name=playername, active=True)
+        # self.log.debug('player found? {}'.format(player))
         if player:
-            player.sendChatMessage("Your {} pilot has been rescued by {}".format(typename, pilotname))
+            self.log.debug('Message sent to {}'.format(playername))
+            player.sendChatMessage('Your {} pilot has been rescued by {}'.format(typename, pilotname))

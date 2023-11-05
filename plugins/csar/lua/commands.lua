@@ -37,3 +37,10 @@ function dcsbot.csarUpdatePersistentData(json)
     local script = 'dcsbot._csarUpdatePersistentData(' .. utils.basicSerialize(json.data) .. ')'  --, ' .. json.points .. '
     net.dostring_in('mission', 'a_do_script(' .. utils.basicSerialize(script) .. ')')
 end
+
+function dcsbot.csarSetLives(json)
+    log.write('DCSServerBot', log.DEBUG, 'CSAR: csarSetLives() (commands.lua)')
+    -- log.write('DCSServerBot', log.DEBUG, 'CSAR: data:' .. utils.basicSerialize(json.data))
+    local script = 'dcsbot._csarSetLives(' .. utils.basicSerialize(json.data) .. ')'  --, ' .. json.points .. '
+    net.dostring_in('mission', 'a_do_script(' .. utils.basicSerialize(script) .. ')')
+end

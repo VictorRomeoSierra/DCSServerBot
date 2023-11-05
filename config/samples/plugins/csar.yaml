@@ -1,0 +1,12 @@
+DEFAULT:
+  expire_after: 24 hours
+  lives:
+    DEFAULT: 8
+    SA342Mistral: 3
+    SA342Minigun: 3
+    SA342L: 3
+    SA342M: 3
+    UH-1H: 8
+    Mi-8MT: 3
+    UH-60L: 3
+    Mi-24P: 3

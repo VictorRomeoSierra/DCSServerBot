@@ -58,4 +58,19 @@ function dcsbot.rescuedPilot(playername, typename, pilotname)
 	dcsbot.sendBotTable(msg)
 end
 
+function dcsbot.csarGetLives(data)
+	log.write('DCSServerBot', log.DEBUG, 'CSAR: csarGetLives() (mission.lua)')
+	local msg = {}
+	msg.command = 'csarGetLives'
+  local json = net.lua2json(data)
+	msg.data = json
+	dcsbot.sendBotTable(msg)
+end
+
+function dcsbot._csarSetLives(json)
+	log.write('DCSServerBot', log.DEBUG, 'CSAR: _csarSetLives() (mission.lua)')
+	local lua = net.json2lua(json)
+	csar.setLives(lua)
+end
+
 env.info("DCSServerBot - CSAR: mission.lua loaded.")

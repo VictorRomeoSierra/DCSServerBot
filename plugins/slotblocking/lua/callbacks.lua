@@ -6,7 +6,7 @@ local config	= base.require("DCSServerBotConfig")
 local slotblock = slotblock or {}
 local slotsList = {}
 
-function dcsbot.blockSlot(playerName, typeName, block)
+function slotblock.blockSlot(playerName, typeName, block)
     if playerName and typeName and block then
         slotsList[playerName.."_"..typeName] = block
     end
