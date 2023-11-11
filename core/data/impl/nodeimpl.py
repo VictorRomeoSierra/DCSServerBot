@@ -293,7 +293,7 @@ class NodeImpl(Node):
     async def get_dcs_branch_and_version(self) -> Tuple[str, str]:
         with open(os.path.join(self.installation, 'autoupdate.cfg'), encoding='utf8') as cfg:
             data = json.load(cfg)
-        return data['branch'], data['version']
+        return data.get('branch', 'release'), data['version']
 
     async def update(self, warn_times: list[int]):
         async def shutdown_with_warning(server: Server):
@@ -407,6 +407,7 @@ class NodeImpl(Node):
         self._public_ip = self.locals.get('public_ip')
         if not self._public_ip:
             self._public_ip = await utils.get_public_ip()
+            self.log.info(f"- Public IP registered as: {self.public_ip}")
         if self.locals['DCS'].get('autoupdate', False):
             if not self.locals['DCS'].get('cloud', False) or self.master:
                 self.autoupdate.start()
@@ -593,7 +594,6 @@ class NodeImpl(Node):
                              os.path.join(instance.home, 'Config', 'SRS.cfg'))
         autoexec = Autoexec(instance=instance)
         autoexec.webgui_port = instance.webgui_port
-        autoexec.webrtc_port = instance.dcs_port + 1
         autoexec.crash_report_mode = "silent"
         with open('config/nodes.yaml') as infile:
             config = yaml.load(infile)

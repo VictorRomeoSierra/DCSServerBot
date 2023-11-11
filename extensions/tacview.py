@@ -31,7 +31,7 @@ class Tacview(Extension):
         return True
 
     async def shutdown(self) -> bool:
-        if self.locals.get('target'):
+        if self.config.get('target'):
             self.check_log.cancel()
         return await super().shutdown()
 
@@ -173,7 +173,7 @@ class Tacview(Extension):
             if not os.path.exists(logfile):
                 self.log_pos = 0
                 return
-            with open(logfile, encoding='utf-8') as file:
+            with open(logfile, encoding='utf-8', errors='ignore') as file:
                 # if we were started with an existing logfile, seek to the file end, else seek to the last position
                 if self.log_pos == -1:
                     file.seek(0, 2)

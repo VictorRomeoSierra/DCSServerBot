@@ -49,7 +49,7 @@ async def file_autocomplete(interaction: discord.Interaction, current: str) -> l
         choices: list[app_commands.Choice[str]] = [
             app_commands.Choice(name=os.path.basename(x), value=os.path.basename(x))
             for x in await server.node.list_directory(config['directory'].format(server=server), config['pattern'])
-            if not current or current.casefold() in x
+            if not current or current.casefold() in x.casefold()
         ]
         return choices[:25]
     except Exception as ex:
@@ -432,7 +432,6 @@ Please make sure you forward the following ports:
 ```
 - DCS Port:    {instance.dcs_port}
 - WebGUI Port: {instance.webgui_port}
-- VOIP Port:   {instance.dcs_port + 1}
 ```
             """, ephemeral=ephemeral)
             await self.bot.audit(f"added instance {instance.name} to node {node.name}.", user=interaction.user)
