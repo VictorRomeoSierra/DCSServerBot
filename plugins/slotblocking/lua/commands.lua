@@ -15,17 +15,6 @@ local utils 	= base.require("DCSServerBotUtils")
 --     utils.sendBotTable(msg, json.channel)
 -- end
 
-function dcsbot.blockSlot(playerName, typeName, block)
-    if playerName and typeName then
-        local msg = {}
-        msg.command = 'blockSlot'
-        msg.playerName = playerName
-        msg.typeName = typename
-        msg.block = block
-        utils.sendBotTable(msg)
-    end
-end
-
 function dcsbot._blockSlot(playerName, typeName, block)
     log.write('DCSServerBot', log.DEBUG, 'Slotblock: _blockSlot() (commands.lua)')
     -- log.write('DCSServerBot', log.DEBUG, 'CSAR: data:' .. utils.basicSerialize(json.data))

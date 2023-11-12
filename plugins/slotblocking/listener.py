@@ -196,9 +196,13 @@ class SlotBlockingListener(EventListener):
 
     @event(name="blockSlot")
     async def blockSlot(self, server: Server, data: dict) -> None:
+        block = data['block']
         server.send_to_dcs({
             'command': '_blockSlot',
             'playerName': data['playerName'],
             'typeName': data['typeName'],
-            'block': data['block']
+            'block': block
         })
+        if block:
+            player: CreditPlayer = cast(CreditPlayer, server.get_player(name=data['playerName']))
+            server.move_to_spectators(player)
