@@ -6,7 +6,6 @@ from contextlib import closing
 
 from core import EventListener, Server, event, chat_command, Player, DEFAULT_TAG
 
-
 class CsarEventListener(EventListener):
     """
     A class where your DCS events will be handled.
@@ -144,3 +143,18 @@ class CsarEventListener(EventListener):
         if player:
             self.log.debug('Message sent to {}'.format(playername))
             player.sendChatMessage('Your {} pilot has been rescued by {}'.format(typename, pilotname))
+    
+    @event(name="blockSlot")
+    async def blockSlot(self, server: Server, data: dict) -> None:
+        block = data['block']
+        self.log.debug('CSAR: blockSlot called: playerName {}, typeName {}, block {}'.format(data['playerName'], data['typeName'], block))
+        server.send_to_dcs({
+            'command': 'csarBlockSlot',
+            'playerName': data['playerName'],
+            'typeName': data['typeName'],
+            'block': block
+        })
+        if block:
+            self.log.debug('CSAR: attempting to move to spectators')
+            player: Player = server.get_player(name=data['playerName'], active=True)
+            server.move_to_spectators(player)

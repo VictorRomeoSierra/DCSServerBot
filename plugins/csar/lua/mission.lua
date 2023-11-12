@@ -73,4 +73,21 @@ function dcsbot._csarSetLives(json)
 	csar.setLives(lua)
 end
 
+function dcsbot.blockSlot(playerName, typeName, block)
+	log.write('DCSServerBot', log.DEBUG, 'CSAR: blockSlot() (mission.lua)')
+  if playerName and typeName then
+      local msg = {}
+      msg.command = 'blockSlot'
+      msg.playerName = playerName
+      msg.typeName = typeName
+      msg.block = block
+      dcsbot.sendBotTable(msg)
+  end
+end
+
+function dcsbot._blockSlot(playerName, typeName, block)
+	log.write('DCSServerBot', log.DEBUG, 'CSAR: _blockSlot() (mission.lua)')
+	slotblock.blockSlot(playerName, typeName, block) -- this better work
+end
+
 env.info("DCSServerBot - CSAR: mission.lua loaded.")

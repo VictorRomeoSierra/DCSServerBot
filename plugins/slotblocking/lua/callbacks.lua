@@ -129,13 +129,6 @@ end
 function slotblock.blockSlot(playerName, typeName, block)
 	log.write('DCSServerBot', log.DEBUG, 'CSAR: _blockSlot() (callbacks.lua)')
 	slotsList[playerName.."_"..typeName] = block
-    if block then 
-end
-
-function slotblock.onMissionLoadEnd()
-    log.write('DCSServerBot', log.DEBUG, 'Slotblock: onMissionLoadEnd() callbacks.lua')
-    net.dostring_in('mission', 'a_do_script("dofile(\\"' .. lfs.writedir():gsub('\\', '/') .. 'Scripts/net/DCSServerBot/DCSServerBot.lua' .. '\\")")')
-    net.dostring_in('mission', 'a_do_script("dofile(\\"' .. lfs.writedir():gsub('\\', '/') .. 'Scripts/net/DCSServerBot/slotblocking/mission.lua' .. '\\")")')
 end
 
 DCS.setUserCallbacks(slotblock)

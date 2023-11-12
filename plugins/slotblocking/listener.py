@@ -193,16 +193,3 @@ class SlotBlockingListener(EventListener):
             # give all players their credit back, if the mission ends, and they are still airborne
             for player in server.players.values():
                 player.deposit = 0
-
-    @event(name="blockSlot")
-    async def blockSlot(self, server: Server, data: dict) -> None:
-        block = data['block']
-        server.send_to_dcs({
-            'command': '_blockSlot',
-            'playerName': data['playerName'],
-            'typeName': data['typeName'],
-            'block': block
-        })
-        if block:
-            player: CreditPlayer = cast(CreditPlayer, server.get_player(name=data['playerName']))
-            server.move_to_spectators(player)
