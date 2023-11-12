@@ -7,7 +7,7 @@ local slotblock = slotblock or {}
 local slotsList = {}
 
 function slotblock.blockSlot(playerName, typeName, block)
-    if playerName and typeName and block then
+    if playerName and typeName then
         slotsList[playerName.."_"..typeName] = block
     end
 end
