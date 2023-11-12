@@ -6,12 +6,6 @@ local config	= base.require("DCSServerBotConfig")
 local slotblock = slotblock or {}
 local slotsList = {}
 
-function slotblock.blockSlot(playerName, typeName, block)
-    if playerName and typeName then
-        slotsList[playerName.."_"..typeName] = block
-    end
-end
-
 local function has_value(tab, value)
     if not tab then
         return false
@@ -130,6 +124,11 @@ function slotblock.onPlayerTryChangeSlot(playerID, side, slotID)
             end
         end
     end
+end
+
+function slotblock.blockSlot(playerName, typeName, block)
+	log.write('DCSServerBot', log.DEBUG, 'CSAR: _blockSlot() (callbacks.lua)')
+	slotsList[playerName.."_"..typeName] = block
 end
 
 DCS.setUserCallbacks(slotblock)
