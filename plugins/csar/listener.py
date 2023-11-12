@@ -157,4 +157,5 @@ class CsarEventListener(EventListener):
         if block:
             self.log.debug('CSAR: attempting to move to spectators')
             player: Player = server.get_player(name=data['playerName'], active=True)
-            server.move_to_spectators(player)
+            reason = 'Unfortunatley, you have no more lives for {} airframes.'.format(data['typeName'])
+            server.move_to_spectators(player, reason)
