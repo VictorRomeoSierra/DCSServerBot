@@ -87,7 +87,8 @@ class RestAPI(Plugin):
 						) 
 						 Where row_number = 1
 					) h on s.player_ucid = h.ucid
-                    GROUP BY 1, points, total_rescues, helicopterused ORDER BY points DESC LIMIT 10
+                    GROUP BY 1, points, total_rescues, helicopterused 
+                    ORDER BY total_rescues DESC LIMIT 10
                 """).fetchall()
 
     def topkdr(self):
