@@ -121,7 +121,10 @@ class Csar(Plugin):
                     GROUP BY typename
                     """,(ucid, )).fetchall()
                 for row in rows:
-                    lives[row[0]] = int(self.lives[row[0]]) - int(row[1])
+                    if self.lives[row[0]]:
+                        lives[row[0]] = int(self.lives[row[0]]) - int(row[1])
+                    else:
+                        lives[row[0]] = int(self.lives['DEFAULT']) - int(row[1])
         
         report = Report(self.bot, self.plugin_name, 'lives.json')
         env = await report.render(name=name, lives=lives)
