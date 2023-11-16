@@ -20,3 +20,4 @@ pywin32==306; sys_platform == 'win32'
 minidump==0.0.21; sys_platform == 'win32'
 ruamel.yaml==0.18.5
 trueskill==0.4.5
+requests==2.31.0
