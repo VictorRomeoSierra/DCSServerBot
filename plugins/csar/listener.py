@@ -122,6 +122,7 @@ class CsarEventListener(EventListener):
 
     @event(name="csarGetLives")
     async def csarGetLives(self, server: Server, data: dict):
+        self.log.debug('csarGetLives called, self.lives: {}'.format(str(self.lives)))
         server.send_to_dcs({
                 'command': 'csarSetLives',
                 'data': self.lives
