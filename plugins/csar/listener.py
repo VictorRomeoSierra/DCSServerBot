@@ -29,7 +29,8 @@ class CsarEventListener(EventListener):
         with self.pool.connection() as conn:
             with closing(conn.cursor(row_factory=dict_row)) as cursor:
                 return list(cursor.execute("""
-                    SELECT id, coalition, country, pos, coordinates, typename, unitname, playername, freq FROM csar_wounded WHERE datestamp > NOW() - INTERVAL '{}'
+                    SELECT id, coalition, country, pos, coordinates, typename, unitname, playername, freq 
+                    FROM csar_wounded WHERE datestamp > NOW() - INTERVAL '{}'
                 """.format(self.expire_after)).fetchall())
 
     # @event(name="registerDCSServer")
