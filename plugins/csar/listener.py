@@ -20,16 +20,20 @@ class CsarEventListener(EventListener):
     """
     @event(name="registerDCSServer")
     async def registerDCSServer(self, server: Server, data: dict) -> None:
+        self.expire_after = self.locals.get(DEFAULT_TAG, {}).get('expire_after')
         self.log.debug(f"CSAR: reading number of lives from csar.yaml")
         self.lives = self.locals.get(DEFAULT_TAG, {}).get('lives')
 
 
     def get_csar_wounded(self) -> list[dict]:
         with self.pool.connection() as conn:
+            with conn.transaction():
+                conn.execute(command)
+        with self.pool.connection() as conn:
             with closing(conn.cursor(row_factory=dict_row)) as cursor:
                 return list(cursor.execute("""
-                    SELECT id, coalition, country, pos, coordinates, typename, unitname, playername, freq FROM csar_wounded
-                """).fetchall())
+                    SELECT id, coalition, country, pos, coordinates, typename, unitname, playername, freq FROM csar_wounded WHERE datestamp > NOW() - INTERVAL '{}'
+                """.format(self.expire_after)).fetchall())
 
     # @event(name="registerDCSServer")
     # async def registerDCSServer(self, server: Server, data: dict) -> None:
