@@ -27,9 +27,6 @@ class CsarEventListener(EventListener):
 
     def get_csar_wounded(self) -> list[dict]:
         with self.pool.connection() as conn:
-            with conn.transaction():
-                conn.execute(command)
-        with self.pool.connection() as conn:
             with closing(conn.cursor(row_factory=dict_row)) as cursor:
                 return list(cursor.execute("""
                     SELECT id, coalition, country, pos, coordinates, typename, unitname, playername, freq FROM csar_wounded WHERE datestamp > NOW() - INTERVAL '{}'
