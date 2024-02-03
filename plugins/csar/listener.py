@@ -27,11 +27,15 @@ class CsarEventListener(EventListener):
 
     def get_csar_wounded(self) -> list[dict]:
         with self.pool.connection() as conn:
+            command = "DELETE FROM csar_wounded WHERE datestamp < NOW() - INTERVAL '{}'".format(self.expire_after)
+            # self.log.debug(command)
+            with self.pool.connection() as conn:
+                with conn.transaction():
+                    conn.execute(command)
             with closing(conn.cursor(row_factory=dict_row)) as cursor:
                 return list(cursor.execute("""
-                    SELECT id, coalition, country, pos, coordinates, typename, unitname, playername, freq 
-                    FROM csar_wounded WHERE datestamp > NOW() - INTERVAL '{}'
-                """.format(self.expire_after)).fetchall())
+                    SELECT id, coalition, country, pos, coordinates, typename, unitname, playername, freq FROM csar_wounded
+                    """.fetchall())
 
     # @event(name="registerDCSServer")
     # async def registerDCSServer(self, server: Server, data: dict) -> None:
