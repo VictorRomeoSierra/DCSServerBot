@@ -1,0 +1,18 @@
+{
+  "color": "blue",
+  "title": "Pilot lives for {name}",
+  "elements":
+  [
+    {
+      "type": "Table",
+      "params": {
+        "obj": "lives",
+        "values": {
+          "Mi-8MT": "Mi-8MT Lives",
+          "Mi-24P": "Mi-24P Lives",
+          "UH-1H": "UH-1H Lives"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+{
+  "color": "blue",
+  "title": "CSAR Rescues for {name}",
+  "elements":
+  [
+    {
+      "type": "Field",
+      "params": {
+        "name": "Rank",
+        "value": "{rank}",
+        "inline": false
+      }
+    },
+    {
+      "type": "SQLTable",
+      "params": {
+        "sql": "SELECT helicopterused as \"Rescue Helicopter\", SUM(savedpilots) as \"Number of Rescued Pilots\" FROM csar_events WHERE ucid = %(ucid)s GROUP BY helicopterused ORDER BY helicopterused"
+      }
+    },
+    {
+      "type": "SQLField",
+      "params": {
+        "sql": "SELECT SUM(savedpilots) as \"Total Rescued Pilots\" FROM csar_events WHERE ucid = %(ucid)s ",
+        "inline": false
+      }
+    }
+  ]
+}
