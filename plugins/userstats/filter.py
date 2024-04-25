@@ -1,53 +1,71 @@
+import discord
+
 from abc import ABC, abstractmethod
 from core import utils, Pagination, ReportEnv, const
+from discord import app_commands
 from services import DCSServerBot
-from typing import Any, Optional
+from typing import Any, Optional, Type
 
 
 class StatisticsFilter(ABC):
+    def __init__(self, period: Optional[str] = None):
+        self._period = period
+
+    @property
+    def period(self) -> str:
+        return self._period
+
+    @staticmethod
+    @abstractmethod
+    def list(bot: DCSServerBot) -> list[str]:
+        ...
+
     @staticmethod
     @abstractmethod
     def supports(bot: DCSServerBot, period: str) -> bool:
         ...
 
-    @staticmethod
     @abstractmethod
-    def filter(bot: DCSServerBot, period: str, server_name: Optional[str] = None) -> str:
+    def filter(self, bot: DCSServerBot) -> str:
         ...
 
-    @staticmethod
     @abstractmethod
-    def format(bot: DCSServerBot, period: str, server_name: Optional[str] = None) -> str:
+    def format(self, bot: DCSServerBot) -> str:
         ...
 
     @staticmethod
     def detect(bot: DCSServerBot, period: str) -> Any:
         if MissionFilter.supports(bot, period):
-            return MissionFilter
+            return MissionFilter(period)
         elif MissionIDFilter.supports(bot, period):
-            return MissionIDFilter
+            return MissionIDFilter(period)
         elif MonthFilter.supports(bot, period):
-            return MonthFilter
+            return MonthFilter(period)
         elif PeriodFilter.supports(bot, period):
-            return PeriodFilter
+            return PeriodFilter(period)
         elif CampaignFilter.supports(bot, period):
-            return CampaignFilter
-        elif MixedFilter.supports(bot, period):
-            return MixedFilter
+            return CampaignFilter(period)
+        elif SquadronFilter.supports(bot, period):
+            return SquadronFilter(period)
         return None
 
 
 class PeriodFilter(StatisticsFilter):
-    @staticmethod
-    def supports(bot: DCSServerBot, period: str) -> bool:
-        return (period and period.startswith('period:')) or period \
-               in ['all', 'day', 'week', 'month', 'year', 'today', 'yesterday']
 
     @staticmethod
-    def filter(bot: DCSServerBot, period: str, server_name: Optional[str] = None) -> str:
-        if period and period.startswith('period:'):
-            period = period[7:]
-        if period in [None, 'all']:
+    def list(bot: DCSServerBot) -> list[str]:
+        return ['all', 'day', 'week', 'month', 'year', 'today', 'yesterday']
+
+    @staticmethod
+    def supports(bot: DCSServerBot, period: str) -> bool:
+        return (period and period.startswith('period:')) or period in PeriodFilter.list(bot)
+
+    def filter(self, bot: DCSServerBot) -> str:
+        if self.period and self.period.startswith('period:'):
+            period = self.period[7:]
+        else:
+            period = self.period
+        if period not in PeriodFilter.list(bot) or period in [None, 'all']:
             return '1 = 1'
         elif period == 'yesterday':
             return "DATE_TRUNC('day', s.hop_on) = current_date - 1"
@@ -56,115 +74,91 @@ class PeriodFilter(StatisticsFilter):
         else:
             return f"DATE(s.hop_on) > (DATE((now() AT TIME ZONE 'utc')) - interval '1 {period}')"
 
-    @staticmethod
-    def format(bot: DCSServerBot, period: str, server_name: Optional[str] = None) -> str:
-        if period and period.startswith('period:'):
-            period = period[7:]
-        if period in [None, 'all']:
-            return 'Overall'
-        elif period == 'day':
-            return 'Daily'
-        elif period == 'yesterday':
-            return 'Yesterdays'
+    def format(self, bot: DCSServerBot) -> str:
+        if self.period and self.period.startswith('period:'):
+            period = self.period[7:]
         else:
-            return period.capitalize() + 'ly'
+            period = self.period
+        if period in [None, 'all']:
+            return 'Overall '
+        elif period == 'day':
+            return 'Daily '
+        elif period in ['today', 'yesterday']:
+            return period.capitalize() + 's '
+        else:
+            return period.capitalize() + 'ly '
 
 
 class CampaignFilter(StatisticsFilter):
-    def __init__(self, campaign: str):
-        self.campaign = campaign
+    @staticmethod
+    def list(bot: DCSServerBot) -> list[str]:
+        return [f"campaign:{x}" for x in utils.get_all_campaigns(bot)]
 
     @staticmethod
     def supports(bot: DCSServerBot, period: str) -> bool:
-        return period and (period.startswith('campaign:') or period.casefold() in [
+        return period and (period.lower().startswith('campaign:') or period.casefold() in [
             x.casefold() for x in utils.get_all_campaigns(bot)
         ])
 
-    @staticmethod
-    def filter(bot: DCSServerBot, period: str, server_name: Optional[str] = None) -> str:
-        if period and period.startswith('campaign:'):
-            period = period[9:]
+    def filter(self, bot: DCSServerBot) -> str:
+        if self.period and self.period.startswith('campaign:'):
+            period = self.period[9:]
+        else:
+            period = self.period
+        period = utils.sanitize_string(period)
         return f"tsrange(s.hop_on, s.hop_off) && (SELECT tsrange(start, stop) FROM campaigns " \
                f"WHERE name ILIKE '{period}') AND m.server_name in (SELECT server_name FROM campaigns_servers)"
 
-    @staticmethod
-    def format(bot: DCSServerBot, period: str, server_name: Optional[str] = None) -> str:
-        if period and period.startswith('campaign:'):
-            period = period[9:]
-        return f'Campaign "{period.capitalize()}"'
-
-
-class MixedFilter(StatisticsFilter):
-    @staticmethod
-    def supports(bot: DCSServerBot, period: str) -> bool:
-        return period is None
-
-    @staticmethod
-    def filter(bot: DCSServerBot, period: str, server_name: Optional[str] = None) -> str:
-        if not server_name and len(bot.servers) == 1:
-            server = list(bot.servers.values())[0]
-        elif server_name in bot.servers:
-            server = bot.servers[server_name]
+    def format(self, bot: DCSServerBot) -> str:
+        if self.period and self.period.lower().startswith('campaign:'):
+            period = self.period[9:]
         else:
-            return PeriodFilter.filter(bot, period)
-        _, name = utils.get_running_campaign(bot, server)
-        if name:
-            return CampaignFilter.filter(bot, name, server_name)
-        else:
-            return PeriodFilter.filter(bot, period, server_name)
-
-    @staticmethod
-    def format(bot: DCSServerBot, period: str, server_name: Optional[str] = None) -> str:
-        if not server_name and len(bot.servers) == 1:
-            server = list(bot.servers.values())[0]
-        elif server_name in bot.servers:
-            server = bot.servers[server_name]
-        else:
-            return PeriodFilter.format(bot, period)
-        _, name = utils.get_running_campaign(bot, server)
-        if name:
-            return CampaignFilter.format(bot, name, server_name)
-        else:
-            return PeriodFilter.format(bot, period, server_name)
+            period = self.period
+        return f'Campaign "{period.capitalize()}"\n'
 
 
 class MissionFilter(StatisticsFilter):
-    def __init__(self, campaign: str):
-        self.campaign = campaign
+    @staticmethod
+    def list(bot: DCSServerBot) -> list[str]:
+        with bot.pool.connection() as conn:
+            rows = conn.execute("SELECT DISTINCT mission_name FROM missions").fetchall()
+            return [f"mission:{row[0]}" for row in rows]
 
     @staticmethod
     def supports(bot: DCSServerBot, period: str) -> bool:
-        return period and period.startswith('mission:')
+        return period and period.lower().startswith('mission:')
 
-    @staticmethod
-    def filter(bot: DCSServerBot, period: str, server_name: Optional[str] = None) -> str:
-        return f"m.mission_name ILIKE '%%{period[8:].strip()}%%'"
+    def filter(self, bot: DCSServerBot) -> str:
+        name = utils.sanitize_string(self.period[8:].strip())
+        return f"m.mission_name ILIKE '%%{name}%%'"
 
-    @staticmethod
-    def format(bot: DCSServerBot, period: str, server_name: Optional[str] = None) -> str:
-        return f'Missions containing "{period[8:].strip().title()}"'
+    def format(self, bot: DCSServerBot) -> str:
+        return f'Missions containing "{self.period[8:].strip().title()}"\n'
 
 
 class MissionIDFilter(StatisticsFilter):
-    def __init__(self, campaign: str):
-        self.campaign = campaign
+    @staticmethod
+    def list(bot: DCSServerBot) -> list[str]:
+        with bot.pool.connection() as conn:
+            rows = conn.execute("SELECT id FROM missions ORDER BY id DESC").fetchall()
+            return [row[0] for row in rows]
 
     @staticmethod
     def supports(bot: DCSServerBot, period: str) -> bool:
         return period and period.startswith('mission_id:')
 
-    @staticmethod
-    def filter(bot: DCSServerBot, period: str, server_name: Optional[str] = None) -> str:
-        return f"m.id = {period[11:].strip()}"
+    def filter(self, bot: DCSServerBot) -> str:
+        mission_id = utils.sanitize_string(self.period[11:].strip())
+        return f"m.id = {mission_id}"
 
-    @staticmethod
-    def format(bot: DCSServerBot, period: str, server_name: Optional[str] = None) -> str:
-        return f'Mission'
+    def format(self, bot: DCSServerBot) -> str:
+        return f'Mission '
 
 
 class MonthFilter(StatisticsFilter):
-    def __init__(self, campaign: str):
-        self.campaign = campaign
+    @staticmethod
+    def list(bot: DCSServerBot) -> list[str]:
+        return [f"month:{const.MONTH[i]}" for i in range(1, 13)]
 
     @staticmethod
     def get_month(period: str):
@@ -177,32 +171,50 @@ class MonthFilter(StatisticsFilter):
     def supports(bot: DCSServerBot, period: str) -> bool:
         return period and period.startswith('month:')
 
+    def filter(self, bot: DCSServerBot) -> str:
+        month = MonthFilter.get_month(self.period[6:].strip())
+        return f"""
+            DATE_PART('month', s.hop_on) = {month} AND 
+            DATE_PART('year', s.hop_on) = DATE_PART('year', CURRENT_DATE)
+        """
+
+    def format(self, bot: DCSServerBot) -> str:
+        month = MonthFilter.get_month(self.period[6:].strip())
+        return f'Month "{const.MONTH[month]}" '
+
+
+class SquadronFilter(StatisticsFilter):
     @staticmethod
-    def filter(bot: DCSServerBot, period: str, server_name: Optional[str] = None) -> str:
-        month = MonthFilter.get_month(period[6:].strip())
-        return f"DATE_PART('month', s.hop_on) = {month} AND DATE_PART('year', s.hop_on) = DATE_PART('year', CURRENT_DATE)"
+    def list(bot: DCSServerBot) -> list[str]:
+        with bot.pool.connection() as conn:
+            rows = conn.execute("SELECT name FROM squadrons").fetchall()
+            return [f"squadron:{row[0]}" for row in rows]
 
-    @staticmethod
-    def format(bot: DCSServerBot, period: str, server_name: Optional[str] = None) -> str:
-        month = MonthFilter.get_month(period[6:].strip())
-        return f'Month "{const.MONTH[month]}"'
-
-
-class MissionStatisticsFilter(StatisticsFilter):
     @staticmethod
     def supports(bot: DCSServerBot, period: str) -> bool:
-        return PeriodFilter.supports(bot, period)
+        return period and period.lower().startswith('squadron:')
 
-    @staticmethod
-    def filter(bot: DCSServerBot, period: str, server_name: Optional[str] = None) -> str:
-        if period in [None, 'all', 'all']:
+    def filter(self, bot: DCSServerBot) -> str:
+        name = utils.sanitize_string(self.period[9:].strip())
+        return f"""
+            s.player_ucid IN (
+                SELECT player_ucid 
+                FROM squadron_members sm, squadrons ss 
+                WHERE ss.id = sm.squadron_id AND ss.name = '{name}'
+            )
+        """
+
+    def format(self, bot: DCSServerBot) -> str:
+        return f'Squadron "{self.period[9:].strip().title()}"\n'
+
+
+class MissionStatisticsFilter(PeriodFilter):
+
+    def filter(self, bot: DCSServerBot) -> str:
+        if self.period in [None, 'all']:
             return '1 = 1'
-        else:
-            return f"DATE(time) > (DATE((now() AT TIME ZONE 'utc')) - interval '1 {period}')"
-
-    @staticmethod
-    def format(bot: DCSServerBot, period: str, server_name: Optional[str] = None) -> str:
-        return PeriodFilter.format(bot, period, server_name)
+        elif self.period in self.list(bot):
+            return f"DATE(time) > (DATE((now() AT TIME ZONE 'utc')) - interval '1 {self.period}')"
 
 
 class StatsPagination(Pagination):
@@ -220,3 +232,32 @@ class StatsPagination(Pagination):
                     await cursor.execute('SELECT DISTINCT s.server_name FROM campaigns c, campaigns_servers s '
                                          'WHERE c.id = s.campaign_id AND c.name ILIKE %s', (period,))
                 return [x[0] async for x in cursor]
+
+
+class PeriodTransformer(app_commands.Transformer):
+    def __init__(self, *, flt: list[Type[StatisticsFilter]]):
+        super().__init__()
+        self.filter: list[Type[StatisticsFilter]] = flt
+
+    async def transform(self, interaction: discord.Interaction, value: str) -> Optional[StatisticsFilter]:
+        for flt in self.filter:
+            if flt.supports(interaction.client, value):
+                return flt(value)
+        return PeriodFilter()
+
+    async def autocomplete(self, interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+        try:
+            if not current and PeriodFilter in self.filter:
+                return [
+                    app_commands.Choice(name=x.title(), value=x) for x in PeriodFilter.list(interaction.client)
+                ]
+            periods = []
+            for flt in self.filter:
+                periods.extend(flt.list(interaction.client))
+            return [
+                app_commands.Choice(name=x.title(), value=x)
+                for x in sorted(periods)
+                if not current or current.casefold() in x.casefold()
+            ][:25]
+        except Exception as ex:
+            interaction.client.log.exception(ex)

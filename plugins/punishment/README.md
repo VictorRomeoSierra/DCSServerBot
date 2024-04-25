@@ -4,7 +4,13 @@ configuration described in here.<br>
 The ideas of this plugin are based on [Slmod](https://github.com/mrSkortch/DCS-SLmod). Thanks to Speed for his awesome solution!
 
 ## Configuration
-The punishment is configured with a file named config/plugins/punishment.yaml. You'll find a sample in ./samples:
+As Punishment is an optional plugin, you need to activate it in main.yaml first like so:
+```yaml
+opt_plugins:
+  - punishment
+```
+
+The plugin itself is configured with a file named config/plugins/punishment.yaml. You'll find a sample in ./samples:
 ```yaml
 DEFAULT:
   penalties:                # These are the penalty points to use.
@@ -55,7 +61,7 @@ DEFAULT:
     weight: 0.25
   - days: 60                # after 60 days, the penalty points get wiped completely                
     weight: 0
-DCS.openbeta_server:
+DCS.release_server:
   exemptions:
   - ucid:
     - 'aabbccddee'          # Do not punish the users with these UCIDs

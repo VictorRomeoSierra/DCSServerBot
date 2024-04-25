@@ -5,11 +5,20 @@ It comes alongside the [Music Plugin](../../plugins/music/README.md), which allo
 and configure which playlist should be played on which server and which frequency.
 
 ## Configuration
-As per usual, the Music service is configured with a yaml file in config/services/music.yaml.
+To activate the Music Service, you need to add an optional plugin to your main.yaml first like so:
+```yaml
+opt_plugins:
+  - music
+```
+
+As per usual, the Music service itself is configured with a yaml file in config/services/music.yaml.
 
 ```yaml
 DEFAULT:
   music_dir: G:\My Drive\Music    # Directory where your music is (or where it is uploaded). For clusters, it should be a cloud drive like here.
+  popup: Now playing {song} on {frequency}{modulation}  # optional - popup message when a song starts to play
+  chat: Now playing {song} on {frequency}{modulation}   # optional - chat message when a song starts to play
+  pause_without_players: false    # Pause music, when no player is active (default: true)
   radios:
     Radio 1:                      # Name of the radio, can be anything
       type: SRSRadio              # we currently only support SRS, so this has to be in

@@ -5,7 +5,13 @@ Donators for instance), by credit points (see [CreditSystem](../creditsystem/REA
 assigned in this plugins configuration.
 
 ## Configuration
-The slot blocking is configured with a file named config/plugins/slotblocking.yaml. 
+As SlotBlocking is an optional plugin, you need to activate it in main.yaml first like so:
+```yaml
+opt_plugins:
+  - slotblocking
+```
+
+The plugin itself is configured with a file named config/plugins/slotblocking.yaml. 
 You'll find a sample file in the ./samples directory:
 ```yaml
 DEFAULT:            # Default section - true for all your servers.
@@ -31,7 +37,7 @@ DEFAULT:            # Default section - true for all your servers.
   - unit_type: observer
     discord: '@everyone'  # Only the "everyone" role needs the @ at the beginning, all other roles don't.
     message: This slot is reserved for members of http://invite.link!
-DCS.openbeta_server:
+DCS.release_server:
   restricted:             # in this example we restrict by credit points
   - group_name: Rookie    # this tag has to be in the group name of the respective units (best is to prepend it)
     points: 10            # you need at least 10 credit points to join this unit

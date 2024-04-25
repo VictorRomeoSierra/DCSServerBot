@@ -1,3 +1,5 @@
+from logging.handlers import RotatingFileHandler
+
 import aiohttp
 import ipaddress
 import os
@@ -9,6 +11,7 @@ import sys
 if sys.platform == 'win32':
     import pywintypes
     import win32api
+    import win32console
 
 from contextlib import closing, suppress
 from pathlib import Path
@@ -19,6 +22,9 @@ API_URLS = [
     'https://api4.ipify.org/'
 ]
 
+ENABLE_QUICK_EDIT_MODE = 0x40
+ENABLE_EXTENDED_FLAGS = 0x80
+
 __all__ = [
     "is_open",
     "get_public_ip",
@@ -26,7 +32,9 @@ __all__ = [
     "is_process_running",
     "get_windows_version",
     "safe_rmtree",
-    "terminate_process"
+    "terminate_process",
+    "quick_edit_mode",
+    "CloudRotatingFileHandler"
 ]
 
 
@@ -112,3 +120,31 @@ def terminate_process(process: Optional[psutil.Process]):
         except psutil.TimeoutExpired:
             process.kill()
             process.wait(timeout=3)
+
+
+def quick_edit_mode(turn_on=None):
+    """ Enable/Disable windows console Quick Edit Mode """
+    screen_buffer = win32console.GetStdHandle(-10)
+    orig_mode = screen_buffer.GetConsoleMode()
+    is_on = (orig_mode & ENABLE_QUICK_EDIT_MODE)
+    if is_on != turn_on and turn_on is not None:
+        if turn_on:
+            new_mode = orig_mode | ENABLE_QUICK_EDIT_MODE
+        else:
+            new_mode = orig_mode & ~ENABLE_QUICK_EDIT_MODE
+        screen_buffer.SetConsoleMode(new_mode | ENABLE_EXTENDED_FLAGS)
+
+    return is_on if turn_on is None else turn_on
+
+
+class CloudRotatingFileHandler(RotatingFileHandler):
+    def shouldRollover(self, record):
+        """
+        Determine if rollover should occur by comparing the log file size to
+        the size specified when the handler was created.
+        """
+        if self.maxBytes > 0:  # are we rolling over?
+            log_file_size = os.path.getsize(self.baseFilename)
+            if log_file_size >= self.maxBytes:
+                return 1
+        return 0

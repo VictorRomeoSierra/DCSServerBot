@@ -5,7 +5,7 @@ from core import utils
 from core.data.dataobject import DataObject, DataObjectFactory
 from core.data.const import Side, Coalition
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Union
 
 from core.services.registry import ServiceRegistry
 
@@ -17,15 +17,14 @@ __all__ = ["Player"]
 
 
 @dataclass
-@DataObjectFactory.register("Player")
+@DataObjectFactory.register()
 class Player(DataObject):
     server: Server = field(compare=False)
     id: int = field(compare=False)
-    name: str = field(compare=False)
     active: bool = field(compare=False)
     side: Side = field(compare=False)
     ucid: str
-    banned: bool = field(compare=False, init=False)
+    banned: bool = field(compare=False, default=False, init=False)
     slot: int = field(compare=False, default=0)
     sub_slot: int = field(compare=False, default=0)
     unit_callsign: str = field(compare=False, default='')
@@ -42,8 +41,10 @@ class Player(DataObject):
     bot: DCSServerBot = field(compare=False, init=False)
 
     def __post_init__(self):
+        from services import BotService
+
         super().__post_init__()
-        self.bot = ServiceRegistry.get("Bot").bot
+        self.bot = ServiceRegistry.get(BotService).bot
         if self.id == 1:
             self.active = False
             return
@@ -101,12 +102,6 @@ class Player(DataObject):
                     conn.execute('UPDATE players SET discord_id = %s WHERE ucid = %s',
                                  (member.id if member else -1, self.ucid))
             self._member = member
-            self.server.send_to_dcs({
-                'command': 'uploadUserRoles',
-                'id': self.id,
-                'ucid': self.ucid,
-                'roles': [x.id for x in self._member.roles] if self._member else []
-            })
 
     @property
     def verified(self) -> bool:
@@ -114,9 +109,16 @@ class Player(DataObject):
 
     @verified.setter
     def verified(self, verified: bool) -> None:
+        if verified == self._verified:
+            return
         with self.pool.connection() as conn:
             with conn.transaction():
                 conn.execute('UPDATE players SET manual = %s WHERE ucid = %s', (verified, self.ucid))
+                if verified:
+                    # delete all old automated links (this will delete the token also)
+                    conn.execute("DELETE FROM players WHERE ucid = %s AND manual = FALSE", (self.ucid,))
+                    conn.execute("UPDATE players SET discord_id = -1 WHERE discord_id = %s AND manual = FALSE",
+                                 (self.member.id,))
         self._verified = verified
 
     @property
@@ -166,9 +168,9 @@ class Player(DataObject):
     def display_name(self) -> str:
         return utils.escape_string(self.name)
 
-    async def update(self, data: dict):
-        async with self.apool.connection() as conn:
-            async with conn.transaction():
+    def update(self, data: dict):
+        with self.pool.connection() as conn:
+            with conn.transaction():
                 if 'id' in data:
                     # if the ID has changed (due to reconnect), we need to update the server list
                     if self.id != data['id']:
@@ -179,7 +181,7 @@ class Player(DataObject):
                     self.active = data['active']
                 if 'name' in data and self.name != data['name']:
                     self.name = data['name']
-                    await conn.execute('UPDATE players SET name = %s WHERE ucid = %s', (self.name, self.ucid))
+                    conn.execute('UPDATE players SET name = %s WHERE ucid = %s', (self.name, self.ucid))
                 if 'side' in data:
                     self.side = Side(data['side'])
                 if 'slot' in data:
@@ -198,7 +200,7 @@ class Player(DataObject):
                     self.group_id = data['group_id']
                 if 'unit_display_name' in data:
                     self.unit_display_name = data['unit_display_name']
-                await conn.execute("""
+                conn.execute("""
                     UPDATE players SET last_seen = (now() AT TIME ZONE 'utc') 
                     WHERE ucid = %s
                 """, (self.ucid, ))
@@ -241,3 +243,19 @@ class Player(DataObject):
             "id": self.unit_name,
             "sound": sound
         })
+
+    async def add_role(self, role: Union[str, int]):
+        if not self.member or not role:
+            return
+        try:
+            await self.member.add_roles(self.bot.get_role(role))
+        except discord.Forbidden:
+            await self.bot.audit('permission "Manage Roles" missing.', user=self.bot.member)
+
+    async def remove_role(self, role: Union[str, int]):
+        if not self.member or not role:
+            return
+        try:
+            await self.member.remove_roles(self.bot.get_role(role))
+        except discord.Forbidden:
+            await self.bot.audit('permission "Manage Roles" missing.', user=self.bot.member)

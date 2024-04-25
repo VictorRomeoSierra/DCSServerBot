@@ -19,15 +19,16 @@ from collections import defaultdict
 from contextlib import closing
 from core import utils, Status, Coalition
 from core.const import SAVED_GAMES
+from core.translations import get_translation
+from core.utils.os import CloudRotatingFileHandler
 from discord.ext import tasks
-from logging.handlers import RotatingFileHandler
 from packaging import version
 from pathlib import Path
-from psycopg.errors import UndefinedTable, InFailedSqlTransaction, NotNullViolation
+from psycopg.errors import UndefinedTable, InFailedSqlTransaction, NotNullViolation, OperationalError
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 from psycopg_pool import ConnectionPool, AsyncConnectionPool
-from typing import Optional, Union, TYPE_CHECKING, Awaitable, Callable, Any, Tuple
+from typing import Optional, Union, Awaitable, Callable, Any
 from version import __version__
 
 from core.autoexec import Autoexec
@@ -43,12 +44,9 @@ from core.utils.helper import SettingsDict, YAMLError
 
 # ruamel YAML support
 from ruamel.yaml import YAML
-from ruamel.yaml.parser import ParserError
-from ruamel.yaml.scanner import ScannerError
+from ruamel.yaml.error import MarkedYAMLError
 yaml = YAML()
 
-if TYPE_CHECKING:
-    from services import ServiceBus
 
 __all__ = [
     "NodeImpl"
@@ -65,10 +63,13 @@ LOGLEVEL = {
 
 REPO_URL = "https://api.github.com/repos/Special-K-s-Flightsim-Bots/DCSServerBot/releases"
 
+# Internationalisation
+_ = get_translation('core')
+
 
 class NodeImpl(Node):
 
-    def __init__(self, name: str, config_dir: Optional[str] = './config'):
+    def __init__(self, name: str, config_dir: Optional[str] = 'config'):
         super().__init__(name, config_dir)
         self.node = self  # to be able to address self.node
         self._public_ip: Optional[str] = None
@@ -106,8 +107,14 @@ class NodeImpl(Node):
         self.listen_address = self.locals.get('listen_address', '0.0.0.0')
         self.listen_port = self.locals.get('listen_port', 10042)
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, type, value, traceback):
+        self.close_db()
+
     async def post_init(self):
-        self.pool, self.apool = self.init_db()
+        self.pool, self.apool = await self.init_db()
         try:
             async with self.apool.connection() as conn:
                 async with conn.transaction():
@@ -129,7 +136,8 @@ class NodeImpl(Node):
 
     @master.setter
     def master(self, value: bool):
-        self._master = value
+        if self._master != value:
+            self._master = value
 
     @property
     def public_ip(self) -> str:
@@ -145,12 +153,14 @@ class NodeImpl(Node):
 
     async def audit(self, message, *, user: Optional[Union[discord.Member, str]] = None,
                     server: Optional[Server] = None):
+        from services import BotService, ServiceBus
+
         if self.master:
-            await ServiceRegistry.get("Bot").bot.audit(message, user=user, server=server)
+            await ServiceRegistry.get(BotService).bot.audit(message, user=user, server=server)
         else:
-            ServiceRegistry.get("ServiceBus").send_to_node({
+            ServiceRegistry.get(ServiceBus).send_to_node({
                 "command": "rpc",
-                "service": "Bot",
+                "service": BotService.__name__,
                 "method": "audit",
                 "params": {
                     "message": message,
@@ -180,8 +190,10 @@ class NodeImpl(Node):
         asyncio.get_event_loop().stop()
 
     async def restart(self):
+        self.log.info("Restarting ...")
         await ServiceRegistry.shutdown()
-        os.execv(sys.executable, ['python', 'run.py', '-n', self.name])
+        await self.aclose_db()
+        os.execv(sys.executable, [os.path.basename(sys.executable), 'run.py'] + sys.argv[1:])
 
     def read_locals(self) -> dict:
         _locals = dict()
@@ -189,7 +201,7 @@ class NodeImpl(Node):
         if os.path.exists(config_file):
             try:
                 self.all_nodes: dict = yaml.load(Path(config_file).read_text(encoding='utf-8'))
-            except (ParserError, ScannerError) as ex:
+            except MarkedYAMLError as ex:
                 raise YAMLError('config_file', ex)
             node: dict = self.all_nodes.get(self.name)
             if not node:
@@ -204,9 +216,9 @@ class NodeImpl(Node):
                                       datefmt='%Y-%m-%d %H:%M:%S')
         formatter.converter = time.gmtime
         os.makedirs('logs', exist_ok=True)
-        fh = RotatingFileHandler(os.path.join('logs', f'dcssb-{self.name}.log'), encoding='utf-8',
-                                 maxBytes=self.config['logging']['logrotate_size'],
-                                 backupCount=self.config['logging']['logrotate_count'])
+        fh = CloudRotatingFileHandler(os.path.join('logs', f'dcssb-{self.name}.log'), encoding='utf-8',
+                                      maxBytes=self.config['logging']['logrotate_size'],
+                                      backupCount=self.config['logging']['logrotate_count'])
         fh.setLevel(LOGLEVEL[self.config['logging']['loglevel']])
         fh.setFormatter(formatter)
         fh.doRollover()
@@ -215,19 +227,61 @@ class NodeImpl(Node):
         ch.setLevel(logging.INFO)
         ch.setFormatter(formatter)
         log.addHandler(ch)
+        # Database logging
+        log2 = logging.getLogger(name='psycopg.pool')
+        log2.setLevel(logging.ERROR)
+        log2.addHandler(ch)
         return log
 
-    def init_db(self) -> Tuple[ConnectionPool, AsyncConnectionPool]:
+    async def init_db(self) -> tuple[ConnectionPool, AsyncConnectionPool]:
         url = self.config.get("database", self.locals.get('database'))['url']
+        # quick connection check
+        db_available = False
+        max_attempts = self.config.get("database", self.locals.get('database')).get('max_retries', 10)
+        while not db_available:
+            try:
+                with psycopg.connect(url):
+                    self.log.info("- Connection to database established.")
+                    db_available = True
+            except OperationalError:
+                max_attempts -= 1
+                if not max_attempts:
+                    raise
+                self.log.warning("- Database not available, trying again in 5s ...")
+                await asyncio.sleep(5)
         pool_min = self.config.get("database", self.locals.get('database')).get('pool_min', 4)
         pool_max = self.config.get("database", self.locals.get('database')).get('pool_max', 10)
         max_idle = self.config.get("database", self.locals.get('database')).get('max_idle', 10 * 60.0)
         timeout = 60.0 if self.locals.get('slow_system', False) else 30.0
         db_pool = ConnectionPool(url, min_size=2, max_size=4,
-                                 check=ConnectionPool.check_connection, max_idle=max_idle)
+                                 check=ConnectionPool.check_connection, max_idle=max_idle, timeout=timeout)
         db_apool = AsyncConnectionPool(conninfo=url, min_size=pool_min, max_size=pool_max,
                                        check=AsyncConnectionPool.check_connection, max_idle=max_idle, timeout=timeout)
         return db_pool, db_apool
+
+    def close_db(self):
+        if self.pool:
+            try:
+                self.pool.close()
+            except Exception as ex:
+                self.log.exception(ex)
+        if self.apool:
+            try:
+                asyncio.run(self.apool.close())
+            except Exception as ex:
+                self.log.exception(ex)
+
+    async def aclose_db(self):
+        if self.pool:
+            try:
+                self.pool.close()
+            except Exception as ex:
+                self.log.exception(ex)
+        if self.apool:
+            try:
+                await self.apool.close()
+            except Exception as ex:
+                self.log.exception(ex)
 
     def init_instances(self):
         grouped = defaultdict(list)
@@ -237,8 +291,7 @@ class NodeImpl(Node):
         for server_name, instances in duplicates.items():
             self.log.warning("Duplicate server \"{}\" defined in instance {}!".format(server_name, ', '.join(instances)))
         for _name, _element in self.locals['instances'].items():
-            instance: InstanceImpl = DataObjectFactory().new(Instance.__name__, node=self, name=_name,
-                                                             locals=_element)
+            instance = DataObjectFactory().new(InstanceImpl, node=self, name=_name, locals=_element)
             self.instances.append(instance)
         del self.locals['instances']
 
@@ -311,14 +364,20 @@ class NodeImpl(Node):
             return False
 
     async def _upgrade_pending_non_git(self) -> bool:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(REPO_URL) as response:
-                result = await response.json()
-                current_version = __version__
-                latest_version = result[0]["tag_name"]
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(REPO_URL) as response:
+                    result = await response.json()
+                    current_version = __version__
+                    latest_version = result[0]["tag_name"]
 
-                if re.sub('^v', '', latest_version) > re.sub('^v', '', current_version):
-                    return True
+                    if re.sub('^v', '', latest_version) > re.sub('^v', '', current_version):
+                        return True
+        except aiohttp.ClientResponseError as ex:
+            # ignore rate limits
+            if ex.status == 403:
+                pass
+            raise
         return False
 
     async def upgrade_pending(self) -> bool:
@@ -346,25 +405,32 @@ class NodeImpl(Node):
                         await conn.execute("UPDATE cluster SET update_pending = TRUE WHERE guild_id = %s",
                                            (self.guild_id, ))
             await ServiceRegistry.shutdown()
-            os.execv(sys.executable, ['python', 'update.py', '-n', self.name])
+            await self.aclose_db()
+            os.execv(sys.executable, [os.path.basename(sys.executable), 'update.py'] + sys.argv[1:])
 
-    async def get_dcs_branch_and_version(self) -> Tuple[str, str]:
+    async def get_dcs_branch_and_version(self) -> tuple[str, str]:
         if not self.dcs_branch or not self.dcs_version:
             with open(os.path.join(self.installation, 'autoupdate.cfg'), mode='r', encoding='utf8') as cfg:
                 data = json.load(cfg)
             self.dcs_branch = data.get('branch', 'release')
             self.dcs_version = data['version']
+            if "openbeta" in self.dcs_branch:
+                self.log.debug("You're running DCS OpenBeta, which is discontinued. "
+                               "Use /dcs update, if you want to switch to the release branch.")
         return self.dcs_branch, self.dcs_version
 
     async def update(self, warn_times: list[int], branch: Optional[str] = None) -> int:
+        from services import ServiceBus
+
         async def shutdown_with_warning(server: Server):
             if server.is_populated():
                 shutdown_in = max(warn_times) if len(warn_times) else 0
                 while shutdown_in > 0:
                     for warn_time in warn_times:
                         if warn_time == shutdown_in:
-                            server.sendPopupMessage(Coalition.ALL, f'Server is going down for a DCS update in '
-                                                                   f'{utils.format_time(warn_time)}!')
+                            server.sendPopupMessage(
+                                Coalition.ALL,
+                                _('Server is going down for a DCS update in {}!').format(utils.format_time(warn_time)))
                     await asyncio.sleep(1)
                     shutdown_in -= 1
             await server.shutdown()
@@ -382,12 +448,21 @@ class NodeImpl(Node):
             def run_subprocess() -> int:
                 try:
                     cmd = [os.path.join(self.installation, 'bin', 'dcs_updater.exe'), '--quiet', 'update']
-                    if branch is not None:
+                    if branch:
                         cmd.append(f"@{branch}")
 
                     process = subprocess.run(
                         cmd, startupinfo=startupinfo, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
                     )
+                    if branch and process.returncode == 0:
+                        # check if the branch has been changed
+                        config = os.path.join(self.installation, 'autoupdate.cfg')
+                        with open(config, mode='r') as infile:
+                            data = json.load(infile)
+                        if data['branch'] != branch:
+                            data['branch'] = branch
+                            with open(config, mode='w') as outfile:
+                                json.dump(data, outfile, indent=2)
                     return process.returncode
                 except Exception as ex:
                     self.log.exception(ex)
@@ -399,7 +474,7 @@ class NodeImpl(Node):
         to_start = []
         in_maintenance = []
         tasks = []
-        bus: ServiceBus = ServiceRegistry.get('ServiceBus')
+        bus = ServiceRegistry.get(ServiceBus)
         for server in [x for x in bus.servers.values() if not x.is_remote]:
             if server.maintenance:
                 in_maintenance.append(server)
@@ -415,7 +490,7 @@ class NodeImpl(Node):
         # call before update hooks
         for callback in self.before_update.values():
             await callback()
-        rc = await do_update()
+        rc = await do_update(branch)
         if rc == 0:
             self.dcs_branch = self.dcs_version = None
             if self.locals['DCS'].get('desanitize', True):
@@ -471,6 +546,7 @@ class NodeImpl(Node):
             "MARIANAISLANDS_terrain",
             "FALKLANDS_terrain",
             "SINAIMAP_terrain",
+            "KOLA_terrain",
             "WWII-ARMOUR",
             "SUPERCARRIER"
         }
@@ -516,108 +592,115 @@ class NodeImpl(Node):
                 self.autoupdate.cancel()
 
     async def heartbeat(self) -> bool:
-        async with self.apool.connection() as conn:
-            async with conn.transaction():
-                async with conn.cursor(row_factory=dict_row) as cursor:
-                    try:
-                        await cursor.execute("""
-                            SELECT NOW() AT TIME ZONE 'UTC' AS now, * FROM nodes 
-                            WHERE guild_id = %s FOR UPDATE
-                        """, (self.guild_id, ))
-                        all_nodes = await cursor.fetchall()
-                        await cursor.execute("""
-                            SELECT c.master, c.version, c.update_pending 
-                            FROM cluster c, nodes n 
-                            WHERE c.guild_id = %s AND c.guild_id = n.guild_id AND c.master = n.node
-                        """, (self.guild_id, ))
-                        cluster = await cursor.fetchone()
-                        # No master there? we take it!
-                        if not cluster:
+        try:
+            async with self.apool.connection() as conn:
+                async with conn.transaction():
+                    async with conn.cursor(row_factory=dict_row) as cursor:
+                        try:
                             await cursor.execute("""
-                                INSERT INTO cluster (guild_id, master, version) VALUES (%s, %s, %s)
-                                ON CONFLICT (guild_id) DO UPDATE 
-                                SET master = excluded.master, version = excluded.version
-                            """, (self.guild_id, self.name, __version__))
-                            return True
-                        # I am the master
-                        if cluster['master'] == self.name:
+                                SELECT NOW() AT TIME ZONE 'UTC' AS now, * FROM nodes 
+                                WHERE guild_id = %s FOR UPDATE
+                            """, (self.guild_id, ))
+                            all_nodes = await cursor.fetchall()
+                            await cursor.execute("""
+                                SELECT c.master, c.version, c.update_pending 
+                                FROM cluster c, nodes n 
+                                WHERE c.guild_id = %s AND c.guild_id = n.guild_id AND c.master = n.node
+                            """, (self.guild_id, ))
+                            cluster = await cursor.fetchone()
+                            # No master there? we take it!
+                            if not cluster:
+                                await cursor.execute("""
+                                    INSERT INTO cluster (guild_id, master, version) VALUES (%s, %s, %s)
+                                    ON CONFLICT (guild_id) DO UPDATE 
+                                    SET master = excluded.master, version = excluded.version
+                                """, (self.guild_id, self.name, __version__))
+                                return True
+                            # I am the master
+                            if cluster['master'] == self.name:
+                                # set the master here already to avoid race conditions
+                                self.master = True
+                                if cluster['update_pending']:
+                                    if not await self.upgrade_pending():
+                                        # we have just finished updating, so restart all other nodes (if there are any)
+                                        for node in await self.get_active_nodes():
+                                            # TODO: we might not have bus access here yet, so be our own bus (dirty)
+                                            data = {
+                                                "command": "rpc",
+                                                "object": "Node",
+                                                "method": "upgrade"
+                                            }
+                                            await conn.execute("""
+                                                INSERT INTO intercom (guild_id, node, data) VALUES (%s, %s, %s)
+                                            """, (self.guild_id, node, Json(data)))
+                                        # clear the update flag
+                                        await cursor.execute("""
+                                            UPDATE cluster SET update_pending = FALSE, version = %s WHERE guild_id = %s
+                                        """, (__version__, self.guild_id))
+                                    else:
+                                        # something went wrong, we need to upgrade again
+                                        await self.upgrade()
+                                elif version.parse(cluster['version']) != version.parse(__version__):
+                                    if version.parse(cluster['version']) > version.parse(__version__):
+                                        self.log.warning(
+                                            f"Bot version downgraded from {cluster['version']} to {__version__}. "
+                                            f"This could lead to unexpected behavior if there have been database schema "
+                                            f"changes.")
+                                    await cursor.execute("UPDATE cluster SET version = %s WHERE guild_id = %s",
+                                                         (__version__, self.guild_id))
+                                return True
+                            # we are not the master, the update is pending, we will not take over
                             if cluster['update_pending']:
-                                if not await self.upgrade_pending():
-                                    # we have just finished updating, so restart all other nodes (if there are any)
-                                    for node in await self.get_active_nodes():
-                                        # TODO: we might not have bus access here yet, so be our own bus (dirty)
-                                        data = {
-                                            "command": "rpc",
-                                            "object": "Node",
-                                            "method": "upgrade"
-                                        }
-                                        await conn.execute("""
-                                            INSERT INTO intercom (guild_id, node, data) VALUES (%s, %s, %s)
-                                        """, (self.guild_id, node, Json(data)))
-                                    # clear the update flag
-                                    await cursor.execute("""
-                                        UPDATE cluster SET update_pending = FALSE, version = %s WHERE guild_id = %s
-                                    """, (__version__, self.guild_id))
-                                else:
-                                    # something went wrong, we need to upgrade again
-                                    await self.upgrade()
-                            elif version.parse(cluster['version']) != version.parse(__version__):
-                                if version.parse(cluster['version']) > version.parse(__version__):
-                                    self.log.warning(
-                                        f"Bot version downgraded from {cluster['version']} to {__version__}. "
-                                        f"This could lead to unexpected behavior if there have been database schema "
-                                        f"changes.")
-                                await cursor.execute("UPDATE cluster SET version = %s WHERE guild_id = %s",
-                                                     (__version__, self.guild_id))
-                            return True
-                        # we are not the master, the update is pending, we will not take over
-                        if cluster['update_pending']:
-                            return False
-                        # we have a version mismatch on the agent, a cloud sync might still be pending
-                        if version.parse(__version__) < version.parse(cluster['version']):
-                            self.log.error(f"We are running version {__version__} where the master is on version "
-                                           f"{cluster['version']} already. Trying to upgrade ...")
-                            # TODO: we might not have bus access here yet, so be our own bus (dirty)
-                            data = {
-                                "command": "rpc",
-                                "object": "Node",
-                                "method": "upgrade"
-                            }
-                            await cursor.execute("""
-                                INSERT INTO intercom (guild_id, node, data) VALUES (%s, %s, %s)
-                            """, (self.guild_id, self.name, Json(data)))
-                            return False
-                        elif version.parse(__version__) > version.parse(cluster['version']):
-                            self.log.warning(f"This node is running on version {__version__} where the master still "
-                                             f"runs on {cluster['version']}. You need to upgrade your master node!")
-                        # we are not the master, but we are the preferred one, taking over
-                        if self.locals.get('preferred_master', False):
+                                return False
+                            # we have a version mismatch on the agent, a cloud sync might still be pending
+                            if version.parse(__version__) < version.parse(cluster['version']):
+                                self.log.error(f"We are running version {__version__} where the master is on version "
+                                               f"{cluster['version']} already. Trying to upgrade ...")
+                                # TODO: we might not have bus access here yet, so be our own bus (dirty)
+                                data = {
+                                    "command": "rpc",
+                                    "object": "Node",
+                                    "method": "upgrade"
+                                }
+                                await cursor.execute("""
+                                    INSERT INTO intercom (guild_id, node, data) VALUES (%s, %s, %s)
+                                """, (self.guild_id, self.name, Json(data)))
+                                return False
+                            elif version.parse(__version__) > version.parse(cluster['version']):
+                                self.log.warning(f"This node is running on version {__version__} where the master still "
+                                                 f"runs on {cluster['version']}. You need to upgrade your master node!")
+                            # we are not the master, but we are the preferred one, taking over
+                            if self.locals.get('preferred_master', False):
+                                await cursor.execute("UPDATE cluster SET master = %s WHERE guild_id = %s",
+                                                     (self.name, self.guild_id))
+                                return True
+                            # else, check if the running master is probably dead...
+                            for row in all_nodes:
+                                if row['node'] == self.name:
+                                    continue
+                                if row['node'] == cluster['master']:
+                                    if (row['now'] - row['last_seen']).total_seconds() > self.locals.get('heartbeat', 30):
+                                        # the master is dead, long live the master
+                                        await cursor.execute("UPDATE cluster SET master = %s WHERE guild_id = %s",
+                                                             (self.name, self.guild_id))
+                                        return True
+                                    return False
+                            # we can not find a master - take over
                             await cursor.execute("UPDATE cluster SET master = %s WHERE guild_id = %s",
                                                  (self.name, self.guild_id))
                             return True
-                        # else, check if the running master is probably dead...
-                        for row in all_nodes:
-                            if row['node'] == self.name:
-                                continue
-                            if row['node'] == cluster['master']:
-                                if (row['now'] - row['last_seen']).total_seconds() > self.locals.get('heartbeat', 30):
-                                    # the master is dead, long live the master
-                                    await cursor.execute("UPDATE cluster SET master = %s WHERE guild_id = %s",
-                                                         (self.name, self.guild_id))
-                                    return True
-                                return False
-                        # we can not find a master - take over
-                        await cursor.execute("UPDATE cluster SET master = %s WHERE guild_id = %s",
-                                             (self.name, self.guild_id))
-                        return True
-                    except UndefinedTable:
-                        return True
-                    except Exception as e:
-                        self.log.exception(e)
-                    finally:
-                        await cursor.execute("""
-                            UPDATE nodes SET last_seen = NOW() AT TIME ZONE 'UTC' WHERE guild_id = %s AND node = %s
-                        """, (self.guild_id, self.name))
+                        except UndefinedTable:
+                            return True
+                        except Exception as e:
+                            self.log.exception(e)
+                            return self.master
+                        finally:
+                            await cursor.execute("""
+                                UPDATE nodes SET last_seen = NOW() AT TIME ZONE 'UTC' WHERE guild_id = %s AND node = %s
+                            """, (self.guild_id, self.name))
+        except OperationalError as ex:
+            self.log.error(ex)
+            return self.master
 
     async def get_active_nodes(self) -> list[str]:
         async with self.apool.connection() as conn:
@@ -629,7 +712,7 @@ class NodeImpl(Node):
             """, (self.guild_id, self.name))
             return [row[0] async for row in cursor]
 
-    async def shell_command(self, cmd: str) -> Optional[Tuple[str, str]]:
+    async def shell_command(self, cmd: str) -> Optional[tuple[str, str]]:
         def run_subprocess():
             proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             return proc.communicate()
@@ -687,20 +770,24 @@ class NodeImpl(Node):
         shutil.move(old_name, new_name, copy_function=shutil.copy2 if force else None)
 
     async def rename_server(self, server: Server, new_name: str):
+        from services import BotService, ServiceBus
+
         if not self.master:
             self.log.error(
                 f"Rename request received for server {server.name} that should have gone to the master node!")
             return
         # we are doing the plugin changes, as we are the master
-        await ServiceRegistry.get('Bot').rename_server(server, new_name)
+        await ServiceRegistry.get(BotService).rename_server(server, new_name)
         # update the ServiceBus
-        ServiceRegistry.get('ServiceBus').rename_server(server, new_name)
+        ServiceRegistry.get(ServiceBus).rename_server(server, new_name)
         # change the proxy name for remote servers (local ones will be renamed by ServerImpl)
         if server.is_remote:
             server.name = new_name
 
     @tasks.loop(minutes=5.0)
     async def autoupdate(self):
+        from services import BotService, ServiceBus
+
         # don't run, if an update is currently running
         if self.update_pending:
             return
@@ -715,14 +802,25 @@ class NodeImpl(Node):
             if new_version and old_version != new_version:
                 self.log.info('A new version of DCS World is available. Auto-updating ...')
                 rc = await self.update([300, 120, 60])
-                ServiceRegistry.get('ServiceBus').send_to_node({
-                    "command": "rpc",
-                    "service": "Bot",
-                    "method": "audit" if rc == 0 else "alert",
-                    "params": {
-                        "message": f"DCS World updated to version {new_version} on node {self.node.name}." if rc == 0 else f"DCS World could not be updated on node {self.name} due to an error ({rc})!"
-                    }
-                })
+                if rc == 0:
+                    ServiceRegistry.get(ServiceBus).send_to_node({
+                        "command": "rpc",
+                        "service": BotService.__name__,
+                        "method": "audit",
+                        "params": {
+                            "message": f"DCS World updated to version {new_version} on node {self.node.name}."
+                        }
+                    })
+                else:
+                    ServiceRegistry.get(ServiceBus).send_to_node({
+                        "command": "rpc",
+                        "service": BotService.__name__,
+                        "method": "alert",
+                        "params": {
+                            "title": "DCS Update Issue",
+                            "message": f"DCS World could not be updated on node {self.name} due to an error ({rc})!"
+                        }
+                    })
         except aiohttp.ClientError as ex:
             self.log.warning(ex)
         except Exception as ex:
@@ -730,10 +828,12 @@ class NodeImpl(Node):
 
     @autoupdate.before_loop
     async def before_autoupdate(self):
+        from services import ServiceBus
+
         # wait for all servers to be in a proper state
         while True:
             await asyncio.sleep(1)
-            bus: ServiceBus = ServiceRegistry.get("ServiceBus")
+            bus = ServiceRegistry.get(ServiceBus)
             if not bus:
                 continue
             server_initialized = True
@@ -755,7 +855,7 @@ class NodeImpl(Node):
             if instance.webgui_port > max_webgui_port:
                 max_webgui_port = instance.webgui_port
         os.makedirs(os.path.join(SAVED_GAMES, name), exist_ok=True)
-        instance: InstanceImpl = DataObjectFactory().new(Instance.__name__, node=self, name=name, locals={
+        instance = DataObjectFactory().new(InstanceImpl, node=self, name=name, locals={
             "bot_port": max_bot_port + 1,
             "dcs_port": max_dcs_port + 10,
             "webgui_port": max_webgui_port + 2
@@ -791,8 +891,7 @@ class NodeImpl(Node):
             settings = SettingsDict(self, settings_path, root='cfg')
             settings['port'] = instance.dcs_port
             settings['name'] = 'n/a'
-        server: ServerImpl = DataObjectFactory().new(
-            Server.__name__, node=self.node, port=instance.bot_port, name='n/a')
+        server = DataObjectFactory().new(ServerImpl, node=self.node, port=instance.bot_port, name='n/a')
         instance.server = server
         self.instances.append(instance)
         return instance
@@ -831,15 +930,16 @@ class NodeImpl(Node):
         with open(config_file, mode='w', encoding='utf-8') as outfile:
             yaml.dump(config, outfile)
 
-    async def find_all_instances(self) -> list[Tuple[str, str]]:
+    async def find_all_instances(self) -> list[tuple[str, str]]:
         return utils.findDCSInstances()
 
     async def migrate_server(self, server: Server, instance: Instance) -> None:
+        from services import ServiceBus
+
         await server.node.unregister_server(server)
-        server: ServerImpl = DataObjectFactory().new(
-            Server.__name__, node=self.node, port=instance.bot_port, name=server.name)
+        server = DataObjectFactory().new(ServerImpl, node=self.node, port=instance.bot_port, name=server.name)
         server.status = Status.SHUTDOWN
-        ServiceRegistry.get("ServiceBus").servers[server.name] = server
+        ServiceRegistry.get(ServiceBus).servers[server.name] = server
         instance.server = server
         config_file = os.path.join(self.config_dir, 'nodes.yaml')
         with open(config_file, mode='r', encoding='utf-8') as infile:

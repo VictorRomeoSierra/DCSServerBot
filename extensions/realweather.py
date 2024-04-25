@@ -5,8 +5,8 @@ import shutil
 import subprocess
 import tempfile
 
-from core import Extension, MizFile, utils, DEFAULT_TAG
-from typing import Optional, Tuple
+from core import Extension, MizFile, utils, DEFAULT_TAG, Server
+from typing import Optional
 
 
 class RealWeatherException(Exception):
@@ -14,6 +14,11 @@ class RealWeatherException(Exception):
 
 
 class RealWeather(Extension):
+
+    def __init__(self, server: Server, config: dict):
+        super().__init__(server, config)
+        self.lock = asyncio.Lock()
+
     @property
     def version(self) -> Optional[str]:
         return utils.get_windows_version(os.path.join(os.path.expandvars(self.config['installation']),
@@ -26,7 +31,15 @@ class RealWeather(Extension):
         else:
             return self.config
 
-    async def beforeMissionLoad(self, filename: str) -> Tuple[str, bool]:
+    @staticmethod
+    def get_icao_code(filename: str) -> Optional[str]:
+        index = filename.find('ICAO_')
+        if index != -1:
+            return filename[index + 5:index + 9]
+        else:
+            return None
+
+    async def beforeMissionLoad(self, filename: str) -> tuple[str, bool]:
         rw_home = os.path.expandvars(self.config['installation'])
         tmpfd, tmpname = tempfile.mkstemp()
         os.close(tmpfd)
@@ -43,6 +56,14 @@ class RealWeather(Extension):
                     element |= config[name]
                 else:
                     cfg[name] = config[name]
+        icao = self.get_icao_code(filename)
+        if icao and icao != self.config.get('metar', {}).get('icao'):
+            cfg |= {
+                "metar": {
+                    "icao": icao
+                }
+            }
+            self.config['metar'] = {"icao": icao}
         cwd = await self.server.get_missions_dir()
         with open(os.path.join(cwd, 'config.json'), mode='w', encoding='utf-8') as outfile:
             json.dump(cfg, outfile, indent=2)
@@ -52,7 +73,8 @@ class RealWeather(Extension):
             subprocess.check_call([os.path.join(rw_home, 'realweather.exe')], stdout=out, stderr=out, cwd=cwd)
 
         try:
-            await asyncio.to_thread(run_subprocess)
+            async with self.lock:
+                await asyncio.to_thread(run_subprocess)
         except subprocess.CalledProcessError:
             raise RealWeatherException(f"Error in RealWeather. Enable debug in your extension to see more.")
 
@@ -66,10 +88,15 @@ class RealWeather(Extension):
         return new_filename, True
 
     async def render(self, param: Optional[dict] = None) -> dict:
+        icao = self.config.get('metar', {}).get('icao')
+        if icao:
+            value = f'Metar: {icao}'
+        else:
+            value = 'enabled'
         return {
             "name": "RealWeather",
             "version": self.version,
-            "value": "enabled"
+            "value": value
         }
 
     def is_installed(self) -> bool:

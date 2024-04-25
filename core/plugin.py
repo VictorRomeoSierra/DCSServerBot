@@ -20,7 +20,7 @@ from discord.utils import MISSING, _shorten
 from os import path
 from packaging import version
 from pathlib import Path
-from typing import Type, Optional, TYPE_CHECKING, Union, Any, Dict, Callable, List, Tuple
+from typing import Type, Optional, TYPE_CHECKING, Union, Any, Dict, Callable, List
 
 from .const import DEFAULT_TAG
 from .listener import TEventListener
@@ -28,13 +28,12 @@ from .utils.helper import YAMLError
 
 # ruamel YAML support
 from ruamel.yaml import YAML
-from ruamel.yaml.parser import ParserError
-from ruamel.yaml.scanner import ScannerError
+from ruamel.yaml.error import MarkedYAMLError
 yaml = YAML()
 
 if TYPE_CHECKING:
     from core import Server
-    from services import DCSServerBot, ServiceBus
+    from services import DCSServerBot
 
 BACKUP_FOLDER = 'config/backup/{}'
 
@@ -125,9 +124,12 @@ class Command(app_commands.Command):
         auto_locale_strings: bool = True,
         extras: Dict[Any, Any] = MISSING,
     ):
+        from services import BotService
+
         super().__init__(name=name, description=description, callback=callback, nsfw=nsfw, parent=parent,
                          guild_ids=guild_ids, auto_locale_strings=auto_locale_strings, extras=extras)
-        bot: DCSServerBot = ServiceRegistry.get("Bot").bot
+        self.mention = ""
+        bot = ServiceRegistry.get(BotService).bot
         # remove node parameter from slash commands if only one node is there
         nodes = len(bot.node.all_nodes)
         if 'node' in self._params and nodes == 1:
@@ -145,6 +147,7 @@ class Command(app_commands.Command):
             if not server:
                 if len(interaction.client.servers) > 0:
                     try:
+                        # noinspection PyUnresolvedReferences
                         await interaction.response.send_message(
                             'No server registered for this channel. '
                             'If the channel is correct, please try again in a bit, when the server has registered.',
@@ -153,6 +156,7 @@ class Command(app_commands.Command):
                     except discord.errors.NotFound:
                         pass
                 else:
+                    # noinspection PyUnresolvedReferences
                     await interaction.response.send_message('No servers registered yet.', ephemeral=True)
                     return
             params['server'] = server
@@ -224,19 +228,21 @@ class Group(app_commands.Group):
 class Plugin(commands.Cog):
 
     def __init__(self, bot: DCSServerBot, eventlistener: Type[TEventListener] = None):
+        from services import ServiceBus
+
         super().__init__()
         self.plugin_name = type(self).__module__.split('.')[-2]
         self.plugin_version = getattr(sys.modules['plugins.' + self.plugin_name], '__version__')
         self.bot: DCSServerBot = bot
         self.node = bot.node
-        self.bus: ServiceBus = ServiceRegistry.get("ServiceBus")
+        self.bus = ServiceRegistry.get(ServiceBus)
         self.log = self.bot.log
         self.pool = self.bot.pool
         self.apool = self.bot.apool
         self.loop = self.bot.loop
         self.locals = self.read_locals()
         if self.plugin_name != 'commands' and 'commands' in self.locals:
-            self._change_commands(self.locals['commands'], {x.name: x for x in self.get_app_commands()})
+            self.change_commands(self.locals['commands'], {x.name: x for x in self.get_app_commands()})
         self._config = dict[str, dict]()
         self.eventlistener: Type[TEventListener] = eventlistener(self) if eventlistener else None
         self.wait_for_on_ready.start()
@@ -255,10 +261,18 @@ class Plugin(commands.Cog):
         self._config.clear()
         self.log.info(f'  => {self.plugin_name.title()} unloaded.')
 
-    def _change_commands(self, cmds: dict, all_cmds: dict, group: app_commands.commands.Group = None) -> None:
+    def change_commands(self, cmds: dict, all_cmds: dict) -> None:
         for name, params in cmds.items():
-            for cmd_name, cmd in self.__dict__.copy().items():
-                if cmd_name == name and isinstance(cmd, Command):
+            for cmd_name, cmd in all_cmds.items():
+                if cmd_name == name and isinstance(cmd, Group):
+                    group_commands = {x.name: x for x in cmd.commands}
+                    if isinstance(params, list):
+                        for param in params:
+                            self.change_commands(param, group_commands)
+                    else:
+                        self.change_commands(params, group_commands)
+                    break
+                elif cmd_name == name and isinstance(cmd, Command):
                     if cmd.parent:
                         cmd.parent.remove_command(cmd.name)
                     if not params.get('enabled', True):
@@ -299,7 +313,8 @@ class Plugin(commands.Cog):
     async def after_dcs_update(self) -> None:
         ...
 
-    async def prune(self, conn: psycopg.AsyncConnection, *, days: int = -1, ucids: list[str] = None) -> None:
+    async def prune(self, conn: psycopg.AsyncConnection, *, days: int = -1, ucids: list[str] = None,
+                    server: Optional[str] = None) -> None:
         ...
 
     async def _init_db(self) -> bool:
@@ -395,11 +410,11 @@ class Plugin(commands.Cog):
         self.log.debug(f'  => Reading plugin configuration from {filename} ...')
         try:
             return yaml.load(Path(filename).read_text(encoding='utf-8'))
-        except (ParserError, ScannerError) as ex:
+        except MarkedYAMLError as ex:
             raise YAMLError(filename, ex)
 
     # get default and specific configs to be merged in derived implementations
-    def get_base_config(self, server: Server) -> Tuple[Optional[dict], Optional[dict]]:
+    def get_base_config(self, server: Server) -> tuple[Optional[dict], Optional[dict]]:
         def get_theatre() -> Optional[str]:
             if server.current_mission:
                 return server.current_mission.map

@@ -9,31 +9,34 @@ from _operator import attrgetter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from copy import deepcopy
-from core import Server, DataObjectFactory, Status, ServerImpl, Autoexec, ServerProxy, EventListener, \
-    InstanceProxy, NodeProxy, Mission, Node, utils, PubSub
+from core import Server, Mission, Node, DataObjectFactory, Status, Autoexec, ServerProxy, InstanceProxy, utils, PubSub
 from core.services.base import Service
 from core.services.registry import ServiceRegistry
+from core.data.impl.serverimpl import ServerImpl
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 from queue import Queue
 from socketserver import BaseRequestHandler, ThreadingUDPServer
-from typing import Tuple, Callable, Optional, cast, TYPE_CHECKING, Union, Any
+from typing import Callable, Optional, cast, Union, Any, TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from services import DCSServerBot
+from ..bot.service import BotService
+from ..bot.dcsserverbot import DCSServerBot
 
 __all__ = [
     "ServiceBus"
 ]
 
+if TYPE_CHECKING:
+    from core import EventListener
 
-@ServiceRegistry.register("ServiceBus")
+
+@ServiceRegistry.register()
 class ServiceBus(Service):
 
-    def __init__(self, node, name: str):
-        super().__init__(node, name)
+    def __init__(self, node):
+        super().__init__(node)
         self.bot: Optional[DCSServerBot] = None
         self.version = self.node.bot_version
         self.listeners: dict[str, asyncio.Future] = dict()
@@ -78,10 +81,10 @@ class ServiceBus(Service):
 
             await self.init_servers()
             if self.master:
-                self.bot = ServiceRegistry.get("Bot").bot
+                self.bot = ServiceRegistry.get(BotService).bot
                 while not self.bot:
                     await asyncio.sleep(1)
-                    self.bot = ServiceRegistry.get("Bot").bot
+                    self.bot = ServiceRegistry.get(BotService).bot
                 await self.bot.wait_until_ready()
                 await self.register_local_servers()
             else:
@@ -151,7 +154,7 @@ class ServiceBus(Service):
                     # was there a server bound to this instance?
                     if row:
                         server: ServerImpl = DataObjectFactory().new(
-                            Server.__name__, node=self.node, port=instance.bot_port, name=row[0])
+                            ServerImpl, node=self.node, port=instance.bot_port, name=row[0])
                         instance.server = server
                         self.servers[server.name] = server
                     else:
@@ -251,7 +254,7 @@ class ServiceBus(Service):
             if 'current_mission' in data:
                 if not server.current_mission:
                     server.current_mission = DataObjectFactory().new(
-                        Mission.__name__, node=server.node, server=server, map=data['current_map'],
+                        Mission, node=server.node, server=server, map=data['current_map'],
                         name=data['current_mission'])
                 server.current_mission.update(data)
 
@@ -313,7 +316,7 @@ class ServiceBus(Service):
 
     async def ban(self, ucid: str, banned_by: str, reason: str = 'n/a', days: Optional[int] = None):
         if days:
-            until = datetime.utcnow() + timedelta(days=days)
+            until = datetime.now(tz=timezone.utc) + timedelta(days=days)
             until_str = until.strftime('%Y-%m-%d %H:%M') + ' (UTC)'
         else:
             until = datetime(year=9999, month=12, day=31)
@@ -324,7 +327,7 @@ class ServiceBus(Service):
                     INSERT INTO bans (ucid, banned_by, reason, banned_until) 
                     VALUES (%s, %s, %s, %s) 
                     ON CONFLICT DO NOTHING
-                """, (ucid, banned_by, reason, until))
+                """, (ucid, banned_by, reason, until.replace(tzinfo=None)))
         for server in self.servers.values():
             if server.status not in [Status.PAUSED, Status.RUNNING, Status.STOPPED]:
                 continue
@@ -372,9 +375,12 @@ class ServiceBus(Service):
                 """, (ucid, ))
                 return await cursor.fetchone()
 
-    def init_remote_server(self, server_name: str, public_ip: str, status: str, instance: str, home: str, settings: dict,
-                           options: dict, node: str, channels: dict, dcs_version: str, maintenance: bool) -> None:
-        server = self.servers.get(server_name)
+    def init_remote_server(self, server_name: str, public_ip: str, status: str, instance: str, home: str,
+                           settings: dict, options: dict, node: str, channels: dict, dcs_version: str,
+                           maintenance: bool) -> None:
+        from core import NodeProxy
+
+        server: ServerProxy = cast(ServerProxy, self.servers.get(server_name))
         if not server or not server.is_remote:
             node = NodeProxy(self.node, node, public_ip, self.node.config_dir)
             server = ServerProxy(
@@ -400,7 +406,7 @@ class ServiceBus(Service):
             self.log.info(f"  => DCS-Server \"{server.name}\" from Node {server.node.name} registered.")
         else:
             # IP might have changed, so update it
-            server.node.public_ip = public_ip
+            cast(NodeProxy, server.node).public_ip = public_ip
         server.status = Status(status)
 
     def send_to_node(self, data: dict, *, node: Optional[Union[Node, str]] = None):
@@ -422,7 +428,7 @@ class ServiceBus(Service):
             elif data.get('command', '') != 'rpc':
                 server_name = data['server_name']
                 if server_name not in self.udp_server.message_queue:
-                    self.log.debug(f"Message received for unregistered server {server_name} - ignoring.")
+                    self.log.debug(f"Message received for unregistered server {server_name}, ignoring.")
                 else:
                     self.udp_server.message_queue[server_name].put(data)
             else:
@@ -482,7 +488,7 @@ class ServiceBus(Service):
         else:
             obj = ServiceRegistry.get(data['service'])
         if not obj:
-            self.log.warning('RPC command received for unknown object/service.')
+            self.log.debug('RPC command received for unknown object/service.')
             return
         try:
             rc = await self.rpc(obj, data)
@@ -497,9 +503,7 @@ class ServiceBus(Service):
                 }, node=data.get('node'))
         except Exception as ex:
             if isinstance(ex, TimeoutError) or isinstance(ex, asyncio.TimeoutError):
-                self.log.warning(f"Timeout error during an RPC call: {data['method']}!")
-            else:
-                self.log.exception(ex, exc_info=True)
+                self.log.warning(f"Timeout error during an RPC call: {data['method']}!", exc_info=True)
             if data.get('channel', '').startswith('sync-'):
                 self.send_to_node({
                     "command": "rpc",
@@ -511,6 +515,8 @@ class ServiceBus(Service):
                         "message": ex.__repr__()
                     }
                 }, node=data.get('node'))
+            else:
+                self.log.exception(ex)
 
     async def handle_broadcast_event(self, data: dict) -> None:
         if self.master:
@@ -532,7 +538,7 @@ class ServiceBus(Service):
         if 'channel' in data and data['channel'].startswith('sync-'):
             server: Server = self.servers.get(server_name)
             if not server:
-                self.log.warning(f'Message for unregistered server {server_name} received, ignoring.')
+                self.log.warning(f'Message received for unregistered server {server_name}, ignoring.')
                 return
             f = server.listeners.get(data['channel'])
             if f and not f.done():
@@ -577,6 +583,14 @@ class ServiceBus(Service):
             for key, value in data['params'].items():
                 setattr(obj, key, value)
 
+    async def propagate_event(self, command: str, data: dict, server: Optional[Server] = None):
+        tasks = [
+            asyncio.create_task(listener.processEvent(command, server, deepcopy(data)))
+            for listener in self.eventListeners
+            if listener.has_event(command)
+        ]
+        await asyncio.gather(*tasks, return_exceptions=True)
+
     async def start_udp_listener(self):
         class RequestHandler(BaseRequestHandler):
 
@@ -594,8 +608,9 @@ class ServiceBus(Service):
                 server = self.servers.get(server_name)
                 if not server:
                     self.log.debug(
-                        f"Command {data['command']} for unregistered server {server_name} received, ignoring.")
+                        f"Command {data['command']} received for unregistered server {server_name}, ignoring.")
                     return
+                server.last_seen = datetime.now(timezone.utc)
                 if 'channel' in data and data['channel'].startswith('sync-'):
                     if data['channel'] in server.listeners:
                         f = server.listeners.get(data['channel'])
@@ -610,7 +625,7 @@ class ServiceBus(Service):
                 udp_server.message_queue[server.name].put(data)
 
         class MyThreadingUDPServer(ThreadingUDPServer):
-            def __init__(derived, server_address: Tuple[str, int], request_handler: Callable[..., BaseRequestHandler]):
+            def __init__(derived, server_address: tuple[str, int], request_handler: Callable[..., BaseRequestHandler]):
                 try:
                     # enable reuse, in case the restart was too fast and the port was still in TIME_WAIT
                     MyThreadingUDPServer.allow_reuse_address = True
@@ -629,7 +644,6 @@ class ServiceBus(Service):
                         if not server:
                             return
                         try:
-                            server.last_seen = datetime.now(timezone.utc)
                             command = data['command']
                             if command == 'registerDCSServer':
                                 if not server.is_remote:
@@ -640,7 +654,7 @@ class ServiceBus(Service):
                                         self.log.debug(f"Registering server {server.name} on Master node ...")
                             elif server.status == Status.UNREGISTERED:
                                 self.log.debug(
-                                    f"Command {command} for unregistered server {server.name} received, ignoring.")
+                                    f"Command {command} received for unregistered server {server.name}, ignoring.")
                                 continue
                             if self.master:
                                 futures = [

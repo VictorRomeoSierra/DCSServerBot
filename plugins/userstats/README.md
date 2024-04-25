@@ -1,8 +1,13 @@
 # Plugin "UserStats"
-DCSServerBot comes with a built-in, database driven statistics system. It allows either users to show their own 
+DCSServerBot comes with a built-in, database driven statistics system. It allows users to show their own 
 achievements like k/d-ratio, flighttimes per module, server or map, etc. For server owners, it allows you to see which 
 of your servers and missions are being used most, at which time and from which kind of users (Discord members vs. 
 public players).
+
+## Squadrons
+If you want to group people to see group stats etc, you can create squadrons with DCSServerBot.<br>
+Commands to manage squadrons are describe below. You can select squadrons in the period parameter of highscore and
+other statistics commands where it makes sense.
 
 ## Configuration
 The plugin can be configured via yaml in config/plugins/userstats.yaml. If such a file does not exists, create one.
@@ -10,12 +15,14 @@ The plugin can be configured via yaml in config/plugins/userstats.yaml. If such 
 ```yaml
 DEFAULT:
   wipe_stats_on_leave: true # wipe user statistics if they leave your Discord server (default: true)
+  squadrons:
+    self_join: true   # enable self-join for squadrons (default: true, otherwise you need to get the associated role)
   highscore:  # overall persistent highscore display (optional)
     channel: 1122334455667788
     params:
       period: month   # can be one of day, month, quarter, year, or any campaign name
       limit: 10       # number of players per entry
-DCS.openbeta_server:
+DCS.release_server:
   highscore:  # server-specific persistent highscore (optional)
   - channel: 9988776655443322
     params:
@@ -32,27 +39,18 @@ instance2:
   enabled: false  # we disable statistics gathering on instance2
 ```
 
-## User Linking
-It is recommended that your users link their Discord ID to their UCID (DCS World ID). The bot can try to do that by 
-itself (bot.yaml: `automatch: true`), but might fail, especially, when the in-game names and Discord names of users differ a lot.
-> Users can generate a unique TOKEN that is being sent as a DM with the ```/linkme``` command.<br>
-> The TOKEN can then be entered in the in-game chat as a chat-command with ```-linkme TOKEN```.
-
 ## Discord Commands
 
-| Command             | Parameter         | Channel       | Role           | Description                                                                                         |
-|---------------------|-------------------|---------------|----------------|-----------------------------------------------------------------------------------------------------|
-| /statistics         | [user] [period]   | all           | DCS            | Display your own statistics or that of a specific user. A period can be supplied.                   |
-| /highscore          | [server] [period] | all           | DCS            | Shows the players with the most playtime or most kills in specific areas (CAP/CAS/SEAD/Anti-Ship)   |
-| /link               | @member player    | all           | DCS Admin      | Sometimes users can't be linked automatically. This is the manual workaround.                       |
-| /unlink             | user              | all           | DCS Admin      | Unlink a member from a ucid / ucid from a user, if the automatic linking made a mistake.            |
-| /info               | user              | all           | DCS Admin      | Displays information about that user and let you (un)ban, kick or unlink them.                      |  
-| /linkcheck          |                   | all           | DCS Admin      | Checks if a DCS user could be matched to a member.                                                  |
-| /mislinks           |                   | all           | DCS Admin      | Checks if a DCS user is possibly mismatched with the wrong member (might still be correct though!). |
-| /linkme             |                   | all           | DCS            | Link a discord user to a DCS user (user self-service).                                              |
-| /inactive           | period number     | admin-channel | DCS Admin      | Show users that are inactive for a specific amount of time.                                         |
-| /reset_statistics   | [server]          | admin-channel | Admin          | Deletes the statistics. If a server is provided, only this server is affected.                      |
-| /delete_statistics  | [user]            | all           | DCS, DCS Admin | Lets a user delete their own statistics, or an DCS Admin do it for any user.                        |
+| Command            | Parameter         | Channel       | Role           | Description                                                                                       |
+|--------------------|-------------------|---------------|----------------|---------------------------------------------------------------------------------------------------|
+| /statistics        | [user] [period]   | all           | DCS            | Display your own statistics or that of a specific user. A period can be supplied.                 |
+| /highscore         | [server] [period] | all           | DCS            | Shows the players with the most playtime or most kills in specific areas (CAP/CAS/SEAD/Anti-Ship) |
+| /reset_statistics  | [server]          | admin-channel | Admin          | Deletes the statistics. If a server is provided, only this server is affected.                    |
+| /delete_statistics | [user]            | all           | DCS, DCS Admin | Lets a user delete their own statistics, or an DCS Admin do it for any user.                      |
+| /squadron create   | <name> [role]     | all           | DCS Admin      | Create a new squadron and give it an optional auto-role.                                          |
+| /squadron delete   | <name>            | all           | DCS Admin      | Deletes a squadron and removes all players from that squadron mapping.                            |
+| /squadron join     | <name>            | all           | DCS            | Join a squadron (and get the optional auto role).                                                 |
+| /squadron leave    | <name>            | all           | DCS            | Leave a squadron (and remove the optional auto role).                                             |
 
 ### Periods
 Periods can be used to specify, if you only want to see statistics for a specific time-period.

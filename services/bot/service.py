@@ -8,7 +8,9 @@ import os
 import shutil
 import zipfile
 
-from core import ServiceRegistry, Service, utils
+from core import utils
+from core.services.base import Service
+from core.services.registry import ServiceRegistry
 from discord.ext import commands
 from discord.utils import MISSING
 from io import BytesIO
@@ -17,18 +19,36 @@ from typing import Optional, Union, TYPE_CHECKING
 
 from .dcsserverbot import DCSServerBot
 
+# ruamel YAML support
+from ruamel.yaml import YAML
+yaml = YAML()
+
 if TYPE_CHECKING:
     from core import Server, Plugin
 
 __all__ = ["BotService"]
 
 
-@ServiceRegistry.register("Bot", master_only=True)
+@ServiceRegistry.register(master_only=True)
 class BotService(Service):
 
-    def __init__(self, node, name: str):
-        super().__init__(node=node, name=name)
-        self.bot = None
+    def __init__(self, node):
+        super().__init__(node=node, name="Bot")
+        self.bot: Optional[DCSServerBot] = None
+        # do we need to change the bot.yaml file?
+        if isinstance(self.locals.get('autorole'), str):
+            value = self.locals.pop('autorole')
+            if self.locals.get('roles', {}).get('DCS', []) and self.locals['roles']['DCS'][0] != '@everyone':
+                if value == 'join':
+                    self.locals['autorole'] = {
+                        "on_join": self.locals['roles']['DCS'][0]
+                    }
+                elif value == 'linkme':
+                    self.locals['autorole'] = {
+                        "linked": self.locals['roles']['DCS'][0]
+                    }
+            with open(os.path.join('config', 'services', self.name + '.yaml'), mode='w', encoding='utf-8') as outfile:
+                yaml.dump(self.locals, outfile)
 
     def init_bot(self):
         def get_prefix(client, message):
@@ -51,9 +71,11 @@ class BotService(Service):
                             assume_unsync_clock=True)
 
     async def start(self, *, reconnect: bool = True) -> None:
+        from services import ServiceBus
+
         await super().start()
         try:
-            while not ServiceRegistry.get("ServiceBus"):
+            while not ServiceRegistry.get(ServiceBus):
                 await asyncio.sleep(1)
             self.bot = self.init_bot()
             await self.install_fonts()
@@ -74,16 +96,17 @@ class BotService(Service):
             await self.bot.close()
         await super().stop()
 
-    async def alert(self, message: str, server: Optional[Server] = None, node: Optional[str] = None) -> None:
+    async def alert(self, title: str, message: str, server: Optional[Server] = None,
+                    node: Optional[str] = None) -> None:
         mentions = ''.join([self.bot.get_role(role).mention for role in self.bot.roles['Alert']])
-        message = mentions + ' ' + utils.escape_string(message)
+        embed, file = utils.create_warning_embed(title=title, text=utils.escape_string(message))
         if not server and node:
             try:
                 server = next(server for server in self.bot.servers.values() if server.node.name == node)
             except StopIteration:
                 server = None
         if server:
-            await self.bot.get_admin_channel(server).send(message)
+            await self.bot.get_admin_channel(server).send(content=mentions, embed=embed, file=file)
 
     async def install_fonts(self):
         font = self.locals.get('reports', {}).get('cjk_font')

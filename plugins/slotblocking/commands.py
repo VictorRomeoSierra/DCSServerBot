@@ -28,7 +28,7 @@ class SlotBlocking(Plugin):
                 del instance['use_reservations']
 
         if version == '3.1':
-            path = os.path.join('config', 'plugins', self.plugin_name + '.yaml')
+            path = os.path.join(self.node.config_dir, 'plugins', self.plugin_name + '.yaml')
             data = yaml.load(Path(path).read_text(encoding='utf-8'))
             if self.node.name in data.keys():
                 for name, node in data.items():
@@ -61,27 +61,28 @@ class SlotBlocking(Plugin):
 
     @commands.Cog.listener()
     async def on_member_update(self, before: discord.Member, after: discord.Member):
-        # did a member change its roles?
-        if before.roles != after.roles:
-            for server in self.bot.servers.values():
-                player: Player = server.get_player(discord_id=after.id)
-                if not player:
-                    ucid = await self.bot.get_ucid_by_member(after)
-                    if not ucid:
-                        return
-                    roles = [
-                        self.bot.get_role(x) for x in self.get_config(server).get('VIP', {}).get('discord', [])
-                    ]
-                    if not roles:
-                        return
-                    for role in set(before.roles) | set(after.roles):
-                        if role in roles:
-                            server.send_to_dcs({
-                                'command': 'uploadUserRoles',
-                                'ucid': ucid,
-                                'roles': [x.id for x in after.roles]
-                            })
-                            break
+        # did a member change their roles?
+        if before.roles == after.roles:
+            return
+        for server in self.bot.servers.values():
+            player: Player = server.get_player(discord_id=after.id)
+            if not player:
+                ucid = await self.bot.get_ucid_by_member(after, verified=True)
+                if not ucid:
+                    return
+                roles = [
+                    self.bot.get_role(x) for x in self.get_config(server).get('VIP', {}).get('discord', [])
+                ]
+                if not roles:
+                    return
+                for role in set(before.roles) | set(after.roles):
+                    if role in roles:
+                        server.send_to_dcs({
+                            'command': 'uploadUserRoles',
+                            'ucid': ucid,
+                            'roles': [x.id for x in after.roles]
+                        })
+                        break
 
 
 async def setup(bot: DCSServerBot):
