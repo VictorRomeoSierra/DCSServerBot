@@ -10,9 +10,9 @@ class HelpListener(EventListener):
 
     @event(name="onPlayerStart")
     async def onPlayerStart(self, server: Server, data: dict) -> None:
-        if data['id'] == 1:
+        if data['id'] == 1 or 'ucid' not in data:
             return
-        player: Player = server.get_player(id=data['id'])
+        player: Player = server.get_player(ucid=data['ucid'])
         if player:
             player.sendChatMessage(f"Use \"{self.prefix}help\" for commands.")
 
@@ -23,7 +23,7 @@ class HelpListener(EventListener):
         ]
         for listener in self.bot.eventListeners:
             for command in listener.chat_commands:
-                if command.roles and not player.has_discord_roles(command.roles):
+                if not listener.can_run(command, server, player):
                     continue
                 cmd = f"{self.prefix}{command.name}"
                 if command.usage:

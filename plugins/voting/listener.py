@@ -1,6 +1,6 @@
 import asyncio
 
-from core import EventListener, chat_command, Server, Player, utils, Coalition, Plugin, event
+from core import EventListener, chat_command, Server, Player, utils, Coalition, Plugin, event, ChatCommand
 from functools import partial
 from itertools import islice
 from typing import Optional
@@ -132,8 +132,12 @@ class VotingHandler:
 
 
 class VotingListener(EventListener):
-    def __init__(self, plugin: Plugin):
-        super().__init__(plugin)
+
+    def can_run(self, command: ChatCommand, server: Server, player: Player) -> bool:
+        config = self.get_config(server=server)
+        if not config:
+            return False
+        return super().can_run(command, server, player)
 
     def check_role(self, player: Player, roles: Optional[list[str]] = None) -> bool:
         if not roles:
@@ -183,12 +187,15 @@ class VotingListener(EventListener):
         config['prefix'] = self.prefix
         try:
             class_name = f"plugins.voting.options.{what}.{what.title()}"
-            item = utils.str_to_class(class_name)(
+            item: VotableItem = utils.str_to_class(class_name)(
                 server, config['options'].get(what), params[1:] if len(params) > 1 else None
             )
             if not item:
                 self.log.error(f"Can't find class {class_name}! Voting aborted.")
                 player.sendChatMessage("Voting aborted due to a server misconfiguration.")
+                return
+            elif not item.can_vote():
+                player.sendChatMessage("This voting option is not available at the moment.")
                 return
             if points and isinstance(player, CreditPlayer):
                 player.points -= points
@@ -201,12 +208,12 @@ class VotingListener(EventListener):
 
     @event(name="onPlayerStart")
     async def onPlayerStart(self, server: Server, data: dict) -> None:
-        if data['id'] == 1:
+        if data['id'] == 1 or 'ucid' not in data:
             return
         config = self.get_config(server)
         if 'welcome_message' not in config:
             return
-        player: Player = server.get_player(id=data['id'])
+        player: Player = server.get_player(ucid=data['ucid'])
         if player:
             player.sendChatMessage(utils.format_string(config['welcome_message'], server=server, player=player,
                                                        prefix=self.prefix))
@@ -216,8 +223,6 @@ class VotingListener(EventListener):
         global all_votes
 
         config = self.get_config(server=server)
-        if not config:
-            return
         if server.name in all_votes:
             if len(params) == 1 and params[0] == 'cancel':
                 if utils.check_roles(['DCS Admin'], player.member):

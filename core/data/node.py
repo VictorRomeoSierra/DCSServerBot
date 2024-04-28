@@ -1,18 +1,19 @@
 import os
 
+from core.translations import get_translation
 from enum import Enum, auto
 from pathlib import Path
-from typing import Union, Optional, Tuple
+from typing import Union, Optional, TYPE_CHECKING
 
-from .instance import Instance
-from .server import Server
 from ..utils.helper import YAMLError
 
 # ruamel YAML support
 from ruamel.yaml import YAML
-from ruamel.yaml.parser import ParserError
-from ruamel.yaml.scanner import ScannerError
+from ruamel.yaml.error import MarkedYAMLError
 yaml = YAML()
+
+if TYPE_CHECKING:
+    from core import Server, Instance
 
 __all__ = [
     "Node",
@@ -20,6 +21,9 @@ __all__ = [
     "SortOrder",
     "FatalException"
 ]
+
+
+_ = get_translation('core')
 
 
 class UploadStatus(Enum):
@@ -42,10 +46,10 @@ class FatalException(Exception):
 
 class Node:
 
-    def __init__(self, name: str, config_dir: Optional[str] = './config'):
+    def __init__(self, name: str, config_dir: Optional[str] = 'config'):
         self.name = name
         self.config_dir = config_dir
-        self.instances: list[Instance] = list()
+        self.instances: list["Instance"] = list()
         self.locals = None
         self.config = self.read_config(os.path.join(config_dir, 'main.yaml'))
         self.guild_id: int = int(self.config['guild_id'])
@@ -83,24 +87,30 @@ class Node:
             config['messages'] = config.get('messages', {})
             config['messages']['player_username'] = config['messages'].get(
                 'player_username',
-                'Your player name contains invalid characters. Please change your name to join our server.'
+                _('Your player name contains invalid characters. Please change your name to join our server.')
             )
             config['messages']['player_default_username'] = config['messages'].get(
                 'player_default_username',
-                'Please change your default player name at the top right of the multiplayer selection list to an '
-                'individual one!'
+                _('Please change your default player name at the top right of the multiplayer selection list to an '
+                  'individual one!')
             )
             config['messages']['player_banned'] = config['messages'].get(
-                'player_banned', 'You are banned from this server. Reason: {}'
+                'player_banned', _('You are banned from this server. Reason: {}')
             )
             config['chat_command_prefix'] = config.get('chat_command_prefix', '-')
             return config
         except FileNotFoundError:
             raise FatalException()
-        except (ParserError, ScannerError) as ex:
+        except MarkedYAMLError as ex:
             raise YAMLError(file, ex)
 
     def read_locals(self) -> dict:
+        raise NotImplemented()
+
+    async def shutdown(self):
+        raise NotImplemented()
+
+    async def restart(self):
         raise NotImplemented()
 
     async def upgrade_pending(self) -> bool:
@@ -109,10 +119,10 @@ class Node:
     async def upgrade(self):
         raise NotImplemented()
 
-    async def update(self, warn_times: list[int]) -> int:
+    async def update(self, warn_times: list[int], branch: Optional[str] = None) -> int:
         raise NotImplemented()
 
-    async def get_dcs_branch_and_version(self) -> Tuple[str, str]:
+    async def get_dcs_branch_and_version(self) -> tuple[str, str]:
         raise NotImplemented()
 
     async def handle_module(self, what: str, module: str) -> None:
@@ -124,7 +134,7 @@ class Node:
     async def get_available_modules(self, userid: Optional[str] = None, password: Optional[str] = None) -> list[str]:
         raise NotImplemented()
 
-    async def shell_command(self, cmd: str) -> Optional[Tuple[str, str]]:
+    async def shell_command(self, cmd: str) -> Optional[tuple[str, str]]:
         raise NotImplemented()
 
     async def read_file(self, path: str) -> Union[bytes, int]:
@@ -142,23 +152,23 @@ class Node:
     async def rename_file(self, old_name: str, new_name: str, *, force: Optional[bool] = False):
         raise NotImplemented()
 
-    async def rename_server(self, server: Server, new_name: str):
+    async def rename_server(self, server: "Server", new_name: str):
         raise NotImplemented()
 
-    async def add_instance(self, name: str, *, template: Optional[Instance] = None) -> Instance:
+    async def add_instance(self, name: str, *, template: Optional["Instance"] = None) -> "Instance":
         raise NotImplemented()
 
-    async def delete_instance(self, instance: Instance, remove_files: bool) -> None:
+    async def delete_instance(self, instance: "Instance", remove_files: bool) -> None:
         raise NotImplemented()
 
-    async def rename_instance(self, instance: Instance, new_name: str) -> None:
+    async def rename_instance(self, instance: "Instance", new_name: str) -> None:
         raise NotImplemented()
 
-    async def find_all_instances(self) -> list[Tuple[str, str]]:
+    async def find_all_instances(self) -> list[tuple[str, str]]:
         raise NotImplemented()
 
-    async def migrate_server(self, server: Server, instance: Instance) -> None:
+    async def migrate_server(self, server: "Server", instance: "Instance") -> None:
         raise NotImplemented()
 
-    async def unregister_server(self, server: Server) -> None:
+    async def unregister_server(self, server: "Server") -> None:
         raise NotImplemented()

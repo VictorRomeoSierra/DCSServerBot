@@ -1,30 +1,31 @@
 from __future__ import annotations
 import asyncio
-import functools
 import discord
+import functools
 import os
 import re
 
 from core import Status, utils
 from datetime import datetime
 from discord import app_commands, Interaction, SelectOption
-from discord.app_commands import Choice, TransformerError
 from discord.ext import commands
 from discord.ui import Button, View, Select
 from enum import Enum, auto
 from fuzzywuzzy import fuzz
-from typing import Optional, cast, Union, TYPE_CHECKING, Iterable, Any
+from io import BytesIO
+from psycopg.rows import dict_row
+from typing import Optional, cast, Union, TYPE_CHECKING, Iterable, Any, Callable
 
 from .helper import get_all_players, is_ucid, format_string
 
 if TYPE_CHECKING:
-    from core import Server, Player, Node, Instance, Plugin
+    from core import Server, Player, Node, Instance, Plugin, Command
     from services import DCSServerBot, ServiceBus
+
 
 __all__ = [
     "PlayerType",
     "wait_for_single_reaction",
-    "input_value",
     "selection_list",
     "selection",
     "yn_question",
@@ -41,7 +42,9 @@ __all__ = [
     "format_embed",
     "embed_to_text",
     "embed_to_simpletext",
+    "create_warning_embed",
     "escape_string",
+    "print_ruler",
     "match",
     "get_interaction_param",
     "get_all_linked_members",
@@ -53,8 +56,11 @@ __all__ = [
     "airbase_autocomplete",
     "mission_autocomplete",
     "group_autocomplete",
+    "squadron_autocomplete",
+    "get_squadron",
     "server_selection",
-    "get_ephemeral"
+    "get_ephemeral",
+    "get_command"
 ]
 
 
@@ -99,29 +105,6 @@ async def wait_for_single_reaction(bot: DCSServerBot, interaction: discord.Inter
     finally:
         for task in tasks:
             task.cancel()
-
-
-async def input_value(bot: DCSServerBot, interaction: discord.Interaction, message: Optional[str] = None,
-                      delete: Optional[bool] = False, timeout: Optional[float] = 300.0):
-    def check(m):
-        return (m.channel == interaction.channel) & (m.author == interaction.user)
-
-    msg = response = None
-    try:
-        if message:
-            if interaction.response.is_done():
-                msg = await interaction.followup.send(message, ephemeral=True)
-            else:
-                await interaction.response.send_message(message, ephemeral=True)
-                msg = await interaction.original_response()
-        response = await bot.wait_for('message', check=check, timeout=timeout)
-        return response.content if response.content != '.' else None
-    finally:
-        if delete:
-            if msg:
-                await msg.delete()
-            if response:
-                await response.delete()
 
 
 async def selection_list(bot: DCSServerBot, interaction: discord.Interaction, data: list, embed_formatter, num: int = 5,
@@ -178,8 +161,11 @@ async def selection_list(bot: DCSServerBot, interaction: discord.Interaction, da
                 return (ord(react.emoji[0]) - 0x31) + j * num
         return -1
     except (TimeoutError, asyncio.TimeoutError):
-        if message:
-            await message.delete()
+        try:
+            if message:
+                await message.delete()
+        except discord.NotFound:
+            pass
         return -1
 
 
@@ -196,7 +182,9 @@ class SelectView(View):
 
     @discord.ui.select()
     async def callback(self, interaction: Interaction, select: Select):
+        # noinspection PyUnresolvedReferences
         if not interaction.response.is_done():
+            # noinspection PyUnresolvedReferences
             await interaction.response.defer()
         if select.max_values > 1:
             self.result = select.values
@@ -205,12 +193,14 @@ class SelectView(View):
         self.stop()
 
     @discord.ui.button(label='OK', style=discord.ButtonStyle.green, custom_id='sl_ok')
-    async def on_ok(self, interaction: Interaction, button: Button):
+    async def on_ok(self, interaction: Interaction, _: Button):
+        # noinspection PyUnresolvedReferences
         await interaction.response.defer()
         self.stop()
 
     @discord.ui.button(label='Cancel', style=discord.ButtonStyle.red, custom_id='sl_cancel')
-    async def on_cancel(self, interaction: Interaction, button: Button):
+    async def on_cancel(self, interaction: Interaction, _: Button):
+        # noinspection PyUnresolvedReferences
         await interaction.response.defer()
         self.result = None
         self.stop()
@@ -219,7 +209,7 @@ class SelectView(View):
 async def selection(interaction: Union[discord.Interaction, commands.Context], *, title: Optional[str] = None,
                     placeholder: Optional[str] = None, embed: discord.Embed = None,
                     options: list[SelectOption], min_values: Optional[int] = 1,
-                    max_values: Optional[int] = 1, ephemeral: bool = False) -> Optional[Union[list, str]]:
+                    max_values: Optional[int] = 1, ephemeral: bool = False) -> Optional[Union[list, str, int]]:
     """
     This function generates a selection menu on Discord with provided options.
     If only one option is present, it immediately returns that option's value.
@@ -237,9 +227,11 @@ async def selection(interaction: Union[discord.Interaction, commands.Context], *
     msg = None
     try:
         if isinstance(interaction, discord.Interaction):
+            # noinspection PyUnresolvedReferences
             if interaction.response.is_done():
                 msg = await interaction.followup.send(embed=embed, view=view, ephemeral=ephemeral)
             else:
+                # noinspection PyUnresolvedReferences
                 await interaction.response.send_message(embed=embed, view=view, ephemeral=ephemeral)
                 msg = await interaction.original_response()
         else:
@@ -248,8 +240,11 @@ async def selection(interaction: Union[discord.Interaction, commands.Context], *
             return None
         return view.result
     finally:
-        if msg:
-            await msg.delete()
+        try:
+            if msg:
+                await msg.delete()
+        except discord.NotFound:
+            pass
 
 
 class YNQuestionView(View):
@@ -258,13 +253,15 @@ class YNQuestionView(View):
         self.result = False
 
     @discord.ui.button(label='Yes', style=discord.ButtonStyle.green, custom_id='yn_yes')
-    async def on_yes(self, interaction: Interaction, button: Button):
+    async def on_yes(self, interaction: Interaction, _: Button):
+        # noinspection PyUnresolvedReferences
         await interaction.response.defer()
         self.result = True
         self.stop()
 
     @discord.ui.button(label='No', style=discord.ButtonStyle.red, custom_id='yn_no')
-    async def on_no(self, interaction: Interaction, button: Button):
+    async def on_no(self, interaction: Interaction, _: Button):
+        # noinspection PyUnresolvedReferences
         await interaction.response.defer()
         self.result = False
         self.stop()
@@ -296,7 +293,10 @@ async def yn_question(ctx: Union[commands.Context, discord.Interaction], questio
             return False
         return view.result
     finally:
-        await msg.delete()
+        try:
+            await msg.delete()
+        except discord.NotFound:
+            pass
 
 
 class PopulatedQuestionView(View):
@@ -305,19 +305,22 @@ class PopulatedQuestionView(View):
         self.result = None
 
     @discord.ui.button(label='Yes', style=discord.ButtonStyle.green, custom_id='pl_yes')
-    async def on_yes(self, interaction: Interaction, button: Button):
+    async def on_yes(self, interaction: Interaction, _: Button):
+        # noinspection PyUnresolvedReferences
         await interaction.response.defer()
         self.result = 'yes'
         self.stop()
 
     @discord.ui.button(label='Later', style=discord.ButtonStyle.primary, custom_id='pl_later', emoji='⏱')
-    async def on_later(self, interaction: Interaction, button: Button):
+    async def on_later(self, interaction: Interaction, _: Button):
+        # noinspection PyUnresolvedReferences
         await interaction.response.defer()
         self.result = 'later'
         self.stop()
 
     @discord.ui.button(label='Cancel', style=discord.ButtonStyle.red, custom_id='pl_cancel')
-    async def on_cancel(self, interaction: Interaction, button: Button):
+    async def on_cancel(self, interaction: Interaction, _: Button):
+        # noinspection PyUnresolvedReferences
         await interaction.response.defer()
         self.stop()
 
@@ -325,8 +328,8 @@ class PopulatedQuestionView(View):
 async def populated_question(interaction: discord.Interaction, question: str, message: Optional[str] = None,
                              ephemeral: Optional[bool] = True) -> Optional[str]:
     """
-    Same as yn_question, but adds an additional option "Later". The usual usecase of this function would be
-    if people are flying atm and you want to ask to trigger an action that would affect their experience (aka stop
+    Same as yn_question, but adds an option "Later". The usual use-case of this function would be
+    if people are flying atm, and you want to ask to trigger an action that would affect their experience (aka stop
     the server).
 
     :param interaction: The discord interaction object.
@@ -339,9 +342,11 @@ async def populated_question(interaction: discord.Interaction, question: str, me
     if message is not None:
         embed.add_field(name=message, value='_ _')
     view = PopulatedQuestionView()
+    # noinspection PyUnresolvedReferences
     if interaction.response.is_done():
         msg = await interaction.followup.send(embed=embed, view=view, ephemeral=ephemeral)
     else:
+        # noinspection PyUnresolvedReferences
         await interaction.response.send_message(embed=embed, view=view, ephemeral=ephemeral)
         msg = await interaction.original_response()
     try:
@@ -349,7 +354,10 @@ async def populated_question(interaction: discord.Interaction, question: str, me
             return None
         return view.result
     finally:
-        await msg.delete()
+        try:
+            await msg.delete()
+        except discord.NotFound:
+            pass
 
 
 def check_roles(roles: Iterable[Union[str, int]], member: Optional[discord.Member] = None) -> bool:
@@ -546,7 +554,7 @@ def format_embed(data: dict, **kwargs) -> discord.Embed:
     Example usage:
 
     data = {
-        'color': discord.Color.red(),
+        'color': 3430907, (#3498DB = blue)
         'title': 'Hello World',
         'description': 'This is an example embed',
         'footer': {
@@ -569,7 +577,7 @@ def format_embed(data: dict, **kwargs) -> discord.Embed:
 
     embed = format_embed(data)
     """
-    color = data['color'] if 'color' in data else discord.Color.blue()
+    color = int(data.get('color', discord.Color.blue()))
     embed = discord.Embed(color=color)
     if 'title' in data:
         embed.title = format_string(data['title'], **kwargs) or '_ _'
@@ -715,6 +723,22 @@ def embed_to_simpletext(embed: discord.Embed) -> str:
     return message
 
 
+def create_warning_embed(title: str, text: Optional[str] = None,
+                         fields: Optional[list[tuple[str, str]]] = None) -> tuple[discord.Embed, discord.File]:
+    embed = discord.Embed(title=title, color=discord.Color.yellow())
+    if text:
+        embed.description = text
+    with open("images/warning.png", mode="rb") as img:
+        img_bytes = img.read()
+    buffer = BytesIO(img_bytes)
+    file = discord.File(fp=buffer, filename="warning.png")
+    embed.set_thumbnail(url="attachment://warning.png")
+    if fields:
+        for name, value in fields:
+            embed.add_field(name=name, value=value)
+    return embed, file
+
+
 def escape_string(msg: str) -> str:
     """
     Escape special characters in a given string to display them in Discord.
@@ -724,6 +748,15 @@ def escape_string(msg: str) -> str:
     :rtype: str
     """
     return re.sub(r"([\\_*~`|>#+\-={}!.\[\]()])", r"\\\1", msg)
+
+
+def print_ruler(*, ruler_length: Optional[int] = 34, header: Optional[str] = None) -> str:
+    if header:
+        header = ' ' + header + ' '
+    filler = int((ruler_length - len(header) / 2.5) / 2)
+    if filler <= 0:
+        filler = 1
+    return '▬' * filler + header + '▬' * filler
 
 
 def normalize_name(name: Optional[str] = None) -> Optional[str]:
@@ -828,31 +861,34 @@ class ServerTransformer(app_commands.Transformer):
     :type status: list of :class:`Status`
 
     """
-    def __init__(self, *, status: list[Status] = None):
+    def __init__(self, *, status: list[Status] = None, maintenance: Optional[bool] = None):
         super().__init__()
         self.status: list[Status] = status
+        self.maintenance = maintenance
 
     async def transform(self, interaction: discord.Interaction, value: Optional[str]) -> Server:
         if value:
             server = interaction.client.servers.get(value)
             if not server:
-                raise TransformerError(value, self.type, self)
+                raise app_commands.TransformerError(value, self.type, self)
         else:
             server = interaction.client.get_server(interaction)
         return server
 
-    async def autocomplete(self, interaction: discord.Interaction, current: str) -> list[Choice[str]]:
+    async def autocomplete(self, interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
         if not await interaction.command._check_can_run(interaction):
             return []
         try:
             server: Optional[Server] = interaction.client.get_server(interaction)
             if (not current and server and server.status != Status.UNREGISTERED and
                     (not self.status or server.status in self.status)):
-                return [Choice(name=server.name, value=server.name)]
-            choices: list[Choice[str]] = [
-                Choice(name=name, value=name)
+                return [app_commands.Choice(name=server.name, value=server.name)]
+            choices: list[app_commands.Choice[str]] = [
+                app_commands.Choice(name=name, value=name)
                 for name, value in interaction.client.servers.items()
-                if (value.status != Status.UNREGISTERED and (not self.status or value.status in self.status) and
+                if (value.status != Status.UNREGISTERED and
+                    (not self.status or value.status in self.status) and
+                    (not self.maintenance or value.maintenance == self.maintenance) and
                     (not current or current.casefold() in name.casefold()))
             ]
             return choices[:25]
@@ -871,7 +907,7 @@ class NodeTransformer(app_commands.Transformer):
         else:
             return interaction.client.node
 
-    async def autocomplete(self, interaction: discord.Interaction, current: str) -> list[Choice[str]]:
+    async def autocomplete(self, interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
         if not await interaction.command._check_can_run(interaction):
             return []
         try:
@@ -906,7 +942,7 @@ class InstanceTransformer(app_commands.Transformer):
         else:
             return None
 
-    async def autocomplete(self, interaction: discord.Interaction, current: str) -> list[Choice[str]]:
+    async def autocomplete(self, interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
         if not await interaction.command._check_can_run(interaction):
             return []
         try:
@@ -914,10 +950,10 @@ class InstanceTransformer(app_commands.Transformer):
             if not node:
                 return []
             if self.unused:
-                all_instances = [instance for server_name, instance in await node.find_all_instances()]
-                for instance in node.instances:
-                    all_instances.remove(instance.name)
-                instances = all_instances
+                instances = [
+                    instance for server_name, instance in await node.find_all_instances()
+                    if instance not in node.instances
+                ]
             else:
                 instances = [x.name for x in node.instances]
             return [
@@ -983,6 +1019,31 @@ async def group_autocomplete(interaction: discord.Interaction, current: str) -> 
     ][:25]
 
 
+async def squadron_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[int]]:
+    if not await interaction.command._check_can_run(interaction):
+        return []
+    async with interaction.client.apool.connection() as conn:
+        cursor = await conn.execute("SELECT id, name FROM squadrons WHERE name ILIKE %s", ('%' + current + '%', ))
+        choices: list[app_commands.Choice[int]] = [
+            app_commands.Choice(name=row[1], value=row[0])
+            async for row in cursor
+        ]
+        return choices[:25]
+
+
+async def get_squadron(bot: DCSServerBot, *, name: Optional[str] = None,
+                       squadron_id: Optional[int] = None) -> Optional[dict]:
+    sql = "SELECT * FROM squadrons"
+    if name:
+        sql += " WHERE name = %(name)s"
+    elif squadron_id:
+        sql += " WHERE id = %(squadron_id)s"
+    async with bot.apool.connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cursor:
+            await cursor.execute(sql, {"name": name, "squadron_id": squadron_id})
+            return await cursor.fetchone()
+
+
 class UserTransformer(app_commands.Transformer):
     """
     A class for transforming interaction values to either discord.Member or ucid (str) objects and providing autocomplete choices for users.
@@ -1007,7 +1068,7 @@ class UserTransformer(app_commands.Transformer):
         else:
             return interaction.user
 
-    async def autocomplete(self, interaction: Interaction, current: str) -> list[Choice[str]]:
+    async def autocomplete(self, interaction: Interaction, current: str) -> list[app_commands.Choice[str]]:
         # is a user is not allowed to run the interaction, they are not allowed to see the autocompletions also
         if not await interaction.command._check_can_run(interaction):
             return []
@@ -1044,7 +1105,7 @@ class PlayerTransformer(app_commands.Transformer):
         server: Server = await ServerTransformer().transform(interaction, get_interaction_param(interaction, 'server'))
         return server.get_player(ucid=value, active=self.active)
 
-    async def autocomplete(self, interaction: Interaction, current: str) -> list[Choice[str]]:
+    async def autocomplete(self, interaction: Interaction, current: str) -> list[app_commands.Choice[str]]:
         if not await interaction.command._check_can_run(interaction):
             return []
         try:
@@ -1070,18 +1131,24 @@ class PlayerTransformer(app_commands.Transformer):
             interaction.client.log.exception(ex)
 
 
+def _server_filter(server: Server) -> bool:
+    return True
+
+
 async def server_selection(bus: ServiceBus,
                            interaction: Union[discord.Interaction, commands.Context], *, title: str,
                            multi_select: Optional[bool] = False,
-                           ephemeral: Optional[bool] = True) -> Optional[Union[Server, list[Server]]]:
+                           ephemeral: Optional[bool] = True,
+                           filter_func: Callable[[Server], bool] = _server_filter
+                           ) -> Optional[Union[Server, list[Server]]]:
     """
 
     """
-    all_servers = list(bus.servers.keys())
+    all_servers = list(bus.servers.values())
     if len(all_servers) == 0:
         return []
     elif len(all_servers) == 1:
-        return [bus.servers[all_servers[0]]]
+        return [all_servers[0]]
     if multi_select:
         max_values = len(all_servers)
     else:
@@ -1091,17 +1158,17 @@ async def server_selection(bus: ServiceBus,
         server = interaction.client.get_server(interaction)
     s = await selection(interaction, title=title,
                         options=[
-                            SelectOption(label=x, value=x, default=(
+                            SelectOption(label=x.name, value=str(idx), default=(
                                 True if server and server == x else
                                 True if not server and idx == 0 else
                                 False
-                            )) for idx, x in enumerate(all_servers)
+                            )) for idx, x in enumerate(all_servers) if filter_func(x)
                         ],
                         max_values=max_values, ephemeral=ephemeral)
-    if multi_select:
-        return [bus.servers[x] for x in s]
+    if isinstance(s, list):
+        return [all_servers[int(x)] for x in s]
     elif s:
-        return bus.servers[s]
+        return all_servers[int(s)]
     return None
 
 
@@ -1125,3 +1192,16 @@ def get_ephemeral(interaction: discord.Interaction) -> bool:
         return True
     channel = bot.get_admin_channel(server)
     return not channel == interaction.channel
+
+
+async def get_command(bot: DCSServerBot, *, name: str,
+                      group: Optional[str] = None) -> Union[app_commands.AppCommand, app_commands.AppCommandGroup]:
+    for cmd in await bot.tree.fetch_commands(guild=bot.guilds[0]):
+        if cmd.options and isinstance(cmd.options[0], app_commands.AppCommandGroup):
+            if group != cmd.name:
+                continue
+            for inner in cmd.options:
+                if inner.name == name:
+                    return inner
+        elif cmd.name == name:
+            return cmd

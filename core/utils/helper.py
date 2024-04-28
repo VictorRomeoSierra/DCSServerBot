@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import builtins
+import importlib
 import json
-import time
 import luadata
 import os
+import pkgutil
 import re
 import shutil
 import string
 import tempfile
+import time
 import unicodedata
 
 # for eval
@@ -19,31 +21,30 @@ from croniter import croniter
 from datetime import datetime, timedelta, timezone
 from importlib import import_module
 from pathlib import Path
-from typing import Optional, Union, TYPE_CHECKING, Tuple, Generator, Iterable
+from typing import Optional, Union, TYPE_CHECKING, Generator, Iterable
 from urllib.parse import urlparse
 
 # ruamel YAML support
 from ruamel.yaml import YAML
-from ruamel.yaml.parser import ParserError
-from ruamel.yaml.scanner import ScannerError
-
+from ruamel.yaml.error import MarkedYAMLError
 yaml = YAML()
 
 if TYPE_CHECKING:
-    from core import ServerProxy, DataObject
+    from core import ServerProxy, DataObject, Node
 
 __all__ = [
+    "parse_time",
     "is_in_timeframe",
     "is_match_daystate",
     "str_to_class",
     "format_string",
+    "sanitize_string",
     "convert_time",
     "format_time",
     "get_utc_offset",
     "format_period",
     "slugify",
     "alternate_parse_settings",
-    "get_all_servers",
     "get_all_players",
     "is_ucid",
     "get_presets",
@@ -51,12 +52,20 @@ __all__ = [
     "is_valid_url",
     "is_github_repo",
     "matches_cron",
+    "dynamic_import",
     "SettingsDict",
     "RemoteSettingsDict",
+    "tree_delete",
     "evaluate",
     "for_each",
     "YAMLError"
 ]
+
+
+def parse_time(time_str: str) -> datetime:
+    fmt, time_str = ('%H:%M', time_str.replace('24:', '00:')) \
+        if time_str.find(':') > -1 else ('%H', time_str.replace('24', '00'))
+    return datetime.strptime(time_str, fmt)
 
 
 def is_in_timeframe(time: datetime, timeframe: str) -> bool:
@@ -70,11 +79,6 @@ def is_in_timeframe(time: datetime, timeframe: str) -> bool:
     :return: True if the time falls within the timeframe, False otherwise.
     :rtype: bool
     """
-    def parse_time(time_str: str) -> datetime:
-        fmt, time_str = ('%H:%M', time_str.replace('24:', '00:')) \
-            if time_str.find(':') > -1 else ('%H', time_str.replace('24', '00'))
-        return datetime.strptime(time_str, fmt)
-
     pos = timeframe.find('-')
     if pos != -1:
         start_time = parse_time(timeframe[:pos])
@@ -126,7 +130,7 @@ def format_string(string_: str, default_: Optional[str] = None, **kwargs) -> str
     """
     class NoneFormatter(string.Formatter):
         def format_field(self, value, spec):
-            if value is None:
+            if not isinstance(value, bool) and not value:
                 spec = ''
                 value = default_ or ''
             elif isinstance(value, list):
@@ -144,6 +148,16 @@ def format_string(string_: str, default_: Optional[str] = None, **kwargs) -> str
     return string_
 
 
+def sanitize_string(s: str) -> str:
+    # Replace single and double quotes, semicolons and backslashes
+    s = re.sub(r"[\"';\\]", "", s)
+
+    # Replace comment sequences
+    s = re.sub(r"--|/\*|\*/", "", s)
+
+    return s
+
+
 SECONDS_IN_DAY = 86400
 SECONDS_IN_HOUR = 3600
 SECONDS_IN_MINUTE = 60
@@ -158,8 +172,11 @@ def format_time_units(units, label_single, label_plural=None):
 def process_time(seconds, time_unit_seconds, retval, label_symbol, label_single, colon_format=False):
     units, seconds = calculate_time(time_unit_seconds, seconds)
     if units != 0:
-        if len(retval) and colon_format:
-            retval += ":"
+        if len(retval):
+            if colon_format:
+                retval += ":"
+            else:
+                retval += " "
         formatted_time = format_time_units(units, label_single) if not colon_format else f"{units:02d}{label_symbol}"
         retval += formatted_time
     return seconds, retval
@@ -190,7 +207,8 @@ def convert_time(seconds: int):
     :param seconds: The number of seconds to be converted into time representation.
     :return: The formatted string representation of time.
     """
-    return convert_time_and_format(int(seconds), True)
+    retval = convert_time_and_format(int(seconds), True)
+    return retval
 
 
 def format_time(seconds: int):
@@ -293,24 +311,8 @@ def alternate_parse_settings(path: str):
     return settings
 
 
-def get_all_servers(self) -> list[str]:
-    """
-    Get a list of all servers that have been seen in the past week.
-
-    :param self: The instance of the class.
-    :return: A list of server names.
-    """
-    with self.pool.connection() as conn:
-        return [
-            row[0] for row in conn.execute("""
-                SELECT server_name FROM instances 
-                WHERE last_seen > (DATE(now() AT TIME ZONE 'utc') - interval '1 week')
-            """)
-        ]
-
-
 def get_all_players(self, linked: Optional[bool] = None, watchlist: Optional[bool] = None,
-                    vip: Optional[bool] = None) -> list[Tuple[str, str]]:
+                    vip: Optional[bool] = None) -> list[tuple[str, str]]:
     """
     This method `get_all_players` returns a list of tuples containing the UCID and name of players from the database. Filtering can be optionally applied by providing values for the parameters
     * `linked`, `watchlist`, and `vip`.
@@ -332,9 +334,9 @@ def get_all_players(self, linked: Optional[bool] = None, watchlist: Optional[boo
         sql += " AND vip IS NOT FALSE"
     if linked is not None:
         if linked:
-            sql += " AND discord_id != -1"
+            sql += " AND discord_id != -1 AND manual IS TRUE"
         else:
-            sql += " AND discord_id = -1"
+            sql += " AND manual IS FALSE"
     with self.pool.connection() as conn:
         return [(row[0], row[1]) for row in conn.execute(sql)]
 
@@ -347,14 +349,14 @@ def is_ucid(ucid: Optional[str]) -> bool:
     return ucid is not None and len(ucid) == 32 and ucid.isalnum() and ucid == ucid.lower()
 
 
-def get_presets() -> Iterable[str]:
+def get_presets(node: Node) -> Iterable[str]:
     """
     Return the set of non-hidden presets from the YAML files in the 'config' directory.
 
     :return: A set of non-hidden presets.
     """
     presets = set()
-    for file in Path('config').glob('presets*.yaml'):
+    for file in Path(node.config_dir).glob('presets*.yaml'):
         with open(file, mode='r', encoding='utf-8') as infile:
             presets |= set([
                 name for name, value in yaml.load(infile).items()
@@ -363,8 +365,9 @@ def get_presets() -> Iterable[str]:
     return presets
 
 
-def get_preset(name: str, filename: Optional[str] = None) -> Optional[dict]:
+def get_preset(node: Node, name: str, filename: Optional[str] = None) -> Optional[dict]:
     """
+    :param node: The node where the configuration is stored.
     :param name: The name of the preset to retrieve.
     :param filename: The optional filename of the preset file to search in. If not provided, it will search for preset files in the 'config' directory.
     :return: The dictionary containing the preset data if found, or None if the preset was not found.
@@ -379,7 +382,7 @@ def get_preset(name: str, filename: Optional[str] = None) -> Optional[dict]:
     if filename:
         return _read_presets_from_file(Path(filename), name)
     else:
-        for file in Path('config').glob('presets*.yaml'):
+        for file in Path(node.config_dir).glob('presets*.yaml'):
             preset = _read_presets_from_file(file, name)
             if preset:
                 return preset
@@ -439,6 +442,13 @@ def matches_cron(datetime_obj: datetime, cron_string: str):
     next_date = cron_job.get_next(datetime)
     prev_date = cron_job.get_prev(datetime)
     return datetime_obj == prev_date or datetime_obj == next_date
+
+
+def dynamic_import(package_name: str):
+    package = importlib.import_module(package_name)
+    for loader, module_name, is_pkg in pkgutil.walk_packages(package.__path__):
+        if is_pkg:
+            globals()[module_name] = importlib.import_module(f"{package_name}.{module_name}")
 
 
 class SettingsDict(dict):
@@ -557,6 +567,37 @@ class RemoteSettingsDict(dict):
         self.server.send_to_dcs(msg)
 
 
+def tree_delete(d: dict, key: str, debug: Optional[bool] = False):
+    """
+    Clears an element from nested structure (a mix of dictionaries and lists)
+    given a key in the form "root/element1/element2".
+    """
+    keys = key.split('/')
+    curr_element = d
+
+    try:
+        for key in keys[:-1]:
+            if isinstance(curr_element, dict):
+                curr_element = curr_element[key]
+            else:  # if it is a list
+                curr_element = curr_element[int(key)]
+    except KeyError:
+        return
+
+    if debug:
+        print("  " * len(keys) + f"|_ Deleting {keys[-1]}")
+
+    if isinstance(curr_element, dict):
+        if isinstance(curr_element[keys[-1]], dict):
+            curr_element[keys[-1]] = {}
+        elif isinstance(curr_element[keys[-1]], list):
+            curr_element[keys[-1]] = []
+        else:
+            del curr_element[keys[-1]]
+    else:  # if it's a list
+        curr_element.pop(int(keys[-1]))
+
+
 def evaluate(value: Union[str, int, float, bool], **kwargs) -> Union[str, int, float, bool]:
     """
     Evaluate the given value, replacing placeholders with keyword arguments if necessary.
@@ -669,5 +710,5 @@ class YAMLError(Exception):
     **Methods:**
 
     """
-    def __init__(self, file: str, ex: Union[ParserError, ScannerError]):
+    def __init__(self, file: str, ex: Union[MarkedYAMLError, ValueError]):
         super().__init__(f"Error in {file}, " + ex.__str__().replace('"<unicode string>"', file))

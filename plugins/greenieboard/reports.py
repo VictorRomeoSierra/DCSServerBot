@@ -2,7 +2,7 @@ import discord
 import os
 import re
 
-from core import report, utils, EmbedElement, NothingToPlot
+from core import report, utils, EmbedElement, NothingToPlot, get_translation
 from datetime import datetime
 from plugins.userstats.filter import StatisticsFilter
 from psycopg.rows import dict_row
@@ -12,22 +12,24 @@ from . import ERRORS, DISTANCE_MARKS, GRADES, const
 from .trapsheet import plot_trapsheet, read_trapsheet, parse_filename
 from ..userstats.highscore import get_sides
 
+_ = get_translation(__name__.split('.')[1])
+
 
 class LSORating(report.EmbedElement):
     async def render(self, landing: dict):
         grade = GRADES[landing['grade']]
         comment = landing['comment'].replace('/', '')
 
-        self.add_field(name="Date/Time", value=f"{landing['time']:%y-%m-%d %H:%M:%S}")
-        self.add_field(name="Plane", value=f"{landing['unit_type']}")
-        self.add_field(name="Carrier", value=f"{landing['place']}")
+        self.add_field(name=_("Date/Time"), value=f"{landing['time']:%y-%m-%d %H:%M:%S}")
+        self.add_field(name=_("Plane"), value=f"{landing['unit_type']}")
+        self.add_field(name=_("Carrier"), value=f"{landing['place']}")
 
-        self.add_field(name="Case", value=f"{landing['trapcase']}")
-        self.add_field(name="Wire", value=f"{landing['wire']}")
-        self.add_field(name="Points", value=f"{landing['points']}")
+        self.add_field(name=_("Case"), value=f"{landing['trapcase']}")
+        self.add_field(name=_("Wire"), value=f"{landing['wire']}")
+        self.add_field(name=_("Points"), value=f"{landing['points']}")
 
-        self.add_field(name="LSO Grade: {}".format(landing['grade'].replace('_', '\\_')), value=grade, inline=False)
-        self.add_field(name="LSO Comment", value=comment.replace('_', '\\_'), inline=False)
+        self.add_field(name=_("LSO Grade: {}").format(landing['grade'].replace('_', '\\_')), value=grade, inline=False)
+        self.add_field(name=_("LSO Comment"), value=comment.replace('_', '\\_'), inline=False)
 
         await report.Ruler(self.env).render(ruler_length=28)
         # remove unnecessary blanks
@@ -81,7 +83,7 @@ class LSORating(report.EmbedElement):
                     if len(little):
                         for x in little:
                             for y in deflate_comment(x):
-                                comments += '- ' + y + ' (a little)\n'
+                                comments += '- ' + y + _(' (a little)\n')
                             element = element.replace(f'({x})', '')
                         if not element:
                             continue
@@ -89,7 +91,7 @@ class LSORating(report.EmbedElement):
                     if len(many):
                         for x in many:
                             for y in deflate_comment(x):
-                                comments += '- ' + y + ' (a lot!)\n'
+                                comments += '- ' + y + _(' (a lot!)\n')
                             element = element.replace(f'_{x}_', '')
                         if not element:
                             continue
@@ -97,7 +99,7 @@ class LSORating(report.EmbedElement):
                     if len(ignored):
                         for x in ignored:
                             for y in deflate_comment(x):
-                                comments += '- ' + y + ' (ignored)\n'
+                                comments += '- ' + y + _(' (ignored)\n')
                             element = element.replace(f'[{x}]', '')
                         if not element:
                             continue
@@ -128,7 +130,7 @@ class TrapSheet(report.MultiGraphElement):
 
 class HighscoreTraps(report.GraphElement):
 
-    async def render(self, interaction: discord.Interaction, server_name: str, period: str, limit: int,
+    async def render(self, interaction: discord.Interaction, server_name: str, limit: int,
                      flt: StatisticsFilter, include_bolters: bool = False, include_waveoffs: bool = False,
                      bar_labels: Optional[bool] = True):
         sql = "SELECT p.discord_id, COALESCE(p.name, 'Unknown') AS name, COUNT(g.*) AS value " \
@@ -146,8 +148,8 @@ class HighscoreTraps(report.GraphElement):
             sql += " AND g.grade <> 'B'"
         if not include_waveoffs:
             sql += " AND g.grade NOT LIKE 'WO%%'"
-        self.env.embed.title = flt.format(self.env.bot, period, server_name) + ' ' + self.env.embed.title
-        sql += ' AND ' + flt.filter(self.env.bot, period, server_name)
+        self.env.embed.title = flt.format(self.env.bot) + self.env.embed.title
+        sql += ' AND ' + flt.filter(self.env.bot)
         sql += f' GROUP BY 1, 2 ORDER BY 3 DESC LIMIT {limit}'
 
         async with self.apool.connection() as conn:
@@ -165,38 +167,82 @@ class HighscoreTraps(report.GraphElement):
                     for c in self.axes.containers:
                         self.axes.bar_label(c, fmt='%d', label_type='edge', padding=2)
                     self.axes.margins(x=0.1)
-                self.axes.set_title("Traps", color='white', fontsize=25)
+                self.axes.set_title(_("Traps"), color='white', fontsize=25)
                 self.axes.set_xlabel("traps")
                 if len(values) == 0:
                     self.axes.set_xticks([])
                     self.axes.set_yticks([])
-                    self.axes.text(0, 0, 'No data available.', ha='center', va='center', rotation=45, size=15)
+                    self.axes.text(0, 0, _('No data available.'), ha='center', va='center', rotation=45, size=15)
 
 
 class GreenieBoard(EmbedElement):
-    async def render(self, server_name: str, num_rows: int):
-        sql1 = 'SELECT g.player_ucid, p.name, g.points, MAX(g.time) AS time FROM (' \
-               'SELECT player_ucid, ROW_NUMBER() OVER w AS rn, AVG(points) OVER w AS points, MAX(time) ' \
-               'OVER w AS time FROM greenieboard'
-        sql2 = 'SELECT TRIM(grade) as "grade", night FROM greenieboard WHERE player_ucid = %s'
+    async def render(self, server_name: str, num_rows: int, squadron: Optional[dict] = None):
+        sql1 = """
+            SELECT g.player_ucid, p.name, g.points, MAX(g.time) AS time FROM (
+                SELECT player_ucid, ROW_NUMBER() OVER w AS rn, 
+                                    AVG(points) OVER w AS points, 
+                                    MAX(time) OVER w AS time 
+                FROM greenieboard
+        """
+        sql2 = """
+            SELECT TRIM(grade) as "grade", night FROM greenieboard 
+            WHERE player_ucid = %(player_ucid)s
+        """
         if server_name:
             self.embed.description = utils.escape_string(server_name)
-            sql1 += f" WHERE mission_id in (SELECT id FROM missions WHERE server_name = '{server_name}')"
-            sql2 += f" AND mission_id in (SELECT id FROM missions WHERE server_name = '{server_name}')"
-        sql1 += ' WINDOW w AS (PARTITION BY player_ucid ORDER BY ID DESC ROWS BETWEEN CURRENT ROW AND 9 FOLLOWING)) ' \
-                'g, players p WHERE g.player_ucid = p.ucid AND g.rn = 1 GROUP BY 1, 2, 3 ORDER BY 3 DESC LIMIT %s'
+            sql1 += """
+                WHERE mission_id in (
+                    SELECT id FROM missions WHERE server_name = %(server_name)s
+                )
+            """
+            sql2 += """
+                AND mission_id in (
+                    SELECT id FROM missions WHERE server_name = %(server_name)s
+                )
+            """
+        if squadron:
+            if self.embed.description:
+                self.embed.description += '\n'
+            else:
+                self.embed.description = ""
+            self.embed.description += f"Squadron \"{utils.escape_string(squadron['name'])}\""
+            if server_name:
+                sql1 += " AND "
+            else:
+                sql1 += " WHERE "
+            sql1 += """
+                player_ucid IN (
+                    SELECT player_ucid FROM squadron_members WHERE squadron_id = %(squadron_id)s
+                )
+                """
+        sql1 += """
+                WINDOW w AS (
+                    PARTITION BY player_ucid ORDER BY ID DESC ROWS BETWEEN CURRENT ROW AND 9 FOLLOWING
+                )
+            ) g, players p 
+            WHERE g.player_ucid = p.ucid AND g.rn = 1 
+            GROUP BY 1, 2, 3 
+            ORDER BY 3 DESC LIMIT %(num_rows)s
+        """
         sql2 += ' ORDER BY ID DESC LIMIT 10'
 
         async with self.apool.connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cursor:
                 pilots = points = landings = ''
                 max_time = datetime.fromisocalendar(1970, 1, 1)
-                await cursor.execute(sql1, (num_rows, ))
+                await cursor.execute(sql1, {
+                    "server_name": server_name,
+                    "num_rows": num_rows,
+                    "squadron_id": squadron['id'] if squadron else None
+                })
                 rows = await cursor.fetchall()
                 for row in rows:
                     pilots += utils.escape_string(row['name']) + '\n'
                     points += f"{row['points']:.2f}\n"
-                    await cursor.execute(sql2, (row['player_ucid'], ))
+                    await cursor.execute(sql2, {
+                        "player_ucid": row['player_ucid'],
+                        "server_name": server_name
+                    })
                     i = 0
                     landings += '**|'
                     async for landing in cursor:
@@ -213,16 +259,15 @@ class GreenieBoard(EmbedElement):
                 # if there is nothing to plot, don't do it
                 if not landings:
                     return
-                self.add_field(name='Pilot', value=pilots)
-                self.add_field(name='Avg', value=points)
+                self.add_field(name=_('Pilot'), value=pilots)
+                self.add_field(name=_('Avg'), value=points)
                 self.add_field(name='|:one:|:two:|:three:|:four:|:five:|:six:|:seven:|:eight:|:nine:|:zero:|',
                                value=landings)
                 footer = ''
                 for grade, text in const.GRADES.items():
                     if grade not in ['WOP', 'OWO', 'TWO', 'WOFD']:
                         footer += const.DAY_EMOJIS[grade] + '\t' + grade.ljust(6) + '\t' + text + '\n'
-                footer += '\nLandings are added at the front, meaning 1 is your latest landing.\n' \
-                          'Night landings shown by round markers.'
+                footer += _('\nThe most recent landing is added at the front.\nNight landings have round markers.')
                 if max_time:
-                    footer += f'\nLast recorded trap: {max_time:%y-%m-%d %H:%M:%S}'
+                    footer += _('\nLast recorded trap: {time:%y-%m-%d %H:%M:%S}').format(time=max_time)
                 self.embed.set_footer(text=footer)

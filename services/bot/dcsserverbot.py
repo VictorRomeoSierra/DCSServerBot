@@ -1,13 +1,16 @@
 import asyncio
 import discord
 
-from core import NodeImpl, ServiceRegistry, EventListener, Server, Channel, utils, Status, FatalException
+from core import Channel, utils, Status, PluginError, Group
+from core.data.node import FatalException
+from core.listener import EventListener
+from core.services.registry import ServiceRegistry
 from datetime import datetime, timezone
 from discord.ext import commands
-from typing import Optional, Union, Tuple, TYPE_CHECKING, Any, Iterable
+from typing import Optional, Union, TYPE_CHECKING, Any, Iterable
 
 if TYPE_CHECKING:
-    from ..servicebus import ServiceBus
+    from core import Server, NodeImpl
 
 __all__ = ["DCSServerBot"]
 
@@ -15,6 +18,8 @@ __all__ = ["DCSServerBot"]
 class DCSServerBot(commands.Bot):
 
     def __init__(self, *args, **kwargs):
+        from services import ServiceBus
+
         super().__init__(*args, **kwargs)
         self.version: str = kwargs['version']
         self.sub_version: str = kwargs['sub_version']
@@ -24,7 +29,7 @@ class DCSServerBot(commands.Bot):
         self.log = self.node.log
         self.locals = kwargs['locals']
         self.plugins = self.node.plugins
-        self.bus: ServiceBus = ServiceRegistry.get("ServiceBus")
+        self.bus = ServiceRegistry.get(ServiceBus)
         self.eventListeners: list[EventListener] = self.bus.eventListeners
         self.audit_channel = None
         self.mission_stats = None
@@ -66,7 +71,7 @@ class DCSServerBot(commands.Bot):
         return self.bus.filter
 
     @property
-    def servers(self) -> dict[str, Server]:
+    def servers(self) -> dict[str, "Server"]:
         return self.bus.servers
 
     async def setup_hook(self) -> None:
@@ -84,13 +89,16 @@ class DCSServerBot(commands.Bot):
             await self.load_extension(f'plugins.{plugin}.commands')
             return True
         except ModuleNotFoundError:
-            self.log.error(f'  - Plugin "{plugin}" not found!')
+            self.log.error(f'  - Plugin "{plugin.title()}" not found!')
         except commands.ExtensionNotFound:
-            self.log.error(f'  - No commands.py found for plugin "{plugin}"!')
+            self.log.error(f'  - No commands.py found for plugin "{plugin.title()}"!')
         except commands.ExtensionAlreadyLoaded:
-            self.log.warning(f'  - Plugin "{plugin} was already loaded"')
+            self.log.warning(f'  - Plugin "{plugin.title()} was already loaded"')
         except commands.ExtensionFailed as ex:
-            self.log.exception(ex.original if ex.original else ex)
+            if ex.original and isinstance(ex.original, PluginError):
+                self.log.error(f'  - {ex.original}')
+            else:
+                self.log.error(f'  - Plugin "{plugin.title()} not loaded: {ex.original if ex.original else ex}')
         except Exception as ex:
             self.log.exception(ex)
         return False
@@ -155,10 +163,10 @@ class DCSServerBot(commands.Bot):
             ret = False
         return ret
 
-    def get_channel(self, id: int, /) -> Any:
-        if id == -1:
+    def get_channel(self, channel_id: int, /) -> Any:
+        if channel_id == -1:
             return None
-        return super().get_channel(id)
+        return super().get_channel(channel_id)
 
     def get_role(self, role: Union[str, int]) -> Optional[discord.Role]:
         if isinstance(role, int):
@@ -171,7 +179,7 @@ class DCSServerBot(commands.Bot):
         else:
             return None
 
-    async def check_channels(self, server: Server):
+    async def check_channels(self, server: "Server"):
         channels = ['status', 'chat']
         if not self.locals.get('admin_channel'):
             channels.append('admin')
@@ -213,12 +221,23 @@ class DCSServerBot(commands.Bot):
                         self.check_roles(roles)
                     try:
                         await self.check_channels(server)
-                    except KeyError as ex:
+                    except KeyError:
                         self.log.error(f"Mandatory channel(s) missing for server {server.name} in servers.yaml!")
 
                 self.log.info('- Registering Discord Commands (this might take a bit) ...')
                 self.tree.copy_global_to(guild=self.guilds[0])
-                await self.tree.sync(guild=self.guilds[0])
+                app_cmds = await self.tree.sync(guild=self.guilds[0])
+                app_ids: dict[str, int] = {}
+                for app_cmd in app_cmds:
+                    app_ids[app_cmd.name] = app_cmd.id
+
+                for cmd in self.tree.get_commands(guild=self.guilds[0]):
+                    if isinstance(cmd, Group):
+                        for inner in cmd.commands:
+                            inner.mention = f"</{inner.qualified_name}:{app_ids[cmd.name]}>"
+                    else:
+                        cmd.mention = f"</{cmd.name}:{app_ids[cmd.name]}>"
+
                 self.synced = True
                 self.log.info('- Discord Commands registered.')
                 if 'discord_status' in self.locals:
@@ -253,7 +272,9 @@ class DCSServerBot(commands.Bot):
     async def on_app_command_error(self, interaction: discord.Interaction, error: discord.app_commands.AppCommandError):
         if isinstance(error, discord.app_commands.CommandNotFound) or isinstance(error, discord.app_commands.CommandInvokeError):
             pass
+        # noinspection PyUnresolvedReferences
         if not interaction.response.is_done():
+            # noinspection PyUnresolvedReferences
             await interaction.response.defer(ephemeral=True)
         if isinstance(error, discord.app_commands.NoPrivateMessage):
             await interaction.followup.send(f"{interaction.command.name} can't be used in a DM.")
@@ -279,7 +300,7 @@ class DCSServerBot(commands.Bot):
             return rc
 
     async def audit(self, message, *, user: Optional[Union[discord.Member, str]] = None,
-                    server: Optional[Server] = None):
+                    server: Optional["Server"] = None):
         if not self.audit_channel:
             if 'audit_channel' in self.locals:
                 self.audit_channel = self.get_channel(int(self.locals['audit_channel']))
@@ -312,13 +333,13 @@ class DCSServerBot(commands.Bot):
                       user.id if isinstance(user, discord.Member) else None,
                       user if isinstance(user, str) else None))
 
-    def get_admin_channel(self, server: Server) -> discord.TextChannel:
+    def get_admin_channel(self, server: "Server") -> discord.TextChannel:
         admin_channel = self.locals.get('admin_channel')
         if not admin_channel:
             admin_channel = int(server.channels.get(Channel.ADMIN, -1))
         return self.get_channel(admin_channel)
 
-    async def get_ucid_by_name(self, name: str) -> Tuple[Optional[str], Optional[str]]:
+    async def get_ucid_by_name(self, name: str) -> tuple[Optional[str], Optional[str]]:
         async with self.apool.connection() as conn:
             search = f'%{name}%'
             cursor = await conn.execute("""
@@ -376,7 +397,7 @@ class DCSServerBot(commands.Bot):
         return utils.match(data['name'], [x for x in self.get_all_members() if not x.bot])
 
     def get_server(self, ctx: Union[discord.Interaction, discord.Message, str], *,
-                   admin_only: Optional[bool] = False) -> Optional[Server]:
+                   admin_only: Optional[bool] = False) -> Optional["Server"]:
         if len(self.servers) == 1:
             if admin_only and int(self.locals.get('admin_channel', 0)) == ctx.channel.id:
                 return list(self.servers.values())[0]
@@ -390,7 +411,7 @@ class DCSServerBot(commands.Bot):
                 for channel in [Channel.ADMIN, Channel.STATUS, Channel.EVENTS, Channel.CHAT,
                                 Channel.COALITION_BLUE_EVENTS, Channel.COALITION_BLUE_CHAT,
                                 Channel.COALITION_RED_EVENTS, Channel.COALITION_RED_CHAT]:
-                    if int(server.locals['channels'].get(channel.value, -1)) != -1 and \
+                    if int(server.locals.get('channels', {}).get(channel.value, -1)) != -1 and \
                             server.channels[channel] == ctx.channel.id:
                         return server
             else:
@@ -399,7 +420,7 @@ class DCSServerBot(commands.Bot):
         return None
 
     async def setEmbed(self, *, embed_name: str, embed: discord.Embed, channel_id: Union[Channel, int] = Channel.STATUS,
-                       file: Optional[discord.File] = None, server: Optional[Server] = None):
+                       file: Optional[discord.File] = None, server: Optional["Server"] = None):
         async with self.lock:
             if server and isinstance(channel_id, Channel):
                 channel_id = int(server.channels.get(channel_id, -1))

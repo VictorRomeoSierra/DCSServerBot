@@ -8,9 +8,7 @@ import stat
 import subprocess
 import sys
 
-from contextlib import suppress
 from core import Extension, utils, Server
-from json import JSONDecodeError
 from typing import Optional
 
 server_ports: dict[int, str] = dict()
@@ -50,7 +48,7 @@ class Olympus(Extension):
         try:
             with open(self.config_path, mode='r', encoding='utf-8') as file:
                 return json.load(file)
-        except Exception as ex:
+        except Exception:
             self.log.warning(f"{self.name}: Config file not found or corrupt, using defaults")
             elevation_provider = {
                 "provider": "https://srtm.fasma.org/{lat}{lng}.SRTMGL3S.hgt.zip",
@@ -133,11 +131,11 @@ class Olympus(Extension):
             self.locals[self.frontend_tag]['port'] = client_port
             self.locals['authentication'] = {
                 "gameMasterPassword": hashlib.sha256(
-                    self.config.get('authentication', {}).get('gameMasterPassword', '').encode('utf-8')).hexdigest(),
+                    str(self.config.get('authentication', {}).get('gameMasterPassword', '')).encode('utf-8')).hexdigest(),
                 "blueCommanderPassword": hashlib.sha256(
-                    self.config.get('authentication', {}).get('blueCommanderPassword', '').encode('utf-8')).hexdigest(),
+                    str(self.config.get('authentication', {}).get('blueCommanderPassword', '')).encode('utf-8')).hexdigest(),
                 "redCommanderPassword": hashlib.sha256(
-                    self.config.get('authentication', {}).get('redCommanderPassword', '').encode('utf-8')).hexdigest()
+                    str(self.config.get('authentication', {}).get('redCommanderPassword', '')).encode('utf-8')).hexdigest()
             }
             with open(self.config_path, 'w', encoding='utf-8') as cfg:
                 json.dump(self.locals, cfg, indent=2)
@@ -152,11 +150,14 @@ class Olympus(Extension):
         out = subprocess.DEVNULL if not self.config.get('debug', False) else None
 
         def run_subprocess():
-            args = [self.nodejs, os.path.join(self.home, self.frontend_tag, 'bin', 'www')]
+            path = os.path.expandvars(
+                self.config.get('frontend', {}).get('path', os.path.join(self.home, self.frontend_tag)))
+            args = [self.nodejs, os.path.join(path, 'bin', 'www')]
             if self.version != '1.0.3.0':
                 args.append('--config')
                 args.append(self.config_path)
-            return subprocess.Popen(args, cwd=os.path.join(self.home, self.frontend_tag), stdout=out, stderr=out)
+            self.log.debug("Launching {}".format(' '.join(args)))
+            return subprocess.Popen(args, cwd=path, stdout=out, stderr=out)
 
         try:
             p = await asyncio.to_thread(run_subprocess)

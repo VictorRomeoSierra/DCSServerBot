@@ -9,7 +9,8 @@ import subprocess
 import sys
 
 if sys.platform == 'win32':
-    import win32con, win32gui
+    import win32con
+    import win32gui
 
 from collections import OrderedDict
 from contextlib import suppress
@@ -24,9 +25,9 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path, PurePath
 from psutil import Process
-from typing import Optional, TYPE_CHECKING, Union, Any, Callable, Type, Coroutine
+from typing import Optional, TYPE_CHECKING, Union, Any
 from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler, FileSystemEvent, FileSystemMovedEvent
+from watchdog.events import FileSystemEventHandler
 
 
 # ruamel YAML support
@@ -36,6 +37,7 @@ yaml = YAML()
 if TYPE_CHECKING:
     from core import Extension, Instance
     from services import DCSServerBot
+    from watchdog.events import FileSystemEvent, FileSystemMovedEvent
 
 __all__ = ["ServerImpl"]
 
@@ -79,7 +81,7 @@ class MissionFileSystemEventHandler(FileSystemEventHandler):
 
 
 @dataclass
-@DataObjectFactory.register("Server")
+@DataObjectFactory.register()
 class ServerImpl(Server):
     bot: Optional[DCSServerBot] = field(compare=False, init=False)
     event_handler: MissionFileSystemEventHandler = field(compare=False, default=None)
@@ -132,7 +134,7 @@ class ServerImpl(Server):
             # no options.lua, create a minimalistic one
             if 'graphics' not in self._options:
                 self._options["graphics"] = {
-                        "visibRange": "High"
+                    "visibRange": "High"
                 }
             if 'plugins' not in self._options:
                 self._options["plugins"] = {}
@@ -323,8 +325,10 @@ class ServerImpl(Server):
                     await conn.execute('DELETE FROM servers WHERE server_name = %s', (new_name, ))
                     await conn.execute('UPDATE servers SET server_name = %s WHERE server_name = %s',
                                        (new_name, self.name))
+                    await conn.execute('DELETE FROM instances WHERE server_name = %s', (new_name, ))
                     await conn.execute('UPDATE instances SET server_name = %s WHERE server_name = %s',
                                        (new_name, self.name))
+                    await conn.execute('DELETE FROM message_persistence WHERE server_name = %s', (new_name, ))
                     await conn.execute('UPDATE message_persistence SET server_name = %s WHERE server_name = %s',
                                        (new_name, self.name))
                     # only the master can take care of a cluster-wide rename
@@ -345,11 +349,11 @@ class ServerImpl(Server):
                 # update servers.yaml
                 update_config(old_name, new_name, update_settings)
                 self.name = new_name
-            except Exception as ex:
+            except Exception:
                 # rollback config
                 update_config(new_name, old_name, update_settings)
                 raise
-        except Exception as ex:
+        except Exception:
             self.log.exception(f"Error during renaming of server {old_name} to {new_name}: ", exc_info=True)
 
     def do_startup(self):
@@ -364,8 +368,14 @@ class ServerImpl(Server):
         # check if all missions are existing
         missions = []
         for mission in self.settings['missionList']:
+            if '.dcssb' in mission:
+                secondary = os.path.join(os.path.dirname(os.path.dirname(mission)), os.path.basename(mission))
+            else:
+                secondary = os.path.join(os.path.dirname(mission), '.dcssb', os.path.basename(mission))
             if os.path.exists(mission):
                 missions.append(mission)
+            elif os.path.exists(secondary):
+                missions.append(secondary)
             else:
                 self.log.warning(f"Removing mission {mission} from serverSettings.lua as it could not be found!")
         if len(missions) != len(self.settings['missionList']):
@@ -378,7 +388,7 @@ class ServerImpl(Server):
             )
             self.process = Process(p.pid)
             self.log.debug(f"  => DCS server starting up with PID {p.pid}")
-        except Exception as ex:
+        except Exception:
             self.log.error(f"  => Error while trying to launch DCS!", exc_info=True)
             self.process = None
 
@@ -404,20 +414,21 @@ class ServerImpl(Server):
             except Exception as ex:
                 self.log.exception(ex)
 
-    def _window_enumeration_handler(self, hwnd, top_windows):
+    @staticmethod
+    def _window_enumeration_handler(hwnd, top_windows):
         top_windows.append((hwnd, win32gui.GetWindowText(hwnd)))
 
     def _minimize(self):
-            top_windows = []
-            win32gui.EnumWindows(self._window_enumeration_handler, top_windows)
+        top_windows = []
+        win32gui.EnumWindows(self._window_enumeration_handler, top_windows)
 
-            # Fetch the window name of the process
-            window_name = self.instance.name
+        # Fetch the window name of the process
+        window_name = self.instance.name
 
-            for i in top_windows:
-                if window_name.lower() in i[1].lower():
-                    win32gui.ShowWindow(i[0], win32con.SW_MINIMIZE)
-                    break
+        for i in top_windows:
+            if window_name.lower() in i[1].lower():
+                win32gui.ShowWindow(i[0], win32con.SW_MINIMIZE)
+                break
 
     async def startup(self, modify_mission: Optional[bool] = True) -> None:
         await self.init_extensions()
@@ -432,12 +443,14 @@ class ServerImpl(Server):
         timeout = 300 if self.node.locals.get('slow_system', False) else 180
         self.status = Status.LOADING
         try:
-            await self.wait_for_status_change([Status.STOPPED, Status.PAUSED, Status.RUNNING], timeout)
+            await self.wait_for_status_change([Status.SHUTDOWN, Status.STOPPED, Status.PAUSED, Status.RUNNING], timeout)
+            if self.status == Status.SHUTDOWN:
+                raise TimeoutError()
             if sys.platform == 'win32' and self.node.locals.get('DCS', {}).get('minimized', True):
                 self._minimize()
         except (TimeoutError, asyncio.TimeoutError):
             # server crashed during launch?
-            if not await self.is_running():
+            if self.status != Status.SHUTDOWN and not await self.is_running():
                 self.status = Status.SHUTDOWN
             raise
 
@@ -547,7 +560,7 @@ class ServerImpl(Server):
                 filename = name
                 break
         else:
-            filename = os.path.normpath(os.path.join(await self.get_missions_dir(), filename))
+            filename = os.path.normpath(os.path.join(self.instance.missions_dir, filename))
         rc = await self.node.write_file(filename, url, force)
         if rc != UploadStatus.OK:
             return rc
@@ -558,7 +571,7 @@ class ServerImpl(Server):
         return UploadStatus.OK
 
     async def listAvailableMissions(self) -> list[str]:
-        return [str(x) for x in sorted(Path(PurePath(await self.get_missions_dir())).glob("*.miz"))]
+        return [str(x) for x in sorted(Path(PurePath(self.instance.missions_dir)).glob("*.miz"))]
 
     async def getMissionList(self) -> list[str]:
         return self.settings.get('missionList', [])
@@ -663,16 +676,21 @@ class ServerImpl(Server):
 
     async def addMission(self, path: str, *, autostart: Optional[bool] = False) -> None:
         path = os.path.normpath(path)
+        if '.dcssb' in path:
+            secondary = os.path.join(os.path.dirname(os.path.dirname(path)), os.path.basename(path))
+        else:
+            secondary = os.path.join(os.path.dirname(path), '.dcssb', os.path.basename(path))
         missions = self.settings['missionList']
-        if path not in missions:
-            if self.status in [Status.STOPPED, Status.PAUSED, Status.RUNNING]:
-                data = await self.send_to_dcs_sync({"command": "addMission", "path": path, "autostart": autostart})
-                self.settings['missionList'] = data['missionList']
-            else:
-                missions.append(path)
-                self.settings['missionList'] = missions
-        elif autostart:
-            self.settings['listStartIndex'] = missions.index(path) + 1
+        if path in missions or secondary in missions:
+            return
+        if self.status in [Status.STOPPED, Status.PAUSED, Status.RUNNING]:
+            data = await self.send_to_dcs_sync({"command": "addMission", "path": path, "autostart": autostart})
+            self.settings['missionList'] = data['missionList']
+        else:
+            missions.append(path)
+            self.settings['missionList'] = missions
+            if autostart:
+                self.settings['listStartIndex'] = missions.index(path if path in missions else secondary) + 1
 
     async def deleteMission(self, mission_id: int) -> None:
         if self.status in [Status.PAUSED, Status.RUNNING] and self.mission_id == mission_id:

@@ -1,0 +1,57 @@
+msgid ""
+msgstr ""
+"Project-Id-Version: 1.0\n"
+"POT-Creation-Date: \n"
+"PO-Revision-Date: \n"
+"Last-Translator: \n"
+"Language-Team: \n"
+"Language: ru\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"X-Generator: Poedit 3.4.1\n"
+
+# /cloud status
+msgid "Test the cloud-connection"
+msgstr "Выполнить проверку соединения с облаком"
+
+msgid "Checking cloud connection ..."
+msgstr "Проверка соединения с облаком..."
+
+msgid "\nCloud TOKEN configured and valid."
+msgstr "\nCloud-TOKEN сконфигурирован и действителен."
+
+msgid "\nCloud TOKEN configured, but invalid!"
+msgstr "\n Cloud-TOKEN сконфигурирован но недействителен!"
+
+msgid "\nGet a cloud TOKEN, if you want to use cloud statistics!"
+msgstr "\nПолучите Cloud-TOKEN, если вы хотите использовать облачную статистику!"
+
+msgid "Cloud connection established."
+msgstr "Соединение с облаком установлено."
+
+msgid "Cloud not connected!"
+msgstr "Соединение с облаком не установлено!"
+
+# /cloud resync
+msgid "Resync statistics with the cloud"
+msgstr "Выполнить повторную синхронизацию статистики с облаком"
+
+msgid "No cloud sync configured!"
+msgstr "Синхронизация с облаком не настроена!"
+
+msgid "Resync with cloud triggered."
+msgstr "Запущена синхронизация с облаком."
+
+# /cloud statistics
+msgid "Generate Cloud Statistics"
+msgstr "Сгенерировать статистику из облака"
+
+msgid "Cloud statistics are not activated in this Discord!"
+msgstr "Облачная статистика для данного Discord не активирована!"
+
+msgid "Use {} to link your account."
+msgstr "Используйте команду {}, для сопряжения своего игрового и Discord идентификаторов."
+
+msgid "No cloud-based statistics found for this user."
+msgstr "Для данного пользователя не найдена статистика в облаке."

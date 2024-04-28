@@ -44,6 +44,7 @@ class Header(report.EmbedElement):
                     self.embed.description = 'User "{}" is not linked or unknown.'.format(
                         utils.escape_string(member if isinstance(member, str) else member.display_name)
                     )
+                    # do we maybe have an permanent ban without a user?
                     if isinstance(member, str) and utils.is_ucid(member):
                         await cursor.execute("""
                                                     SELECT 1 as banned, reason, banned_by, banned_until 
@@ -68,19 +69,25 @@ class Header(report.EmbedElement):
                 last_seen = row['last_seen']
             if row['banned'] == 1:
                 banned = True
-        self.add_datetime_field('Last seen', last_seen.replace(tzinfo=timezone.utc))
-        self.add_datetime_field('First seen', first_seen.replace(tzinfo=timezone.utc))
-        if rows[0]['watchlist']:
-            self.add_field(name='Watchlist', value="🔍")
-        if rows[0]['vip']:
-            self.add_field(name="VIP", value="⭐")
-        if banned:
-            banned_until = rows[0]['banned_until']
-            if banned_until.year != 9999:
-                banned_until = banned_until
-            self.add_datetime_field('Ban expires', banned_until.replace(tzinfo=timezone.utc))
-            self.add_field(name='Banned by', value=rows[0]['banned_by'])
-            self.add_field(name='Reason', value=rows[0]['reason'])
+        else:
+            first_seen = last_seen = None
+        if first_seen and last_seen:
+            self.add_datetime_field('Last seen', last_seen.replace(tzinfo=timezone.utc))
+            self.add_datetime_field('First seen', first_seen.replace(tzinfo=timezone.utc))
+        if rows:
+            if rows[0]['watchlist']:
+                self.add_field(name='Watchlist', value="🔍")
+            if rows[0]['vip']:
+                self.add_field(name="VIP", value="⭐")
+            if banned:
+                banned_until = rows[0]['banned_until']
+                if banned_until.year != 9999:
+                    banned_until = banned_until
+                self.add_datetime_field('Ban expires', banned_until.replace(tzinfo=timezone.utc))
+                self.add_field(name='Banned by', value=rows[0]['banned_by'])
+                self.add_field(name='Reason', value=rows[0]['reason'])
+        else:
+            self.add_field(name="Link status", value="Unlinked")
 
 
 class UCIDs(report.EmbedElement):
@@ -95,14 +102,13 @@ class UCIDs(report.EmbedElement):
             async with conn.cursor(row_factory=dict_row) as cursor:
                 await cursor.execute(sql)
                 rows = await cursor.fetchall()
-                if not rows:
-                    return
-                self.add_field(name='▬' * 13 + ' Connected UCIDs ' + '▬' * 12, value='_ _', inline=False)
-                self.add_field(name='UCID', value='\n'.join([row['ucid'] for row in rows]))
-                self.add_field(name='DCS Name', value='\n'.join([utils.escape_string(row['name']) for row in rows]))
-                if isinstance(member, discord.Member):
-                    self.add_field(name='Validated', value='\n'.join(
-                        ['Approved' if row['manual'] is True else 'Not Approved' for row in rows]))
+        if rows:
+            self.add_field(name='▬' * 13 + ' Connected UCIDs ' + '▬' * 12, value='_ _', inline=False)
+            self.add_field(name='UCID', value='\n'.join([row['ucid'] for row in rows]))
+            self.add_field(name='DCS Name', value='\n'.join([utils.escape_string(row['name']) for row in rows]))
+            if isinstance(member, discord.Member):
+                self.add_field(name='Validated', value='\n'.join(
+                    ['Approved' if row['manual'] is True else 'Not Approved' for row in rows]))
 
 
 class History(report.EmbedElement):
@@ -117,17 +123,16 @@ class History(report.EmbedElement):
             async with conn.cursor(row_factory=dict_row) as cursor:
                 await cursor.execute(sql)
                 rows = await cursor.fetchall()
-                if not rows:
-                    return
-                self.add_field(name='▬' * 13 + ' Change History ' + '▬' * 13, value='_ _', inline=False)
-                self.add_field(name='DCS Name', value='\n'.join([
-                    utils.escape_string(row['name'] or 'n/a') for row in rows
-                ]))
-                self.add_field(name='Time (UTC)', value='\n'.join([
-                    f'{row["time"].replace(tzinfo=timezone.utc).strftime("%y-%m-%d %H:%Mz")} / '
-                    f'<t:{int(row["time"].replace(tzinfo=timezone.utc).timestamp())}:R>' for row in rows
-                ]))
-                self.add_field(name='_ _', value='_ _')
+        if rows:
+            self.add_field(name='▬' * 13 + ' Change History ' + '▬' * 13, value='_ _', inline=False)
+            self.add_field(name='DCS Name', value='\n'.join([
+                utils.escape_string(row['name'] or 'n/a') for row in rows
+            ]))
+            self.add_field(name='Time (UTC)', value='\n'.join([
+                f'{row["time"].replace(tzinfo=timezone.utc).strftime("%y-%m-%d %H:%Mz")} / '
+                f'<t:{int(row["time"].replace(tzinfo=timezone.utc).timestamp())}:R>' for row in rows
+            ]))
+            self.add_field(name='_ _', value='_ _')
 
 
 class ServerInfo(report.EmbedElement):
@@ -143,13 +148,16 @@ class Footer(report.EmbedElement):
     async def render(self, member: Union[discord.Member, str], banned: bool, watchlist: bool, player: Optional[Player]):
         footer = ''
         if isinstance(member, discord.Member):
-            _member: Member = DataObjectFactory().new('Member', node=self.node, member=member)
+            _member = DataObjectFactory().new(Member, name=member.name, node=self.node, member=member)
             if _member.ucid:
                 footer += '🔀 Unlink their DCS-account\n'
                 if not _member.verified:
                     footer += '💯 Verify their DCS-link\n'
-        footer += '✅ Unban them\n' if banned else '⛔ Ban them (DCS only)\n'
-        footer += '🆓 Unwatch them\n' if watchlist else '🔍 Put them on the watchlist\n'
-        if player:
-            footer += f'⏏️ Kick them from {player.server.name}'
+        else:
+            _member = None
+        if not _member or _member.ucid:
+            footer += '✅ Unban them\n' if banned else '⛔ Ban them (DCS only)\n'
+            footer += '🆓 Unwatch them\n' if watchlist else '🔍 Put them on the watchlist\n'
+            if player:
+                footer += f'⏏️ Kick them from {player.server.name}'
         self.embed.set_footer(text=footer)

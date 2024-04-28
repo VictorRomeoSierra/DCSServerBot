@@ -2,12 +2,16 @@ import asyncio
 import os
 
 from core import Server, ServiceRegistry, Node, PersistentReport, Report, Status
+from services import BotService, ServiceBus
 from typing import Optional
 
 
 async def report(file: str, channel: int, node: Node, persistent: Optional[bool] = True,
                  server: Optional[Server] = None):
-    bot = ServiceRegistry.get("Bot").bot
+    # we can only render on the master node
+    if not node.master:
+        return
+    bot = ServiceRegistry.get(BotService).bot
     if persistent:
         r = PersistentReport(bot, 'scheduler', file, channel_id=channel, server=server,
                              embed_name=os.path.basename(file)[:-5])
@@ -24,7 +28,7 @@ async def restart(node: Node, server: Server, shutdown: Optional[bool] = False, 
         return
     server.maintenance = True
     if shutdown:
-        ServiceRegistry.get("Bus").send_to_node({"command": "onShutdown", "server_name": server.name})
+        ServiceRegistry.get(ServiceBus).send_to_node({"command": "onShutdown", "server_name": server.name})
         await asyncio.sleep(1)
         await server.shutdown()
         await server.startup()

@@ -1,10 +1,12 @@
 import pandas as pd
 
-from core import report, ReportEnv, utils, Side, Coalition
+from core import report, ReportEnv, utils, Side, Coalition, get_translation
 from dataclasses import dataclass
 from datetime import datetime
 from plugins.userstats.filter import StatisticsFilter
 from psycopg.rows import dict_row
+
+_ = get_translation(__name__.split('.')[1])
 
 
 @dataclass
@@ -25,14 +27,15 @@ class Sorties(report.EmbedElement):
             self.sorties.loc[len(self.sorties.index)] = [flight.plane, flight.end - flight.start]
         return Flight()
 
-    async def render(self, ucid: str, period: str, flt: StatisticsFilter) -> None:
+    async def render(self, ucid: str, flt: StatisticsFilter) -> None:
         sql = """
             SELECT mission_id, init_type, init_cat, event, place, time 
             FROM missionstats s
-            WHERE event IN ('S_EVENT_BIRTH', 'S_EVENT_TAKEOFF', 'S_EVENT_LAND', 'S_EVENT_UNIT_LOST', 'S_EVENT_PLAYER_LEAVE_UNIT')
+            WHERE event IN ('S_EVENT_BIRTH', 'S_EVENT_TAKEOFF', 'S_EVENT_LAND', 'S_EVENT_UNIT_LOST', 
+                            'S_EVENT_PLAYER_LEAVE_UNIT')
         """
-        self.env.embed.title = flt.format(self.env.bot, period) + ' ' + self.env.embed.title
-        sql += ' AND ' + flt.filter(self.env.bot, period)
+        self.env.embed.title = flt.format(self.env.bot) + self.env.embed.title
+        sql += ' AND ' + flt.filter(self.env.bot)
         sql += ' AND init_id = %s ORDER BY 6'
 
         async with self.apool.connection() as conn:
@@ -73,27 +76,29 @@ class Sorties(report.EmbedElement):
                     sorties += str(row['count']) + '\n'
                     times += utils.convert_time(row['total_time'].total_seconds()) + '\n'
                 if len(planes) == 0:
-                    self.add_field(name='No sorties found for this player.', value='_ _')
+                    self.add_field(name=_('No sorties found for this player.'), value='_ _')
                 else:
-                    self.add_field(name='Module', value=planes)
-                    self.add_field(name='Sorties', value=sorties)
-                    self.add_field(name='Total Flighttime', value=times)
-                    self.embed.set_footer(text='Flighttime is the time you were airborne from takeoff to landing / '
-                                               'leave or\nairspawn to landing / leave.')
+                    self.add_field(name=_('Module'), value=planes)
+                    self.add_field(name=_('Sorties'), value=sorties)
+                    self.add_field(name=_('Total Flighttime'), value=times)
+                    self.embed.set_footer(
+                        text=_('Flighttime is the time you were airborne from takeoff to landing / leave or\n'
+                               'airspawn to landing / leave.'))
 
 
 class MissionStats(report.EmbedElement):
     async def render(self, stats: dict, sql: str, mission_id: int, sides: list[Coalition]) -> None:
         if len(sides) == 0:
-            self.add_field(name='Data can only be displayed in a private coalition channel!', value='_ _')
+            self.add_field(name=_('Data can only be displayed in a private coalition channel!'), value='_ _')
             return
-        self.add_field(name='▬▬▬▬▬▬▬▬▬▬▬ Current Situation ▬▬▬▬▬▬▬▬▬▬▬', value='_ _', inline=False)
+        self.add_field(name='▬▬▬▬▬▬▬▬▬▬▬ {} ▬▬▬▬▬▬▬▬▬▬▬'.format(_('Current Situation')),
+                       value='_ _', inline=False)
         self.add_field(
-            name='_ _', value='Airbases / FARPs\nPlanes\nHelicopters\nGround Units\nShips\nStructures')
+            name='_ _', value=_('Airbases / FARPs\nPlanes\nHelicopters\nGround Units\nShips\nStructures'))
         for coalition in sides:
             coalition_data = stats['coalitions'][coalition.name]
             value = '{}\n'.format(len(coalition_data['airbases']))
-            for unit_type in ['Airplanes', 'Helicopters', 'Ground Units', 'Ships']:
+            for unit_type in [_('Airplanes'), _('Helicopters'), _('Ground Units'), _('Ships')]:
                 value += '{}\n'.format(len(coalition_data['units'][unit_type])
                                        if unit_type in coalition_data['units'] else 0)
             value += '{}\n'.format(len(coalition_data['statics']))
@@ -106,7 +111,8 @@ class MissionStats(report.EmbedElement):
                         Side.BLUE: {},
                         Side.RED: {}
                     }
-                    self.add_field(name='▬▬▬▬▬▬▬▬▬▬▬ Achievements ▬▬▬▬▬▬▬▬▬▬▬▬', value='_ _', inline=False)
+                    self.add_field(name='▬▬▬▬▬▬▬▬▬▬▬ {} ▬▬▬▬▬▬▬▬▬▬▬▬'.format(_('Achievements')),
+                                   value='_ _', inline=False)
                     async for row in cursor:
                         s = Side(int(row['init_side']))
                         for name, value in row.items():
@@ -123,7 +129,7 @@ class MissionStats(report.EmbedElement):
 
 
 class ModuleStats1(report.EmbedElement):
-    async def render(self, ucid: str, module: str, period: str, flt: StatisticsFilter) -> None:
+    async def render(self, ucid: str, module: str, flt: StatisticsFilter) -> None:
         sql = """
             SELECT COUNT(*) as num, 
                    ROUND(SUM(EXTRACT(EPOCH FROM (s.hop_off - s.hop_on)))) as total, 
@@ -131,63 +137,73 @@ class ModuleStats1(report.EmbedElement):
             FROM statistics s, missions m 
             WHERE s.mission_id = m.id AND s.player_ucid = %(ucid)s AND s.slot = %(module)s
         """
-        self.env.embed.title = flt.format(self.env.bot, period) + ' ' + self.env.embed.title
-        sql += ' AND ' + flt.filter(self.env.bot, period)
+        self.env.embed.title = flt.format(self.env.bot) + self.env.embed.title
+        sql += ' AND ' + flt.filter(self.env.bot)
 
         async with self.apool.connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cursor:
                 await cursor.execute(sql, self.env.params)
                 row = await cursor.fetchone()
-                self.add_field(name='Usages', value=str(row['num']))
-                self.add_field(name='Total Playtime', value=utils.convert_time(row['total'] or 0))
-                self.add_field(name='Average Playtime', value=utils.convert_time(row['average'] or 0))
+                self.add_field(name=_('Usages'), value=str(row['num']))
+                self.add_field(name=_('Total Playtime'), value=utils.convert_time(row['total'] or 0))
+                self.add_field(name=_('Average Playtime'), value=utils.convert_time(row['average'] or 0))
 
 
 class ModuleStats2(report.EmbedElement):
-    async def render(self, ucid: str, module: str, period: str, flt: StatisticsFilter) -> None:
+    async def render(self, ucid: str, module: str, flt: StatisticsFilter) -> None:
         weapons = hs_ratio = ks_ratio = ''
         category = None
+        inner_sql1 = """
+            SELECT CASE WHEN COALESCE(m.weapon, '') = '' OR m.event = 'S_EVENT_SHOOTING_START' 
+                        THEN 'Gun' ELSE m.weapon 
+                   END AS weapon, 
+                   COALESCE(SUM(CASE WHEN m.event IN ('S_EVENT_SHOT', 'S_EVENT_SHOOTING_START') 
+                                     THEN 1 ELSE 0 
+                                END), 0) AS shots 
+            FROM missionstats m, statistics s 
+            WHERE m.mission_id = s.mission_id AND m.time BETWEEN s.hop_on and COALESCE(s.hop_off, NOW()) 
+            AND m.init_id = %(ucid)s AND m.init_type = %(module)s 
+        """
+        inner_sql1 += ' AND ' + flt.filter(self.env.bot)
+        inner_sql1 += " GROUP BY 1"
+        inner_sql2 = """
+            SELECT CASE WHEN m.target_cat IN ('Airplanes', 'Helicopters') THEN 'Air' 
+                        WHEN m.target_cat IN ('Ground Units', 'Ships', 'Structures') THEN 'Ground' 
+                   END AS target_cat, 
+                   CASE WHEN COALESCE(m.weapon, '') = '' THEN 'Gun' ELSE m.weapon 
+                   END AS weapon, 
+                   COALESCE(SUM(CASE WHEN m.event = 'S_EVENT_HIT' THEN 1 ELSE 0 END), 0) AS hits, 
+                   COALESCE(SUM(CASE WHEN m.event = 'S_EVENT_KILL' THEN 1 ELSE 0 END), 0) AS kills 
+            FROM missionstats m, statistics s 
+            WHERE m.event IN ('S_EVENT_HIT', 'S_EVENT_KILL') 
+            AND m.mission_id = s.mission_id AND m.time BETWEEN s.hop_on and COALESCE(s.hop_off, NOW()) 
+            AND m.target_cat IS NOT NULL AND m.init_id = %(ucid)s AND m.init_type = %(module)s
+        """
+        inner_sql2 += ' AND ' + flt.filter(self.env.bot)
+        inner_sql2 += " GROUP BY 1, 2"
+        sql = f"""
+                SELECT y.target_cat, y.weapon, x.shots, y.hits, y.kills, y.kills::DECIMAL / x.shots AS kd 
+                FROM (
+                    {inner_sql1}
+                )x, (
+                    {inner_sql2}
+                ) y WHERE x.weapon = y.weapon AND x.shots <> 0 ORDER BY 1, 6 DESC
+        """
         async with self.apool.connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cursor:
-                await cursor.execute("""
-                    SELECT y.target_cat, y.weapon, x.shots, y.hits, y.kills, y.kills::DECIMAL / x.shots AS kd 
-                    FROM (
-                        SELECT CASE WHEN COALESCE(m.weapon, '') = '' OR m.event = 'S_EVENT_SHOOTING_START' 
-                                    THEN 'Gun' ELSE m.weapon 
-                               END AS weapon, 
-                               COALESCE(SUM(CASE WHEN m.event IN ('S_EVENT_SHOT', 'S_EVENT_SHOOTING_START') 
-                                                 THEN 1 ELSE 0 
-                                            END), 0) AS shots 
-                        FROM missionstats m, statistics s 
-                        WHERE m.mission_id = s.mission_id AND m.time BETWEEN s.hop_on and COALESCE(s.hop_off, NOW()) 
-                        AND m.init_id = %(ucid)s AND m.init_type = %(module)s 
-                        GROUP BY 1
-                    )x, (
-                        SELECT CASE WHEN m.target_cat IN ('Airplanes', 'Helicopters') THEN 'Air' 
-                                    WHEN m.target_cat IN ('Ground Units', 'Ships', 'Structures') THEN 'Ground' 
-                               END AS target_cat, 
-                               CASE WHEN COALESCE(m.weapon, '') = '' THEN 'Gun' ELSE m.weapon 
-                               END AS weapon, 
-                               COALESCE(SUM(CASE WHEN m.event = 'S_EVENT_HIT' THEN 1 ELSE 0 END), 0) AS hits, 
-                               COALESCE(SUM(CASE WHEN m.event = 'S_EVENT_KILL' THEN 1 ELSE 0 END), 0) AS kills 
-                        FROM missionstats m, statistics s 
-                        WHERE m.event IN ('S_EVENT_HIT', 'S_EVENT_KILL') 
-                        AND m.mission_id = s.mission_id AND m.time BETWEEN s.hop_on and COALESCE(s.hop_off, NOW()) 
-                        AND m.target_cat IS NOT NULL AND m.init_id = %(ucid)s AND m.init_type = %(module)s
-                        GROUP BY 1, 2 
-                    ) y WHERE x.weapon = y.weapon AND x.shots <> 0 ORDER BY 1, 6 DESC
-                """, self.env.params)
+                await cursor.execute(sql, self.env.params)
                 async for row in cursor:
-                    if row['weapon'] == 'Gun':
+                    if row['weapon'] == _('Gun'):
                         continue
                     if category != row['target_cat']:
                         if len(weapons) > 0:
-                            self.add_field(name='Weapon', value=weapons)
-                            self.add_field(name='Hits/Shot', value=hs_ratio)
-                            self.add_field(name='Kills/Shot', value=ks_ratio)
+                            self.add_field(name=_('Weapon'), value=weapons)
+                            self.add_field(name=_('Hits/Shot'), value=hs_ratio)
+                            self.add_field(name=_('Kills/Shot'), value=ks_ratio)
                             weapons = hs_ratio = ks_ratio = ''
                         category = row['target_cat']
-                        self.add_field(name=f"▬▬▬▬▬▬ Category {category} ▬▬▬▬▬▬", value='_ _', inline=False)
+                        self.add_field(name="▬▬▬▬▬▬ {} ▬▬▬▬▬▬".format(_('Category {}').format(category)),
+                                       value='_ _', inline=False)
                     shots = row['shots']
                     hits = row['hits']
                     kills = row['kills']
@@ -195,17 +211,16 @@ class ModuleStats2(report.EmbedElement):
                     hs_ratio += f"{100*hits/shots:.2f}%\n"
                     ks_ratio += f"{100*kills/shots:.2f}%\n"
         if weapons:
-            self.add_field(name='Weapon', value=weapons)
-            self.add_field(name='Hits/Shot', value=hs_ratio)
-            self.add_field(name='Kills/Shot', value=ks_ratio)
+            self.add_field(name=_('Weapon'), value=weapons)
+            self.add_field(name=_('Hits/Shot'), value=hs_ratio)
+            self.add_field(name=_('Kills/Shot'), value=ks_ratio)
 
 
 class Refuelings(report.EmbedElement):
-    async def render(self, ucid: str, period: str, flt: StatisticsFilter) -> None:
+    async def render(self, ucid: str, flt: StatisticsFilter) -> None:
         sql = "SELECT init_type, COUNT(*) FROM missionstats WHERE EVENT = 'S_EVENT_REFUELING_STOP'"
-        if period:
-            self.env.embed.title = flt.format(self.env.bot, period) + ' ' + self.env.embed.title
-            sql += ' AND ' + flt.filter(self.env.bot, period)
+        self.env.embed.title = flt.format(self.env.bot) + self.env.embed.title
+        sql += ' AND ' + flt.filter(self.env.bot)
         sql += ' AND init_id = %s GROUP BY 1 ORDER BY 2 DESC'
 
         modules = []
@@ -216,7 +231,7 @@ class Refuelings(report.EmbedElement):
                 modules.append(row[0])
                 numbers.append(str(row[1]))
         if len(modules):
-            self.add_field(name='Module', value='\n'.join(modules))
-            self.add_field(name='Refuelings', value='\n'.join(numbers))
+            self.add_field(name=_('Module'), value='\n'.join(modules))
+            self.add_field(name=_('Refuelings'), value='\n'.join(numbers))
         else:
-            self.add_field(name='No refuelings found for this user.', value='_ _')
+            self.add_field(name=_('No refuelings found for this user.'), value='_ _')

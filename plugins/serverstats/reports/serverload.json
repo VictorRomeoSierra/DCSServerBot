@@ -3,11 +3,6 @@
   "title": "Server Load ({period})",
   "input": [
     {
-      "name": "period",
-      "range": ["", "hour", "day", "week", "month"],
-      "default": "hour"
-    },
-    {
       "name": "ruler_length",
       "value": 27
     }
