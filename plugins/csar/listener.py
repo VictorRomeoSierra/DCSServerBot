@@ -127,7 +127,7 @@ class CsarEventListener(EventListener):
         self.log.debug('csarGetLives called, self.lives: {}'.format(str(self.lives)))
         server.send_to_dcs({
                 'command': 'csarSetLives',
-                'data': self.lives
+                'data': json.dumps(self.lives)  #'[{}]'.format()
             })
 
     @chat_command(name="csar", roles=['DCS Admin'], help="A sample command")
