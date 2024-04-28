@@ -1,0 +1,9 @@
+SlotUpdate:
+  modify:
+  - for-each: coalition/blue/country/*/*/group/*/$'{name}' in ['%name%']
+    select: x
+    replace:
+      x: '%x%'
+    select: y
+    replace:
+      y: '%y%'
