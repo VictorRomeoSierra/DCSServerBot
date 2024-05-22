@@ -1,13 +1,18 @@
+import logging
 import os
 
+from core import utils
 from core.translations import get_translation
 from enum import Enum, auto
 from pathlib import Path
 from typing import Union, Optional, TYPE_CHECKING
+from urllib.parse import urlparse
 
 from ..utils.helper import YAMLError
 
 # ruamel YAML support
+from pykwalify.errors import SchemaError, CoreError
+from pykwalify.core import Core
 from ruamel.yaml import YAML
 from ruamel.yaml.error import MarkedYAMLError
 yaml = YAML()
@@ -48,6 +53,7 @@ class Node:
 
     def __init__(self, name: str, config_dir: Optional[str] = 'config'):
         self.name = name
+        self.log = logging.getLogger(__name__)
         self.config_dir = config_dir
         self.instances: list["Instance"] = list()
         self.locals = None
@@ -74,10 +80,27 @@ class Node:
     def extensions(self) -> dict:
         raise NotImplemented()
 
-    @staticmethod
-    def read_config(file) -> dict:
+    def read_config(self, file) -> dict:
         try:
+            c = Core(source_file=file, schema_files=['schemas/main_schema.yaml'], file_encoding='utf-8')
+            try:
+                c.validate(raise_exception=True)
+            except SchemaError as ex:
+                self.log.warning(f'Error while parsing {file}:\n{ex}')
             config = yaml.load(Path(file).read_text(encoding='utf-8'))
+            # check if we need to secure the database URL
+            database_url = config.get('database', {}).get('url')
+            if database_url:
+                url = urlparse(database_url)
+                if url.password != 'SECRET':
+                    utils.set_password('database', url.password)
+                    port = url.port or 5432
+                    config['database']['url'] = \
+                        f"{url.scheme}://{url.username}:SECRET@{url.hostname}:{port}{url.path}?sslmode=prefer"
+                    with open(file, 'w', encoding='utf-8') as f:
+                        yaml.dump(config, f)
+                    print("Database password found, removing it from config.")
+
             # set defaults
             config['autoupdate'] = config.get('autoupdate', False)
             config['logging'] = config.get('logging', {})
@@ -99,7 +122,7 @@ class Node:
             )
             config['chat_command_prefix'] = config.get('chat_command_prefix', '-')
             return config
-        except FileNotFoundError:
+        except (FileNotFoundError, CoreError):
             raise FatalException()
         except MarkedYAMLError as ex:
             raise YAMLError(file, ex)
@@ -131,10 +154,13 @@ class Node:
     async def get_installed_modules(self) -> list[str]:
         raise NotImplemented()
 
-    async def get_available_modules(self, userid: Optional[str] = None, password: Optional[str] = None) -> list[str]:
+    async def get_available_modules(self) -> list[str]:
         raise NotImplemented()
 
-    async def shell_command(self, cmd: str) -> Optional[tuple[str, str]]:
+    async def get_latest_version(self, branch: str) -> Optional[str]:
+        raise NotImplemented()
+
+    async def shell_command(self, cmd: str, timeout: int = 60) -> Optional[tuple[str, str]]:
         raise NotImplemented()
 
     async def read_file(self, path: str) -> Union[bytes, int]:

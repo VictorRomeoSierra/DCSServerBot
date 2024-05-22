@@ -2,13 +2,13 @@
 aiofiles==23.2.1
 
 # AIOHTTP: Uses asyncio for async/await native coroutines for establishing and handling HTTP connections
-aiohttp==3.9.3
+aiohttp==3.9.5
 
 # Certifi: Python package for providing Mozilla's CA Bundle
 certifi==2024.2.2
 
 # Croniter: Python iterator implementing a cron schedule format
-croniter==2.0.3
+croniter==2.0.5
 
 # discord.py: The python interface for the Discord API
 discord.py==2.3.2
@@ -17,7 +17,7 @@ discord.py==2.3.2
 eyeD3==0.9.7
 
 # FastAPI: A modern, fast (high-performance), web framework for building APIs with Python 3.6+ based on standard Python type hints
-fastapi==0.110.1
+fastapi==0.111.0
 
 # FuzzyWuzzy: Python library that uses Levenshtein Distance to calculate the differences between strings
 fuzzywuzzy==0.18.0
@@ -26,10 +26,10 @@ fuzzywuzzy==0.18.0
 GitPython==3.1.43
 
 # jsonschema: An implementation of JSON Schema for Python
-jsonschema==4.21.1
+jsonschema==4.22.0
 
 # Matplotlib: Python 2D plotting library
-matplotlib==3.8.4
+matplotlib==3.9.0
 
 # Minidump: Windows Minidump file reader
 minidump==0.0.23; sys_platform == 'win32'
@@ -53,16 +53,19 @@ pid==3.0.4
 pip==24.0
 
 # Psycopg: PostgreSQL database adapter for Python
-psycopg[binary]==3.1.18
+psycopg[binary]==3.1.19
 
 # Psycopg Pool: PostgreSQL database adapter pool for Python
-psycopg_pool==3.2.1
+psycopg-pool==3.2.2
 
 # PSUtil: Cross-platform library to access system details and process utilities
 psutil==5.9.8
 
 # PyArrow: Python library providing high-performance tools for doing analytics on Arrow-based columnar data
-pyarrow==15.0.2
+pyarrow==16.1.0
+
+# pyKwalify: A Python library for YAML/JSON schema validation
+pykwalify==1.8.0
 
 # python-Levenshtein: Python extension for computing string edit distances and similarities
 python-Levenshtein==0.25.1
@@ -84,6 +87,9 @@ rich==13.7.1
 
 # ruamel-yaml: YAML parser/emitter supporting roundtrip comment preservation
 ruamel.yaml==0.18.6
+
+# seaborn: Extension for Matplotlib with more and nicer graphics
+seaborn==0.13.2
 
 # TrueSkill: Python module implementing the TrueSkill rating system
 trueskill==0.4.5

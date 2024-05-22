@@ -1,7 +1,5 @@
-import argparse
 import logging
 import os
-import pickle
 import platform
 import psycopg
 import secrets
@@ -13,7 +11,7 @@ if sys.platform == 'win32':
     import winreg
 
 from contextlib import closing, suppress
-from core import utils, SAVED_GAMES, translations
+from core import utils, SAVED_GAMES, translations, COMMAND_LINE_ARGS
 from pathlib import Path
 from rich import print
 from rich.console import Console
@@ -24,9 +22,6 @@ from urllib.parse import quote, urlparse
 # ruamel YAML support
 from ruamel.yaml import YAML
 yaml = YAML()
-
-DCSSB_DB_USER = "dcsserverbot"
-DCSSB_DB_NAME = "dcsserverbot"
 
 # for gettext // i18n
 _: Optional[Callable[[str], str]] = None
@@ -109,7 +104,7 @@ class Install:
         return host, port
 
     @staticmethod
-    def get_database_url() -> Optional[str]:
+    def get_database_url(user: str, database: str) -> Optional[str]:
         host, port = Install.get_database_host('127.0.0.1', 5432)
         while True:
             passwd = Prompt.ask(_('Please enter your PostgreSQL master password (user=postgres)'))
@@ -117,35 +112,34 @@ class Install:
             try:
                 with psycopg.connect(url, autocommit=True) as conn:
                     with closing(conn.cursor()) as cursor:
-                        if os.path.exists('password.pkl'):
-                            with open('password.pkl', mode='rb') as f:
-                                passwd = pickle.load(f)
-                        else:
+                        try:
+                            passwd = utils.get_password('database') or ''
+                        except ValueError:
                             passwd = secrets.token_urlsafe(8)
-                            try:
-                                cursor.execute(f"CREATE USER {DCSSB_DB_USER} WITH ENCRYPTED PASSWORD '{passwd}'")
-                            except psycopg.Error:
-                                print(_('[yellow]Existing {} user found![/]').format(DCSSB_DB_USER))
-                                if Confirm.ask(_('Do you remember the password of {}?').format(DCSSB_DB_USER)):
-                                    while True:
-                                        passwd = Prompt.ask(
-                                            _("Please enter your password for user {}").format(DCSSB_DB_USER))
-                                        try:
-                                            with psycopg.connect(f"postgres://{DCSSB_DB_USER}:{quote(passwd)}@{host}:{port}/{DCSSB_DB_NAME}?sslmode=prefer"):
-                                                pass
-                                            break
-                                        except psycopg.Error:
-                                            print(_("[red]Wrong password! Try again.[/]"))
-                                else:
-                                    cursor.execute(f"ALTER USER {DCSSB_DB_USER} WITH ENCRYPTED PASSWORD '{passwd}'")
-                            with open('password.pkl', mode='wb') as f:
-                                pickle.dump(passwd, f)
-                            with suppress(psycopg.Error):
-                                cursor.execute(f"CREATE DATABASE {DCSSB_DB_NAME}")
-                                cursor.execute(f"GRANT ALL PRIVILEGES ON DATABASE {DCSSB_DB_NAME} TO {DCSSB_DB_USER}")
-                                cursor.execute(f"ALTER DATABASE {DCSSB_DB_NAME} OWNER TO {DCSSB_DB_USER}")
-                            print(_("[green]- Database user and database created.[/]"))
-                        return f"postgres://{DCSSB_DB_USER}:{quote(passwd)}@{host}:{port}/{DCSSB_DB_NAME}?sslmode=prefer"
+                        try:
+                            cursor.execute(f"CREATE USER {user} WITH ENCRYPTED PASSWORD '{passwd}'")
+                        except psycopg.Error:
+                            print(_('[yellow]Existing {} user found![/]').format(user))
+                            if Confirm.ask(_('Do you remember the password of {}?').format(user)):
+                                while True:
+                                    passwd = Prompt.ask(
+                                        _("Please enter your password for user {}").format(user))
+                                    try:
+                                        with psycopg.connect(f"postgres://{user}:{quote(passwd)}@{host}:{port}/{database}?sslmode=prefer"):
+                                            pass
+                                        break
+                                    except psycopg.Error:
+                                        print(_("[red]Wrong password! Try again.[/]"))
+                            else:
+                                cursor.execute(f"ALTER USER {user} WITH ENCRYPTED PASSWORD '{passwd}'")
+                        # store the password
+                        utils.set_password('database', passwd)
+                        with suppress(psycopg.Error):
+                            cursor.execute(f"CREATE DATABASE {database}")
+                            cursor.execute(f"GRANT ALL PRIVILEGES ON DATABASE {database} TO {user}")
+                            cursor.execute(f"ALTER DATABASE {database} OWNER TO {user}")
+                        print(_("[green]- Database user and database created.[/]"))
+                    return f"postgres://{user}:SECRET@{host}:{port}/{database}?sslmode=prefer"
             except psycopg.OperationalError:
                 print(_("[red]Master password wrong. Please try again.[/]"))
 
@@ -194,6 +188,7 @@ For a successful installation, you need to fulfill the following prerequisites:
         if use_lang_in_game:
             main['language'] = translations.get_language()
         token = Prompt.ask(_('Please enter your discord TOKEN (see documentation)')) or '<see documentation>'
+        utils.set_password('token', token)
         owner = IntPrompt.ask(_('Please enter your Owner ID (right click on your discord user, "Copy User ID")'))
         print(_("\nWe now need to setup your Discord roles and channels.\n"
                 "DCSServerBot creates a role mapping for your bot users. It has the following internal roles:"))
@@ -214,7 +209,6 @@ For a successful installation, you need to fulfill the following prerequisites:
                 default=default).split(',')
 
         bot = {
-            "token": token,
             "owner": owner,
             "roles": roles
         }
@@ -230,7 +224,7 @@ For a successful installation, you need to fulfill the following prerequisites:
         nodes = {}
         return main, nodes, bot
 
-    def install(self):
+    def install(self, config_dir: str, user: str, database: str):
         global _
 
         major_version = int(platform.python_version_tuple()[1])
@@ -247,30 +241,31 @@ I will now guide you through the installation process.
 If you need any further assistance, please visit the support discord, listed in the documentation.
 
         """)
-        if not os.path.exists('config/main.yaml'):
+        if not os.path.exists(os.path.join(config_dir, 'main.yaml')):
             main, nodes, bot = self.install_master()
             master = True
             servers = {}
             schedulers = {}
             i = 2
         else:
-            main = yaml.load(Path('config/main.yaml').read_text(encoding='utf-8'))
-            nodes = yaml.load(Path('config/nodes.yaml').read_text(encoding='utf-8'))
-            bot = yaml.load(Path('config/services/bot.yaml').read_text(encoding='utf-8'))
+            main = yaml.load(Path(os.path.join(config_dir, 'main.yaml')).read_text(encoding='utf-8'))
+            nodes = yaml.load(Path(os.path.join(config_dir, 'nodes.yaml')).read_text(encoding='utf-8'))
+            bot = yaml.load(Path(os.path.join(config_dir, 'services', 'bot.yaml')).read_text(encoding='utf-8'))
             try:
-                servers = yaml.load(Path('config/servers.yaml').read_text(encoding='utf-8'))
+                servers = yaml.load(Path(os.path.join(config_dir, 'servers.yaml')).read_text(encoding='utf-8'))
             except FileNotFoundError:
                 servers = {}
             try:
-                schedulers = yaml.load(Path('config/plugins/scheduler.yaml').read_text(encoding='utf-8'))
+                schedulers = yaml.load(
+                    Path(os.path.join(config_dir, 'plugins', 'scheduler.yaml')).read_text(encoding='utf-8'))
             except FileNotFoundError:
                 schedulers = {}
 
             _ = translations.get_translation("install")
 
             if self.node in nodes:
-                if Confirm.ask(_("[red]A configuration for this nodes exists already![/]\n"
-                                 "Do you want to overwrite it?"), default=False):
+                if not Confirm.ask(_("[red]A configuration for this node exists already![/]\n"
+                                     "Do you want to overwrite it?"), default=False):
                     self.log.warning(_("Aborted: configuration exists"))
                     exit(-1)
             else:
@@ -280,7 +275,7 @@ If you need any further assistance, please visit the support discord, listed in 
 
         print(_("\n{}. Database Setup").format(i+1))
         if master:
-            database_url = Install.get_database_url()
+            database_url = Install.get_database_url(user, database)
             if not database_url:
                 self.log.error(_("Aborted: No valid Database URL provided."))
                 exit(-1)
@@ -291,7 +286,7 @@ If you need any further assistance, please visit the support discord, listed in 
                 hostname, port = self.get_database_host(url.hostname, url.port)
                 database_url = f"{url.scheme}://{url.username}:{url.password}@{hostname}:{port}{url.path}?sslmode=prefer"
             except StopIteration:
-                database_url = Install.get_database_url()
+                database_url = Install.get_database_url(user, database)
 
         print(_("\n{}. Node Setup").format(i+2))
         if sys.platform == 'win32':
@@ -413,33 +408,31 @@ If you need any further assistance, please visit the support discord, listed in 
                 self.log.info(_("Instance {} configured.").format(instance))
         print(_("\n\nAll set. Writing / updating your config files now..."))
         if master:
-            os.makedirs("config", exist_ok=True)
-            with open('config/main.yaml', mode='w', encoding='utf-8') as out:
+            os.makedirs(config_dir, exist_ok=True)
+            with open(os.path.join(config_dir, 'main.yaml'), mode='w', encoding='utf-8') as out:
                 yaml.dump(main, out)
-            print(_("- Created {}").format("config/main.yaml"))
-            self.log.info(_("{} written.").format("config/main.yaml"))
-            os.makedirs('config/services', exist_ok=True)
-            with open('config/services/bot.yaml', mode='w', encoding='utf-8') as out:
+            print(_("- Created {}").format(os.path.join(config_dir, "main.yaml")))
+            self.log.info(_("{} written.").format(os.path.join(config_dir, "main.yaml")))
+            os.makedirs(os.path.join(config_dir, 'services'), exist_ok=True)
+            with open(os.path.join(config_dir, 'services', 'bot.yaml'), mode='w', encoding='utf-8') as out:
                 yaml.dump(bot, out)
-            print(_("- Created {}").format("config/services/bot.yaml"))
-            self.log.info(_("{} written.").format("config/services/bot.yaml"))
-        with open('config/nodes.yaml', mode='w', encoding='utf-8') as out:
+            print(_("- Created {}").format(os.path.join(config_dir, 'services', 'bot.yaml')))
+            self.log.info(_("{} written.").format(os.path.join(config_dir, 'services', 'bot.yaml')))
+        with open(os.path.join(config_dir, 'nodes.yaml'), mode='w', encoding='utf-8') as out:
             yaml.dump(nodes, out)
-            if os.path.exists('password.pkl'):
-                os.remove('password.pkl')
-        print(_("- Created {}").format("config/nodes.yaml"))
-        self.log.info(_("{} written.").format("config/nodes.yaml"))
-        with open('config/servers.yaml', mode='w', encoding='utf-8') as out:
+        print(_("- Created {}").format(os.path.join(config_dir, "nodes.yaml")))
+        self.log.info(_("{} written.").format(os.path.join(config_dir, "nodes.yaml")))
+        with open(os.path.join(config_dir, 'servers.yaml'), mode='w', encoding='utf-8') as out:
             yaml.dump(servers, out)
-        print(_("- Created {}").format("config/servers.yaml"))
-        self.log.info(_("{} written.").format("config/servers.yaml"))
+        print(_("- Created {}").format(os.path.join(config_dir, "servers.yaml")))
+        self.log.info(_("{} written.").format(os.path.join(config_dir, "servers.yaml")))
         # write plugin configuration
         if scheduler:
-            os.makedirs('config/plugins', exist_ok=True)
-            with open('config/plugins/scheduler.yaml', mode='w', encoding='utf-8') as out:
+            os.makedirs(os.path.join(config_dir, 'plugins'), exist_ok=True)
+            with open(os.path.join(config_dir, 'plugins', 'scheduler.yaml'), mode='w', encoding='utf-8') as out:
                 yaml.dump(schedulers, out)
-            print(_("- Created {}").format("config/plugins/scheduler.yaml"))
-            self.log.info(_("{} written.").format("config/plugins/scheduler.yaml"))
+            print(_("- Created {}").format(os.path.join(config_dir, 'plugins', 'scheduler.yaml')))
+            self.log.info(_("{} written.").format(os.path.join(config_dir, 'plugins', 'scheduler.yaml')))
         try:
             os.chmod(os.path.join(dcs_installation, 'Scripts', 'MissionScripting.lua'), stat.S_IWUSR)
         except PermissionError:
@@ -453,13 +446,11 @@ If you need any further assistance, please visit the support discord, listed in 
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(prog='DCSServerBot', description="Welcome to DCSServerBot!",
-                                     epilog='If unsure about the parameters, please check the documentation.')
-    parser.add_argument('-n', '--node', help='Node name', default=platform.node())
-    args = parser.parse_args()
+    # get the command line args from core
+    args = COMMAND_LINE_ARGS
     console = Console()
     try:
-        Install(args.node).install()
+        Install(node=args.node).install(config_dir=args.config, user=args.user, database=args.database)
     except KeyboardInterrupt:
         pass
     except Exception:

@@ -148,13 +148,15 @@ class MonitoringService(Service):
                 # we do not need to warn, if the server was just launched manually
                 if server.maintenance and server.status == Status.LOADING:
                     return
-                title = f'Server "{server.name}" died!'
-                message = 'Setting state to SHUTDOWN.'
-                self.log.warning(title + ' ' + message)
+                # only escalate, if the server was not stopped (maybe the process was manually shut down)
+                if server.status != Status.STOPPED:
+                    title = f'Server "{server.name}" died!'
+                    message = 'Setting state to SHUTDOWN.'
+                    self.log.warning(title + ' ' + message)
+                    if server.locals.get('ping_admin_on_crash', True):
+                        await self.warn_admins(server, title=title, message=message)
+                    await self.node.audit(f'Server died.', server=server)
                 server.status = Status.SHUTDOWN
-                if server.locals.get('ping_admin_on_crash', True):
-                    await self.warn_admins(server, title=title, message=message)
-                await self.node.audit(f'Server died.', server=server)
                 return
             # No, check if the process is still doing something
             try:
@@ -172,7 +174,7 @@ class MonitoringService(Service):
                     if 'affinity' in server.instance.locals:
                         await self.check_affinity(server, server.instance.locals['affinity'])
                     # check extension states
-                    for ext in [x for x in server.extensions.values() if not x.is_running()]:
+                    for ext in [x for x in server.extensions.values() if not await asyncio.to_thread(x.is_running)]:
                         try:
                             await ext.startup()
                         except Exception as ex:
@@ -227,7 +229,7 @@ class MonitoringService(Service):
         })
 
     async def serverload(self):
-        for server in self.bus.servers.values():
+        for server in self.bus.servers.copy().values():
             if server.is_remote or server.status not in [Status.RUNNING, Status.PAUSED]:
                 continue
             if not server.process:

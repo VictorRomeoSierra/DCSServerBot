@@ -3,8 +3,9 @@ import aiohttp
 import asyncio
 import certifi
 import discord
+import glob
+import gzip
 import json
-import logging
 import os
 import platform
 import psycopg
@@ -13,14 +14,12 @@ import shutil
 import ssl
 import subprocess
 import sys
-import time
 
 from collections import defaultdict
 from contextlib import closing
 from core import utils, Status, Coalition
 from core.const import SAVED_GAMES
 from core.translations import get_translation
-from core.utils.os import CloudRotatingFileHandler
 from discord.ext import tasks
 from packaging import version
 from pathlib import Path
@@ -29,6 +28,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Json
 from psycopg_pool import ConnectionPool, AsyncConnectionPool
 from typing import Optional, Union, Awaitable, Callable, Any
+from urllib.parse import urlparse, quote
 from version import __version__
 
 from core.autoexec import Autoexec
@@ -39,10 +39,11 @@ from core.data.impl.instanceimpl import InstanceImpl
 from core.data.server import Server
 from core.data.impl.serverimpl import ServerImpl
 from core.services.registry import ServiceRegistry
-from core.utils.dcs import LICENSES_URL
 from core.utils.helper import SettingsDict, YAMLError
 
 # ruamel YAML support
+from pykwalify.errors import SchemaError
+from pykwalify.core import Core
 from ruamel.yaml import YAML
 from ruamel.yaml.error import MarkedYAMLError
 yaml = YAML()
@@ -52,16 +53,10 @@ __all__ = [
     "NodeImpl"
 ]
 
-LOGLEVEL = {
-    'DEBUG': logging.DEBUG,
-    'INFO': logging.INFO,
-    'WARNING': logging.WARNING,
-    'ERROR': logging.ERROR,
-    'CRITICAL': logging.CRITICAL,
-    'FATAL': logging.FATAL
-}
-
 REPO_URL = "https://api.github.com/repos/Special-K-s-Flightsim-Bots/DCSServerBot/releases"
+LOGIN_URL = 'https://www.digitalcombatsimulator.com/gameapi/login/'
+UPDATER_URL = 'https://www.digitalcombatsimulator.com/gameapi/updater/branch/{}/'
+LICENSES_URL = 'https://www.digitalcombatsimulator.com/checklicenses.php'
 
 # Internationalisation
 _ = get_translation('core')
@@ -83,7 +78,6 @@ class NodeImpl(Node):
         self.before_update: dict[str, Callable[[], Awaitable[Any]]] = dict()
         self.after_update: dict[str, Callable[[], Awaitable[Any]]] = dict()
         self.locals = self.read_locals()
-        self.log = self.init_logger()
         if sys.platform == 'win32':
             from os import system
             system(f"title DCSServerBot v{self.bot_version}.{self.sub_version}")
@@ -104,14 +98,14 @@ class NodeImpl(Node):
         self.pool: Optional[ConnectionPool] = None
         self.apool: Optional[AsyncConnectionPool] = None
         self._master = None
-        self.listen_address = self.locals.get('listen_address', '0.0.0.0')
+        self.listen_address = self.locals.get('listen_address', '127.0.0.1')
         self.listen_port = self.locals.get('listen_port', 10042)
 
-    def __enter__(self):
+    async def __aenter__(self):
         return self
 
-    def __exit__(self, type, value, traceback):
-        self.close_db()
+    async def __aexit__(self, type, value, traceback):
+        await self.close_db()
 
     async def post_init(self):
         self.pool, self.apool = await self.init_db()
@@ -192,7 +186,7 @@ class NodeImpl(Node):
     async def restart(self):
         self.log.info("Restarting ...")
         await ServiceRegistry.shutdown()
-        await self.aclose_db()
+        await self.close_db()
         os.execv(sys.executable, [os.path.basename(sys.executable), 'run.py'] + sys.argv[1:])
 
     def read_locals(self) -> dict:
@@ -200,41 +194,48 @@ class NodeImpl(Node):
         config_file = os.path.join(self.config_dir, 'nodes.yaml')
         if os.path.exists(config_file):
             try:
+                schema_files = ['./schemas/nodes_schema.yaml']
+                schema_files.extend([str(x) for x in Path('./extensions/schemas').glob('*.yaml')])
+                c = Core(source_file=config_file, schema_files=schema_files, file_encoding='utf-8')
+                try:
+                    c.validate(raise_exception=True)
+                except SchemaError as ex:
+                    self.log.warning(f'Error while parsing {config_file}:\n{ex}')
                 self.all_nodes: dict = yaml.load(Path(config_file).read_text(encoding='utf-8'))
             except MarkedYAMLError as ex:
                 raise YAMLError('config_file', ex)
             node: dict = self.all_nodes.get(self.name)
             if not node:
                 raise FatalException(f'No configuration found for node {self.name} in {config_file}!')
+            dirty = False
+            # check if we need to secure the database URL
+            database_url = node.get('database', {}).get('url')
+            if database_url:
+                url = urlparse(database_url)
+                if url.password and url.password != 'SECRET':
+                    utils.set_password('database', url.password)
+                    port = url.port or 5432
+                    node['database']['url'] = \
+                        f"{url.scheme}://{url.username}:SECRET@{url.hostname}:{port}{url.path}?sslmode=prefer"
+                    dirty = True
+                    self.log.info("Database password found, removing it from config.")
+            password = node['DCS'].pop('dcs_password', node['DCS'].pop('password', None))
+            if password:
+                node['DCS']['user'] = node['DCS'].pop('dcs_user', node['DCS'].get('user'))
+                utils.set_password('DCS', password)
+                dirty = True
+            if dirty:
+                with open(config_file, 'w', encoding='utf-8') as f:
+                    yaml.dump(self.all_nodes, f)
             return node
         raise FatalException(f"No {config_file} found. Exiting.")
 
-    def init_logger(self):
-        log = logging.getLogger(name='dcsserverbot')
-        log.setLevel(logging.DEBUG)
-        formatter = logging.Formatter(fmt=u'%(asctime)s.%(msecs)03d %(levelname)s\t%(message)s',
-                                      datefmt='%Y-%m-%d %H:%M:%S')
-        formatter.converter = time.gmtime
-        os.makedirs('logs', exist_ok=True)
-        fh = CloudRotatingFileHandler(os.path.join('logs', f'dcssb-{self.name}.log'), encoding='utf-8',
-                                      maxBytes=self.config['logging']['logrotate_size'],
-                                      backupCount=self.config['logging']['logrotate_count'])
-        fh.setLevel(LOGLEVEL[self.config['logging']['loglevel']])
-        fh.setFormatter(formatter)
-        fh.doRollover()
-        log.addHandler(fh)
-        ch = logging.StreamHandler()
-        ch.setLevel(logging.INFO)
-        ch.setFormatter(formatter)
-        log.addHandler(ch)
-        # Database logging
-        log2 = logging.getLogger(name='psycopg.pool')
-        log2.setLevel(logging.ERROR)
-        log2.addHandler(ch)
-        return log
-
     async def init_db(self) -> tuple[ConnectionPool, AsyncConnectionPool]:
         url = self.config.get("database", self.locals.get('database'))['url']
+        try:
+            url = url.replace('SECRET', quote(utils.get_password('database')) or '')
+        except ValueError:
+            pass
         # quick connection check
         db_available = False
         max_attempts = self.config.get("database", self.locals.get('database')).get('max_retries', 10)
@@ -253,25 +254,17 @@ class NodeImpl(Node):
         pool_max = self.config.get("database", self.locals.get('database')).get('pool_max', 10)
         max_idle = self.config.get("database", self.locals.get('database')).get('max_idle', 10 * 60.0)
         timeout = 60.0 if self.locals.get('slow_system', False) else 30.0
-        db_pool = ConnectionPool(url, min_size=2, max_size=4,
-                                 check=ConnectionPool.check_connection, max_idle=max_idle, timeout=timeout)
+        db_pool = ConnectionPool(url, min_size=2, max_size=4, check=ConnectionPool.check_connection, max_idle=max_idle,
+                                 timeout=timeout, open=False)
         db_apool = AsyncConnectionPool(conninfo=url, min_size=pool_min, max_size=pool_max,
-                                       check=AsyncConnectionPool.check_connection, max_idle=max_idle, timeout=timeout)
+                                       check=AsyncConnectionPool.check_connection, max_idle=max_idle, timeout=timeout,
+                                       open=False)
+        # we need to open the pools directly in here
+        db_pool.open()
+        await db_apool.open()
         return db_pool, db_apool
 
-    def close_db(self):
-        if self.pool:
-            try:
-                self.pool.close()
-            except Exception as ex:
-                self.log.exception(ex)
-        if self.apool:
-            try:
-                asyncio.run(self.apool.close())
-            except Exception as ex:
-                self.log.exception(ex)
-
-    async def aclose_db(self):
+    async def close_db(self):
         if self.pool:
             try:
                 self.pool.close()
@@ -290,10 +283,9 @@ class NodeImpl(Node):
         duplicates = {server_name: instances for server_name, instances in grouped.items() if len(instances) > 1}
         for server_name, instances in duplicates.items():
             self.log.warning("Duplicate server \"{}\" defined in instance {}!".format(server_name, ', '.join(instances)))
-        for _name, _element in self.locals['instances'].items():
+        for _name, _element in self.locals.pop('instances', {}).items():
             instance = DataObjectFactory().new(InstanceImpl, node=self, name=_name, locals=_element)
             self.instances.append(instance)
-        del self.locals['instances']
 
     async def update_db(self):
         # Initialize the database
@@ -368,10 +360,10 @@ class NodeImpl(Node):
             async with aiohttp.ClientSession() as session:
                 async with session.get(REPO_URL) as response:
                     result = await response.json()
-                    current_version = __version__
-                    latest_version = result[0]["tag_name"]
+                    current_version = re.sub('^v', '', __version__)
+                    latest_version = re.sub('^v', '', result[0]["tag_name"])
 
-                    if re.sub('^v', '', latest_version) > re.sub('^v', '', current_version):
+                    if version.parse(latest_version) > version.parse(current_version):
                         return True
         except aiohttp.ClientResponseError as ex:
             # ignore rate limits
@@ -405,7 +397,7 @@ class NodeImpl(Node):
                         await conn.execute("UPDATE cluster SET update_pending = TRUE WHERE guild_id = %s",
                                            (self.guild_id, ))
             await ServiceRegistry.shutdown()
-            await self.aclose_db()
+            await self.close_db()
             os.execv(sys.executable, [os.path.basename(sys.executable), 'update.py'] + sys.argv[1:])
 
     async def get_dcs_branch_and_version(self) -> tuple[str, str]:
@@ -433,7 +425,7 @@ class NodeImpl(Node):
                                 _('Server is going down for a DCS update in {}!').format(utils.format_time(warn_time)))
                     await asyncio.sleep(1)
                     shutdown_in -= 1
-            await server.shutdown()
+            await server.shutdown(force=True)
 
         async def do_update(branch: Optional[str] = None) -> int:
             # disable any popup on the remote machine
@@ -535,7 +527,7 @@ class NodeImpl(Node):
             data = json.load(cfg)
         return data['modules']
 
-    async def get_available_modules(self, userid: Optional[str] = None, password: Optional[str] = None) -> list[str]:
+    async def get_available_modules(self) -> list[str]:
         licenses = {
             "CAUCASUS_terrain",
             "NEVADA_terrain",
@@ -550,12 +542,17 @@ class NodeImpl(Node):
             "WWII-ARMOUR",
             "SUPERCARRIER"
         }
-        if not userid:
+        user = self.locals['DCS'].get('user')
+        if not user:
             return list(licenses)
-        else:
-            auth = aiohttp.BasicAuth(login=userid, password=password)
-            async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(
-                    ssl=ssl.create_default_context(cafile=certifi.where())), auth=auth) as session:
+        password = utils.get_password('DCS')
+        headers = {
+            'User-Agent': 'DCS_Updater/'
+        }
+        async with aiohttp.ClientSession(headers=headers, connector=aiohttp.TCPConnector(
+                ssl=ssl.create_default_context(cafile=certifi.where()))) as session:
+            response = await session.post(LOGIN_URL, data={"login": user, "password": password})
+            if response.status == 200:
                 async with session.get(LICENSES_URL) as response:
                     if response.status == 200:
                         all_licenses = (await response.text(encoding='utf8')).split('<br>')[1:]
@@ -563,6 +560,32 @@ class NodeImpl(Node):
                             if lic.endswith('_terrain'):
                                 licenses.add(lic)
             return list(licenses)
+
+    async def get_latest_version(self, branch: str) -> Optional[str]:
+        async def _get_latest_version_no_auth():
+            async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(
+                    ssl=ssl.create_default_context(cafile=certifi.where()))) as session:
+                async with session.get(UPDATER_URL.format(branch)) as response:
+                    if response.status == 200:
+                        return json.loads(gzip.decompress(await response.read()))['versions2'][-1]['version']
+
+        async def _get_latest_version_auth():
+            user = self.locals['DCS'].get('user')
+            password = utils.get_password('DCS')
+            headers = {
+                'User-Agent': 'DCS_Updater/'
+            }
+            async with aiohttp.ClientSession(headers=headers, connector=aiohttp.TCPConnector(
+                    ssl=ssl.create_default_context(cafile=certifi.where()))) as session:
+                response = await session.post(LOGIN_URL, data={"login": user, "password": password})
+                if response.status == 200:
+                    async with session.get(UPDATER_URL.format(branch)) as response:
+                        return json.loads(gzip.decompress(await response.read()))['versions2'][-1]['version']
+
+        if not self.locals['DCS'].get('user'):
+            return await _get_latest_version_no_auth()
+        else:
+            return await _get_latest_version_auth()
 
     async def register(self):
         self._public_ip = self.locals.get('public_ip')
@@ -575,8 +598,7 @@ class NodeImpl(Node):
         else:
             branch, old_version = await self.get_dcs_branch_and_version()
             try:
-                new_version = await utils.getLatestVersion(branch, userid=self.locals['DCS'].get('dcs_user'),
-                                                           password=self.locals['DCS'].get('dcs_password'))
+                new_version = await self.get_latest_version(branch)
                 if new_version and old_version != new_version:
                     self.log.warning(
                         f"- Your DCS World version is outdated. Consider upgrading to version {new_version}.")
@@ -712,15 +734,18 @@ class NodeImpl(Node):
             """, (self.guild_id, self.name))
             return [row[0] async for row in cursor]
 
-    async def shell_command(self, cmd: str) -> Optional[tuple[str, str]]:
+    async def shell_command(self, cmd: str, timeout: int = 60) -> Optional[tuple[str, str]]:
         def run_subprocess():
             proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            return proc.communicate()
+            return proc.communicate(timeout=timeout)
 
         self.log.debug('Running shell-command: ' + cmd)
-        stdout, stderr = await asyncio.to_thread(run_subprocess)
-        return (stdout.decode('cp1252', 'ignore') if stdout else None,
-                stderr.decode('cp1252', 'ignore') if stderr else None)
+        try:
+            stdout, stderr = await asyncio.to_thread(run_subprocess)
+            return (stdout.decode('cp1252', 'ignore') if stdout else None,
+                    stderr.decode('cp1252', 'ignore') if stderr else None)
+        except subprocess.TimeoutExpired:
+            raise TimeoutError()
 
     async def read_file(self, path: str) -> Union[bytes, int]:
         path = os.path.expandvars(path)
@@ -764,7 +789,9 @@ class NodeImpl(Node):
         return ret
 
     async def remove_file(self, path: str):
-        os.remove(path)
+        files = glob.glob(path)
+        for file in files:
+            os.remove(file)
 
     async def rename_file(self, old_name: str, new_name: str, *, force: Optional[bool] = False):
         shutil.move(old_name, new_name, copy_function=shutil.copy2 if force else None)
@@ -794,8 +821,7 @@ class NodeImpl(Node):
         try:
             try:
                 branch, old_version = await self.get_dcs_branch_and_version()
-                new_version = await utils.getLatestVersion(branch, userid=self.locals['DCS'].get('dcs_user'),
-                                                           password=self.locals['DCS'].get('dcs_password'))
+                new_version = await self.get_latest_version(branch)
             except Exception:
                 self.log.warning("Update check failed, possible server outage at ED.")
                 return
@@ -832,21 +858,15 @@ class NodeImpl(Node):
 
         # wait for all servers to be in a proper state
         while True:
-            await asyncio.sleep(1)
             bus = ServiceRegistry.get(ServiceBus)
-            if not bus:
-                continue
-            server_initialized = True
-            for server in bus.servers.values():
-                if server.status == Status.UNREGISTERED:
-                    server_initialized = False
-            if server_initialized:
+            if bus and bus.servers and all(server.status != Status.UNREGISTERED for server in bus.servers.values()):
                 break
+            await asyncio.sleep(1)
 
     async def add_instance(self, name: str, *, template: Optional[Instance] = None) -> Instance:
-        max_bot_port = -1
-        max_dcs_port = -1
-        max_webgui_port = -1
+        max_bot_port = 6666-1
+        max_dcs_port = 10308-10
+        max_webgui_port = 8088-2
         for instance in self.instances:
             if instance.bot_port > max_bot_port:
                 max_bot_port = instance.bot_port

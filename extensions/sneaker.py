@@ -9,6 +9,7 @@ import subprocess
 
 from core import Extension, Status, ServiceRegistry, Server, utils
 from services import ServiceBus
+from threading import Thread
 from typing import Optional
 
 process: Optional[psutil.Process] = None
@@ -51,14 +52,21 @@ class Sneaker(Extension):
         with open(filename, mode='w', encoding='utf-8') as file:
             json.dump(cfg, file, indent=2)
 
+    def _log_output(self, p: subprocess.Popen):
+        for line in iter(p.stdout.readline, b''):
+            self.log.info(line.decode('utf-8').rstrip())
+
     def _run_subprocess(self, config: str):
         cmd = os.path.basename(self.config['cmd'])
-        out = subprocess.DEVNULL if not self.config.get('debug', False) else None
+        out = subprocess.PIPE if self.config.get('debug', False) else subprocess.DEVNULL
         self.log.debug(f"Launching Sneaker server with {cmd} --bind {self.config['bind']} "
                        f"--config {config}")
-        return subprocess.Popen([
-            cmd, "--bind", self.config['bind'], "--config", config
-        ], executable=os.path.expandvars(self.config['cmd']), stdout=out, stderr=out)
+        p = subprocess.Popen([cmd, "--bind", self.config['bind'], "--config", config],
+                                executable=os.path.expandvars(self.config['cmd']),
+                                stdout=out, stderr=subprocess.STDOUT)
+        if self.config.get('debug', False):
+            Thread(target=self._log_output, args=(p,)).start()
+        return p
 
     async def startup(self) -> bool:
         global process, servers, lock
@@ -68,18 +76,18 @@ class Sneaker(Extension):
             self.log.warning('Sneaker needs Tacview to be enabled in your server!')
             return False
         try:
-            if 'config' not in self.config:
-                # we need to lock here, to avoid race conditions on parallel server startups
-                async with lock:
+            async with lock:
+                if 'config' not in self.config:
+                    # we need to lock here, to avoid race conditions on parallel server startups
                     await asyncio.to_thread(utils.terminate_process, process)
                     self.create_config()
                     p = await asyncio.to_thread(self._run_subprocess,
                                                 os.path.join(self.node.config_dir, 'sneaker.json'))
                     process = psutil.Process(p.pid)
-            elif not process or not process.is_running():
-                p = await asyncio.to_thread(self._run_subprocess, os.path.expandvars(self.config['config']))
-                process = psutil.Process(p.pid)
-                atexit.register(self.shutdown)
+                elif not process or not process.is_running():
+                    p = await asyncio.to_thread(self._run_subprocess, os.path.expandvars(self.config['config']))
+                    process = psutil.Process(p.pid)
+                    atexit.register(self.shutdown)
             servers.add(self.server.name)
             return True
         except Exception as ex:
@@ -107,8 +115,8 @@ class Sneaker(Extension):
                 cmd = os.path.basename(self.config['cmd'])
                 self.log.debug(f"Launching Sneaker server with {cmd} --bind {self.config['bind']} "
                                f"--config config/sneaker.json")
-                p = self._run_subprocess(os.path.join(self.node.config_dir, 'sneaker.json'))
                 try:
+                    p = self._run_subprocess(os.path.join(self.node.config_dir, 'sneaker.json'))
                     process = psutil.Process(p.pid)
                 except Exception as ex:
                     self.log.error(f"Error during launch of {self.config['cmd']}: {str(ex)}")

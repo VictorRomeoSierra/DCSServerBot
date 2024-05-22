@@ -1,4 +1,8 @@
 from __future__ import annotations
+
+import asyncio
+import logging
+
 from abc import ABC
 from typing import Optional, TYPE_CHECKING
 
@@ -12,7 +16,7 @@ class Extension(ABC):
 
     def __init__(self, server: Server, config: dict):
         self.node = server.node
-        self.log = self.node.log
+        self.log = logging.getLogger(__name__)
         self.pool = self.node.pool
         self.config: dict = config
         self.server: Server = server
@@ -30,7 +34,7 @@ class Extension(ABC):
 
     async def startup(self) -> bool:
         # avoid race conditions
-        if self.is_running():
+        if await asyncio.to_thread(self.is_running):
             return True
         schedule = getattr(self, 'schedule', None)
         if schedule and not schedule.is_running():

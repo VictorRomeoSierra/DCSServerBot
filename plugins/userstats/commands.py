@@ -76,7 +76,7 @@ class UserStatistics(Plugin):
                     "squadron": {"join": {"enabled": False}}
                 }, {x.name: x for x in self.get_app_commands()})
 
-    def migrate(self, version: str) -> None:
+    async def migrate(self, new_version: str, conn: Optional[psycopg.AsyncConnection] = None) -> None:
         if version == '3.2':
             if not self.locals:
                 return
@@ -214,7 +214,7 @@ class UserStatistics(Plugin):
             if isinstance(name, discord.Member):
                 name = name.display_name
         file = 'userstats-campaign.json' if isinstance(period, CampaignFilter) else 'userstats.json'
-        report = PaginationReport(self.bot, interaction, self.plugin_name, file)
+        report = PaginationReport(interaction, self.plugin_name, file)
         await report.render(member=user, member_name=name, server_name=None, period=period.period, flt=period)
 
     @command(description='Displays the top players of your server(s)')
@@ -230,7 +230,7 @@ class UserStatistics(Plugin):
                             )]] = PeriodFilter(), limit: Optional[app_commands.Range[int, 3, 20]] = None):
         file = 'highscore-campaign.json' if isinstance(period, CampaignFilter) else 'highscore.json'
         if not _server:
-            report = PaginationReport(self.bot, interaction, self.plugin_name, file)
+            report = PaginationReport(interaction, self.plugin_name, file)
             await report.render(interaction=interaction, server_name=None, flt=period, period=period.period,
                                 limit=limit)
         else:
@@ -537,9 +537,11 @@ class UserStatistics(Plugin):
                              'highscore-campaign.json' if isinstance(flt, CampaignFilter) else 'highscore.json')
         embed_name = 'highscore-' + period
         channel_id = highscore.get('channel')
+        if not channel_id and server:
+            channel_id = server.channels[Channel.STATUS]
         if not mission_end:
             report = PersistentReport(self.bot, self.plugin_name, file, embed_name=embed_name, server=server,
-                                      channel_id=channel_id or Channel.STATUS)
+                                      channel_id=channel_id)
             await report.render(interaction=None, server_name=server.name if server else None, flt=flt, **kwargs)
         else:
             report = Report(self.bot, self.plugin_name, file)

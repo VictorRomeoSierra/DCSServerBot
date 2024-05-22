@@ -86,6 +86,9 @@ MyNode:
           red_password: red
           autostart: true     # optional: if you manage your SRS servers outside of DCSSB, set that to false
           no_shutdown: true   # optional: don't shut down SRS on mission end (default: false)
+          srs_message_prefix: 'SRS Running @ '        # optional: overwrite the message prefix
+          srs_nudge_message: 'Optional nudge message' # optional: overwrite the existing nudge message
+          
 ```
 You need one entry in the node section, pointing to your DCS-SRS installation and one in every instance section, 
 where you want to use SRS with. The next time the bot starts your server, it will auto-launch SRS and take care of it.
@@ -146,8 +149,9 @@ To delete old tacview files, checkout the [Cleanup](../services/cleanup/README.m
 ### LotAtc
 Another famous extension for DCS is [LotAtc](https://www.lotatc.com/) by D'Art. If you think about any kind of proper
 GCI or ATC work, there is no way around it. It perfectly integrates with DCS and DCS-SRS.<br/>
-DCSServerBot can detect if it is there and enabled, but that's about it. You'll get a notification in your servers
-status embed about ports and - if you like - passwords and the version of LotAtc printed in the footer.
+You'll get a notification in your servers status embed about ports and - if you like - passwords and the version of 
+LotAtc printed in the footer. If a GCI gets active on your server, players of the respective coalition will be informed
+via the in-game chat and a popup. Same if the GCI leaves their slot again.
 ```yaml
 MyNode:
   # [...]
@@ -321,7 +325,8 @@ MyNode:
       extensions:
         Olympus:
           debug: true                     # Show the Olympus console in the DCSSB console, default = false
-          url: http://myfancyurl:3000/   # optional: your own URL, if available
+          show_passwords: true            # show passwords in your server status embed (default: false)
+          url: http://myfancyurl:3000/    # optional: your own URL, if available
           backend:
             port: 3001                    # server port for DCS Olympus internal communication (needs to be unique)                   
           authentication:
@@ -372,7 +377,8 @@ MyNode:
       extensions:
         Olympus:
           debug: true                     # Show the Olympus console in the DCSSB console, default = false
-          url: http://myfancyurl:3000/   # optional: your own URL, if available
+          show_passwords: true            # show passwords in your server status embed (default: false)
+          url: http://myfancyurl:3000/    # optional: your own URL, if available
           server:
             address: '*'                  # your bind address. * = 0.0.0.0, use localhost for local only setups
             port: 3001                    # server port for DCS Olympus internal communication (needs to be unique)                   
@@ -410,6 +416,24 @@ MyNode:
           port: 50051     # you can set any configuration parameter here, that will be replaced in your dcs-grpc.lua file.
 ```
 
+### Pretense
+[Pretense](https://github.com/Dzsek/pretense) is a dynamic campaign system built by Dzsek. Unfortunately he dropped
+the development of it lately, but it is still in use by many and great missions to run on your servers. That is why
+I decided to not drop the support for now in DCSServerBot.<br>
+The main part happens in the [Pretense](../plugins/pretense/README.md) plugin, where you can run commands and configure
+specific statistic displays. But you can also use this small extension to either display your users which version of
+Pretense you are using and to have a very basic configuration of it. Just add some lines to your nodes.yaml like so:
+```yaml
+MyNode:
+  # [...]
+  instances:
+    DCS.release_server:
+      # [...]
+      extensions:
+        Pretense:
+          randomize: true # puts a randomize.lua in your Missions\Saves directory. See the Pretense documentation for more.
+```
+
 ### Write your own Extension!
 Do you use something alongside with DCS that isn't supported yet? Are you someone that does not fear some lines of
 Python code? Well then - write your own extension!</br>
@@ -434,9 +458,9 @@ class MyExtension(Extension):
         self.log.debug("Hello World!")
         return True
 
-    async def shutdown(self) -> bool:
+    def shutdown(self) -> bool:
         self.log.debug("Cya World!")
-        return await super().shutdown()
+        return super().shutdown()
 
     def is_running(self) -> bool:
         return True

@@ -34,6 +34,7 @@ class GameMasterEventListener(EventListener):
             return
         os.makedirs('logs', exist_ok=True)
         self.chat_log[server.name] = logging.getLogger(name=f'chat-{server.name}')
+        self.chat_log[server.name].propagate = False
         self.chat_log[server.name].setLevel(logging.INFO)
         formatter = logging.Formatter(fmt=u'%(asctime)s.%(msecs)03d %(levelname)s\t%(message)s',
                                       datefmt='%Y-%m-%d %H:%M:%S')
@@ -163,7 +164,7 @@ class GameMasterEventListener(EventListener):
         try:
             await self.campaign('start', servers=[server], name=name)
         except psycopg.errors.UniqueViolation:
-            await self.resetCampaign(data)
+            await self.resetCampaign(server, data)
 
     @event(name="stopCampaign")
     async def stopCampaign(self, server: Server, _: dict) -> None:

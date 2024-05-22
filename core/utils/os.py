@@ -1,5 +1,4 @@
-from logging.handlers import RotatingFileHandler
-
+import pickle
 import aiohttp
 import ipaddress
 import os
@@ -14,6 +13,7 @@ if sys.platform == 'win32':
     import win32console
 
 from contextlib import closing, suppress
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional, Union
 
@@ -31,16 +31,22 @@ __all__ = [
     "find_process",
     "is_process_running",
     "get_windows_version",
+    "list_all_files",
+    "make_unix_filename",
     "safe_rmtree",
     "terminate_process",
     "quick_edit_mode",
+    "create_secret_dir",
+    "set_password",
+    "get_password",
+    "delete_password",
     "CloudRotatingFileHandler"
 ]
 
 
 def is_open(ip, port):
     with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
-        s.settimeout(3)
+        s.settimeout(0.5)
         return s.connect_ex((ip, int(port))) == 0
 
 
@@ -91,6 +97,29 @@ def get_windows_version(cmd: str) -> Optional[str]:
     return version
 
 
+def list_all_files(path: str) -> list[str]:
+    """
+    Returns a list of all files in a given directory path, including files in subdirectories.
+
+    :param path: The path of the directory to search for files.
+    :return: A list of file paths relative to the given directory path.
+    """
+    # If we only have one file, return that
+    if not os.path.isdir(path):
+        return [os.path.basename(path)]
+    file_paths = []
+    for dirpath, dirnames, filenames in os.walk(path):
+        for filename in filenames:
+            full_path = os.path.join(dirpath, filename)
+            relative_path = os.path.relpath(full_path, path)
+            file_paths.append(relative_path)
+    return file_paths
+
+
+def make_unix_filename(*args) -> str:
+    return '/'.join(arg.replace('\\', '/').strip('/') for arg in args)
+
+
 def safe_rmtree(path: Union[str, Path]):
     # if path is a single file, delete that
     if os.path.isfile(path):
@@ -135,6 +164,36 @@ def quick_edit_mode(turn_on=None):
         screen_buffer.SetConsoleMode(new_mode | ENABLE_EXTENDED_FLAGS)
 
     return is_on if turn_on is None else turn_on
+
+
+def create_secret_dir():
+    path = os.path.join('config', '.secret')
+    if not os.path.exists(path):
+        os.makedirs(path, exist_ok=True)
+        if sys.platform == 'win32':
+            import ctypes
+            ctypes.windll.kernel32.SetFileAttributesW(path, 2)
+
+
+def set_password(key: str, password: str):
+    create_secret_dir()
+    with open(os.path.join('config', '.secret', f'{key}.pkl'), mode='wb') as f:
+        pickle.dump(password, f)
+
+
+def get_password(key: str) -> str:
+    try:
+        with open(os.path.join('config', '.secret', f'{key}.pkl'), mode='rb') as f:
+            return pickle.load(f)
+    except FileNotFoundError:
+        raise ValueError(key)
+
+
+def delete_password(key: str):
+    try:
+        os.remove(os.path.join('config', '.secret', f'{key}.pkl'))
+    except FileNotFoundError:
+        raise ValueError(key)
 
 
 class CloudRotatingFileHandler(RotatingFileHandler):

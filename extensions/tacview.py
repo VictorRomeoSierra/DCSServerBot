@@ -7,7 +7,7 @@ import shutil
 from core import Extension, utils, ServiceRegistry, Server
 from discord.ext import tasks
 from services import ServiceBus, BotService
-from typing import Optional
+from typing import Optional, Any
 
 TACVIEW_DEFAULT_DIR = os.path.normpath(os.path.expandvars(os.path.join('%USERPROFILE%', 'Documents', 'Tacview')))
 rtt_ports: dict[int, str] = dict()
@@ -20,7 +20,7 @@ class Tacview(Extension):
         super().__init__(server, config)
         self.bus = ServiceRegistry.get(ServiceBus)
         self.log_pos = -1
-        self.exp = re.compile(r'TACVIEW.DLL \(Main\): Successfully saved (?P<filename>.*)')
+        self.exp = re.compile(r'Successfully saved \[(?P<filename>.*?)\]')
 
     async def startup(self) -> bool:
         await super().startup()
@@ -54,47 +54,44 @@ class Tacview(Extension):
             self.server.options['plugins'] = options
         return options['Tacview']
 
+    def set_option(self, options: dict, name: str, value: Any, default: Optional[Any] = None) -> bool:
+        if options['Tacview'].get(name, default) != value:
+            options['Tacview'][name] = value
+            self.log.info(f'  => {self.server.name}: Setting ["{name}"] = {value}')
+            return True
+        return False
+
     async def prepare(self) -> bool:
         global rtt_ports, rcp_ports
 
-        dirty = False
         options = self.server.options['plugins']
-        if 'tacviewExportPath' in self.config:
-            path = os.path.normpath(os.path.expandvars(self.config['tacviewExportPath']))
-            if options['Tacview'].get('tacviewExportPath', TACVIEW_DEFAULT_DIR) != path:
-                options['Tacview']['tacviewExportPath'] = path
-                dirty = True
-                if not os.path.exists(path):
-                    os.makedirs(path)
-                self.log.info(f'  => {self.server.name}: Setting ["tacviewExportPath"] = "{path}".')
-        for param in ['tacviewRealTimeTelemetryPort', 'tacviewRemoteControlPort']:
-            if param in self.config:
-                if param not in options['Tacview'] or int(options['Tacview'][param]) != int(self.config[param]):
-                    options['Tacview'][param] = str(self.config[param])
-                    dirty = True
-        for param in ['tacviewRealTimeTelemetryPassword', 'tacviewRemoteControlPassword']:
-            if param in self.config:
-                if param not in options['Tacview'] or options['Tacview'][param] != self.config[param]:
-                    options['Tacview'][param] = self.config[param]
-                    dirty = True
-        for param in ['tacviewPlaybackDelay']:
-            if param in self.config:
-                if param not in options['Tacview'] or int(options['Tacview'][param]) != int(self.config[param]):
-                    options['Tacview'][param] = int(self.config[param])
-                    dirty = True
-        if 'tacviewPlaybackDelay' not in options['Tacview'] or not options['Tacview']['tacviewPlaybackDelay']:
-            self.log.warning(f'  => {self.server.name}: tacviewPlaybackDelay is not set, you might see '
-                             f'performance issues!')
+        dirty = False
+        for name, value in self.config.items():
+            if not name.startswith('tacview'):
+                continue
+            if name == 'tacviewExportPath':
+                path = os.path.normpath(os.path.expandvars(self.config['tacviewExportPath']))
+                os.makedirs(path, exist_ok=True)
+                dirty = self.set_option(options, name, path, TACVIEW_DEFAULT_DIR) or dirty
+            # Unbelievable but true. Tacview can only work with strings as ports.
+            elif name in ['tacviewRealTimeTelemetryPort', 'tacviewRemoteControlPort']:
+                dirty = self.set_option(options, name, str(value)) or dirty
+            else:
+                dirty = self.set_option(options, name, value) or dirty
+
+        if not options['Tacview'].get('tacviewPlaybackDelay', 0):
+            self.log.warning(
+                f'  => {self.server.name}: tacviewPlaybackDelay is not set, you might see performance issues!')
         if dirty:
             self.server.options['plugins'] = options
             self.locals = options['Tacview']
-        rtt_port = self.locals.get('tacviewRealTimeTelemetryPort', 42674)
+        rtt_port = int(self.locals.get('tacviewRealTimeTelemetryPort', 42674))
         if rtt_ports.get(rtt_port, self.server.name) != self.server.name:
             self.log.error(f"  =>  {self.server.name}: tacviewRealTimeTelemetryPort {rtt_port} already in use by "
                            f"server {rtt_ports[rtt_port]}!")
             return False
         rtt_ports[rtt_port] = self.server.name
-        rcp_port = self.locals.get('tacviewRemoteControlPort', 42675)
+        rcp_port = int(self.locals.get('tacviewRemoteControlPort', 42675))
         if rcp_ports.get(rcp_port, self.server.name) != self.server.name:
             self.log.error(f"  =>  {self.server.name}: tacviewRemoteControlPort {rcp_port} already in use by "
                            f"server {rcp_ports[rcp_port]}!")
@@ -159,7 +156,8 @@ class Tacview(Extension):
     @tasks.loop(seconds=1)
     async def check_log(self):
         try:
-            logfile = os.path.join(self.server.instance.home, 'Logs', 'dcs.log')
+            logfile = os.path.expandvars(self.config.get('log',
+                                                         os.path.join(self.server.instance.home, 'Logs', 'dcs.log')))
             if not os.path.exists(logfile):
                 self.log_pos = 0
                 return
@@ -171,13 +169,13 @@ class Tacview(Extension):
                     await file.seek(self.log_pos, 0)
                 lines = await file.readlines()
                 for line in lines:
-                    if 'TACVIEW.DLL (Main): End of flight data recorder.' in line:
+                    if 'End of flight data recorder.' in line:
                         self.check_log.cancel()
                         self.log_pos = -1
                         return
                     match = self.exp.search(line)
                     if match:
-                        await self.send_tacview_file(match.group('filename')[1:-1])
+                        await self.send_tacview_file(match.group('filename'))
                 self.log_pos = await file.tell()
         except Exception as ex:
             self.log.exception(ex)

@@ -1,6 +1,6 @@
 import asyncio
 
-from core import const, report, Status, Server, utils, ServiceRegistry, Plugin
+from core import const, report, Status, Server, utils, ServiceRegistry, Plugin, Side
 from datetime import datetime, timedelta, timezone
 from services import BotService
 from typing import Optional, cast
@@ -51,8 +51,13 @@ class ServerInfo(report.EmbedElement):
         if server.current_mission:
             value = server.current_mission.map
             if not server.locals.get('coalitions'):
-                value += (f"\n\n**Avail. Slots**\n"
-                          f"🔹 {server.current_mission.num_slots_blue}  |  {server.current_mission.num_slots_red} 🔸")
+                blue = len(server.get_active_players(side=Side.BLUE))
+                red = len(server.get_active_players(side=Side.RED))
+                value += "\n\n**Slots**\n"
+                if server.current_mission.num_slots_blue:
+                    value += f"🔹Used: {blue} / {server.current_mission.num_slots_blue}\n"
+                if server.current_mission.num_slots_red:
+                    value += f"🔸Used: {red} / {server.current_mission.num_slots_red}"
             else:
                 value += "\n\n**Coalitions**\nYes"
             self.add_field(name='Map', value=value)
@@ -125,7 +130,7 @@ class WeatherInfo(report.EmbedElement):
 class ExtensionsInfo(report.EmbedElement):
 
     async def render(self, server: Server):
-        extensions = await server.render_extensions()
+        extensions = await server.render_extensions() if server.status in [Status.RUNNING, Status.PAUSED] else None
         # we don't have any extensions loaded (yet)
         if not extensions:
             return
@@ -133,7 +138,7 @@ class ExtensionsInfo(report.EmbedElement):
         footer = self.embed.footer.text or ''
         for ext in extensions:
             self.add_field(name=ext['name'], value=ext['value'])
-        footer += " | ".join([f"{ext['name']} v{ext['version']}" for ext in extensions if 'version' in ext])
+        footer += " | ".join([f"{ext['name']} v{ext['version']}" for ext in extensions if ext.get('version')])
         self.embed.set_footer(text=footer)
 
 

@@ -1,14 +1,14 @@
 from __future__ import annotations
 import io
-import shutil
-
+import logging
 import luadata
 import os
+import shutil
 import tempfile
 import zipfile
 
 from datetime import datetime
-from typing import Union, Any, Optional
+from typing import Union, Optional
 
 from core import utils
 
@@ -20,13 +20,13 @@ __all__ = [
 
 class MizFile:
 
-    def __init__(self, root: Any, filename: str):
-        self.log = root.log
+    def __init__(self, filename: str):
+        self.log = logging.getLogger(__name__)
         self.filename = filename
         self.mission = dict()
         self.options = dict()
         self._load()
-        self._files: list[str] = list()
+        self._files: list[dict] = []
 
     def _load(self):
         try:
@@ -47,6 +47,11 @@ class MizFile:
         with zipfile.ZipFile(self.filename, 'r') as zin:
             with zipfile.ZipFile(tmpname, 'w') as zout:
                 zout.comment = zin.comment  # preserve the comment
+                filenames = []
+                for item in self._files:
+                    filenames.extend([
+                        utils.make_unix_filename(item['target'], x) for x in utils.list_all_files(item['source'])
+                    ])
                 for item in zin.infolist():
                     if item.filename == 'mission':
                         zout.writestr(item, "mission = " + luadata.serialize(self.mission, 'utf-8', indent='\t',
@@ -54,13 +59,23 @@ class MizFile:
                     elif item.filename == 'options':
                         zout.writestr(item, "options = " + luadata.serialize(self.options, 'utf-8', indent='\t',
                                                                              indent_level=0))
-                    elif os.path.basename(item.filename) not in [os.path.basename(x) for x in self._files]:
+                    elif item.filename not in filenames:
                         zout.writestr(item, zin.read(item.filename))
-                for file in self._files:
-                    try:
-                        zout.write(file, f'l10n/DEFAULT/{os.path.basename(file)}')
-                    except FileNotFoundError:
-                        self.log.warning(f"- File {file} could not be found, skipping.")
+                for item in self._files:
+                    def get_dir_path(name):
+                        return name if os.path.isdir(name) else os.path.dirname(name)
+
+                    for file in utils.list_all_files(item['source']):
+                        if os.path.basename(file).lower() == 'desktop.ini':
+                            continue
+                        try:
+                            zout.write(
+                                os.path.join(get_dir_path(item['source']), file),
+                                utils.make_unix_filename(item['target'], file)
+                            )
+                        except FileNotFoundError:
+                            self.log.warning(
+                                f"- File {os.path.join(item['source'], file)} could not be found, skipping.")
         try:
             if new_filename and new_filename != self.filename:
                 shutil.copy2(tmpname, new_filename)
@@ -69,6 +84,32 @@ class MizFile:
             os.remove(tmpname)
         except PermissionError as ex:
             self.log.error(f"Can't write new mission file: {ex}")
+
+    def apply_preset(self, preset: Union[dict, list]):
+        if isinstance(preset, list):
+            for _preset in preset:
+                self.apply_preset(_preset)
+            return
+
+        for key, value in preset.items():
+            # handle special cases
+            if key == 'date':
+                self.date = datetime.strptime(value, '%Y-%m-%d')
+            elif key == 'clouds':
+                if isinstance(value, str):
+                    self.clouds = {"preset": value}
+                elif isinstance(value, dict):
+                    self.clouds = value
+                else:
+                    self.log.warning("Value 'clouds', str or dict required.")
+            elif key == 'modify':
+                self.modify(value)
+            else:
+                converted_value = int(value) if isinstance(value, str) and value.isdigit() else value
+                try:
+                    setattr(self, key, converted_value)
+                except AttributeError:
+                    self.log.warning(f"Value '{key}' can not be set, ignored.")
 
     @property
     def theatre(self) -> str:
@@ -261,8 +302,13 @@ class MizFile:
         return self._files
 
     @files.setter
-    def files(self, files: list[str]):
-        self._files = files
+    def files(self, files: list[Union[str, dict]]):
+        self._files = []
+        for file in files:
+            if isinstance(file, str):
+                self._files.append({"source": file, "target": "l10n/DEFAULT"})
+            else:
+                self._files.append(file)
 
     def modify(self, config: Union[list, dict]) -> None:
         def process_elements(reference: dict, **kwargs):

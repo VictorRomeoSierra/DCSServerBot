@@ -28,6 +28,7 @@ class Player(DataObject):
     slot: int = field(compare=False, default=0)
     sub_slot: int = field(compare=False, default=0)
     unit_callsign: str = field(compare=False, default='')
+    unit_id: int = field(compare=False, default=0)
     unit_name: str = field(compare=False, default='')
     unit_display_name: str = field(compare=False, default='')
     unit_type: str = field(compare=False, default='')
@@ -190,6 +191,8 @@ class Player(DataObject):
                     self.sub_slot = data['sub_slot']
                 if 'unit_callsign' in data:
                     self.unit_callsign = data['unit_callsign']
+                if 'unit_id' in data:
+                    self.unit_id = data['unit_id']
                 if 'unit_name' in data:
                     self.unit_name = data['unit_name']
                 if 'unit_type' in data:

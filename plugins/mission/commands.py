@@ -102,7 +102,7 @@ class Mission(Plugin):
         self.update_channel_name.cancel()
         await super().cog_unload()
 
-    def migrate(self, version: str) -> None:
+    async def migrate(self, new_version: str, conn: Optional[psycopg.AsyncConnection] = None) -> None:
         if version == '3.6':
             filename = os.path.join(self.node.config_dir, 'plugins', 'userstats.yaml')
             if not os.path.exists(filename):
@@ -482,6 +482,7 @@ class Mission(Plugin):
                     except FileNotFoundError:
                         await interaction.followup.send(_('Mission "{}" was already deleted.').format(name),
                                                         ephemeral=ephemeral)
+                await self.bot.audit(_("deleted mission {}").format(name), user=interaction.user)
             except (TimeoutError, asyncio.TimeoutError):
                 await interaction.followup.send(_("Timeout while deleting mission.\n"
                                                   "Please reconfirm that the deletion was successful."),
@@ -626,7 +627,7 @@ class Mission(Plugin):
         ephemeral = utils.get_ephemeral(interaction)
         # noinspection PyUnresolvedReferences
         await interaction.response.defer(ephemeral=ephemeral)
-        miz = await asyncio.to_thread(MizFile, self.bot, server.current_mission.filename)
+        miz = await asyncio.to_thread(MizFile, server.current_mission.filename)
         if os.path.exists('config/presets.yaml'):
             with open('config/presets.yaml', mode='r', encoding='utf-8') as infile:
                 presets = yaml.load(infile)
@@ -687,7 +688,7 @@ class Mission(Plugin):
                                                     ephemeral=True)
             return
         if new_file != filename:
-            await server.replaceMission(mission_id, new_file)
+            await server.replaceMission(mission_id + 1, new_file)
         # noinspection PyUnresolvedReferences
         await interaction.response.send_message(_("Mission {} has been rolled back.").format(miz_file[:-4]),
                                                 ephemeral=utils.get_ephemeral(interaction))
@@ -1149,11 +1150,15 @@ class Mission(Plugin):
                 pass
 
     @player.command(description=_('Shows player information'))
-    @utils.app_has_role('DCS Admin')
+    @utils.app_has_role('DCS')
     @app_commands.guild_only()
     async def info(self, interaction: discord.Interaction,
-                   member: app_commands.Transform[Union[discord.Member, str], utils.UserTransformer]):
-        await self._info(interaction, member)
+                   server: app_commands.Transform[Server, utils.ServerTransformer(status=[Status.RUNNING])],
+                   player: app_commands.Transform[Player, utils.PlayerTransformer(active=True)]):
+        report = Report(self.bot, 'mission', 'player-info.json')
+        env = await report.render(player=player)
+        # noinspection PyUnresolvedReferences
+        await interaction.response.send_message(embed=env.embed, ephemeral=utils.get_ephemeral(interaction))
 
     @command(description=_('Shows player information'))
     @utils.app_has_role('DCS Admin')
@@ -1379,8 +1384,10 @@ class Mission(Plugin):
             if server.status == Status.UNREGISTERED:
                 continue
             try:
-                # channel = await self.bot.fetch_channel(int(server.locals['channels'][Channel.STATUS.value]))
-                channel = self.bot.get_channel(server.channels[Channel.STATUS])
+                channel_id = server.channels.get(Channel.STATUS, -1)
+                if channel_id == -1:
+                    continue
+                channel = self.bot.get_channel(channel_id)
                 if not channel:
                     channel = await self.bot.fetch_channel(server.channels[Channel.STATUS])
                 # name changes of the status channel will only happen with the correct permission
@@ -1422,7 +1429,7 @@ class Mission(Plugin):
                             player.ucid in self.get_config(server).get('afk_exemptions', [])):
                         continue
                     if (datetime.now(timezone.utc) - dt).total_seconds() > max_time:
-                        msg = self.get_config(server).get(
+                        msg = server.locals.get(
                             'message_afk', '{player.name}, you have been kicked for being AFK for more than {time}.'
                         ).format(player=player, time=utils.format_time(max_time))
                         server.kick(player, msg)

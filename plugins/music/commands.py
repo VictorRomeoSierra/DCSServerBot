@@ -27,7 +27,7 @@ class Music(Plugin):
         super().__init__(bot, eventlistener)
         self.service = ServiceRegistry.get(MusicService)
         if not self.service:
-            raise PluginInstallationError(plugin=self.plugin_name, reason=r"MusicService not loaded!")
+            raise PluginInstallationError(plugin=self.plugin_name, reason="MusicService not loaded!")
         if not self.service.locals:
             raise PluginInstallationError(plugin=self.plugin_name, reason=r"No config\services\music.yaml found!")
 
@@ -72,7 +72,7 @@ class Music(Plugin):
         try:
             while not view.is_finished():
                 await msg.edit(embed=await view.render(), view=view)
-                await asyncio.sleep(1)
+                await asyncio.sleep(5)
         finally:
             try:
                 await msg.delete()

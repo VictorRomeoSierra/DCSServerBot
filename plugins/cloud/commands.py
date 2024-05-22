@@ -24,7 +24,7 @@ from .logger import CloudLoggingHandler
 _ = get_translation(__name__.split('.')[1])
 
 
-class CloudHandler(Plugin):
+class Cloud(Plugin):
 
     def __init__(self, bot: DCSServerBot, eventlistener: Type[TEventListener] = None):
         super().__init__(bot, eventlistener)
@@ -73,13 +73,13 @@ class CloudHandler(Plugin):
         await super().cog_load()
         if self.config.get('upload_errors', True):
             cloud_logger = CloudLoggingHandler(node=self.node, url=self.base_url + '/errors/')
-            self.log.addHandler(cloud_logger)
+            self.log.root.addHandler(cloud_logger)
 
     async def cog_unload(self) -> None:
         if self.config.get('register', True):
             self.register.cancel()
         if self.config.get('upload_errors', True):
-            for handler in self.log.handlers:
+            for handler in self.log.root.handlers:
                 if isinstance(handler, CloudLoggingHandler):
                     self.log.removeHandler(handler)
         if 'token' in self.config:
@@ -209,7 +209,7 @@ class CloudHandler(Plugin):
                 return
             # TODO: support period
             df = pd.DataFrame(response)
-            report = PaginationReport(self.bot, interaction, self.plugin_name, 'cloudstats.json')
+            report = PaginationReport(interaction, self.plugin_name, 'cloudstats.json')
             await report.render(user=name, data=df, guild=None)
         except aiohttp.ClientError:
             await interaction.followup.send(_('Cloud not connected!'), ephemeral=True)
@@ -324,4 +324,4 @@ class CloudHandler(Plugin):
 
 
 async def setup(bot: DCSServerBot):
-    await bot.add_cog(CloudHandler(bot, CloudListener))
+    await bot.add_cog(Cloud(bot, CloudListener))

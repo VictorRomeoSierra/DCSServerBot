@@ -1,4 +1,6 @@
 from __future__ import annotations
+
+import logging
 import os
 
 from abc import ABC
@@ -11,6 +13,8 @@ from ..const import DEFAULT_TAG
 from ..data.dataobject import DataObject
 
 # ruamel YAML support
+from pykwalify.errors import SchemaError
+from pykwalify.core import Core
 from ruamel.yaml import YAML
 from ruamel.yaml.error import MarkedYAMLError
 yaml = YAML()
@@ -70,7 +74,7 @@ class Service(ABC):
         self.name = name or self.__class__.__name__
         self.running: bool = False
         self.node: NodeImpl = node
-        self.log = node.log
+        self.log = logging.getLogger(__name__)
         self.pool = node.pool
         self.apool = node.apool
         self.config = node.config
@@ -94,9 +98,21 @@ class Service(ABC):
             return {}
         self.log.debug(f'  - Reading service configuration from {filename} ...')
         try:
+            path = os.path.join('services', self.name.lower(), 'schemas')
+            if os.path.exists(path):
+                schema_files = [str(x) for x in Path(path).glob('*.yaml')]
+                c = Core(source_file=filename, schema_files=schema_files, file_encoding='utf-8')
+                try:
+                    c.validate(raise_exception=True)
+                except SchemaError as ex:
+                    self.log.warning(f'Error while parsing {filename}:\n{ex}')
             return yaml.load(Path(filename).read_text(encoding='utf-8'))
-        except MarkedYAMLError as ex:
+        except (MarkedYAMLError, SchemaError) as ex:
             raise ServiceInstallationError(self.name, ex.__str__())
+
+    def save_config(self):
+        with open(os.path.join('config', 'services', self.name + '.yaml'), mode='w', encoding='utf-8') as outfile:
+            yaml.dump(self.locals, outfile)
 
     def get_config(self, server: Optional[Server] = None) -> dict:
         if not server:

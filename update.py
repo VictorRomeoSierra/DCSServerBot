@@ -1,7 +1,5 @@
-import argparse
 import io
 import os
-import platform
 import re
 import requests
 import shutil
@@ -11,8 +9,9 @@ import tempfile
 import zipfile
 
 from contextlib import closing
+from core import utils, COMMAND_LINE_ARGS
+from packaging import version
 from typing import Iterable, Optional
-
 from version import __version__
 
 
@@ -57,18 +56,6 @@ def do_update_git(delete: Optional[bool]) -> int:
         return do_update_github(delete)
 
 
-def list_all_files(path):
-    # Returns a list of all file paths in the given directory and its subdirectories.
-    # The paths are in the form of relative paths from the given root directory.
-    file_paths = []
-    for dirpath, dirnames, filenames in os.walk(path):
-        for filename in filenames:
-            full_path = os.path.join(dirpath, filename)
-            relative_path = os.path.relpath(full_path, path)
-            file_paths.append(relative_path)
-    return file_paths
-
-
 def cleanup_local_files(to_delete_set: Iterable):
     # Exclude directories from deletion
     exclude_dirs = {'__pycache__', '.git', 'config', 'reports', 'sounds', 'services', 'extensions', 'plugins', 'logs'}
@@ -84,11 +71,10 @@ def cleanup_local_files(to_delete_set: Iterable):
 
 def do_update_github(delete: Optional[bool] = False) -> int:
     response = requests.get(f"https://api.github.com/repos/Special-K-s-Flightsim-Bots/DCSServerBot/releases")
-    current_version = __version__
-    latest_version = response.json()[0]["tag_name"]
+    current_version = re.sub('^v', '', __version__)
+    latest_version = re.sub('^v', '', response.json()[0]["tag_name"])
 
-    # Comparing SemVer taking in account that there could be a "v" prefix
-    if re.sub('^v', '', latest_version) > re.sub('^v', '', current_version):
+    if version.parse(latest_version) > version.parse(current_version):
         print('- Updating myself...')
 
         zip_url = response.json()[0]['zipball_url']
@@ -106,8 +92,8 @@ def do_update_github(delete: Optional[bool] = False) -> int:
 
                     if delete:
                         # check for necessary file deletions
-                        old_files_set = set(list_all_files(os.getcwd()))
-                        new_files_set = set(list_all_files(extracted_folder))
+                        old_files_set = set(utils.list_all_files(os.getcwd()))
+                        new_files_set = set(utils.list_all_files(extracted_folder))
                         to_delete_set = old_files_set - new_files_set
                         cleanup_local_files(to_delete_set)
 
@@ -134,13 +120,8 @@ def do_update_github(delete: Optional[bool] = False) -> int:
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(prog='update.py', description="Welcome to DCSServerBot!",
-                                     epilog='If unsure about the parameters, please check the documentation.')
-    parser.add_argument('-n', '--node', help='Node name', default=platform.node())
-    parser.add_argument('-d', '--delete', action='store_true', help='remove obsolete local files')
-    parser.add_argument('-r', '--no-restart', action='store_true', default=False,
-                        help="don't start DCSServerBot after the update")
-    args = parser.parse_args()
+    # get the command line args from core
+    args = COMMAND_LINE_ARGS
     try:
         rc = do_update_git(args.delete)
     except ImportError:

@@ -36,11 +36,11 @@ class SRSRadio(Radio):
             def run_subprocess():
                 return subprocess.Popen([
                     os.path.join(srs_inst, "DCS-SR-ExternalAudio.exe"),
-                    "-f", self.config['frequency'],
-                    "-m", str(self.config['modulation']),
+                    "-f", str(self.config['frequency']),
+                    "-m", self.config['modulation'],
                     "-c", str(self.config['coalition']),
-                    "-v", self.config.get('volume', '1.0'),
-                    "-p", srs_port,
+                    "-v", str(self.config.get('volume', 1.0)),
+                    "-p", str(srs_port),
                     "-n", self.config.get('display_name', 'DCSSB MusicBox'),
                     "-i", file
                 ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
