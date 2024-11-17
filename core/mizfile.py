@@ -7,10 +7,9 @@ import shutil
 import tempfile
 import zipfile
 
+from core import utils
 from datetime import datetime
 from typing import Union, Optional
-
-from core import utils
 
 __all__ = [
     "MizFile",
@@ -23,8 +22,9 @@ class MizFile:
     def __init__(self, filename: str):
         self.log = logging.getLogger(__name__)
         self.filename = filename
-        self.mission = dict()
-        self.options = dict()
+        self.mission: dict = {}
+        self.options: dict = {}
+        self.warehouses: dict = {}
         self._load()
         self._files: list[dict] = []
 
@@ -36,6 +36,12 @@ class MizFile:
                 try:
                     with miz.open('options') as options:
                         self.options = luadata.unserialize(io.TextIOWrapper(options, encoding='utf-8').read(), 'utf-8')
+                except FileNotFoundError:
+                    pass
+                try:
+                    with miz.open('warehouses') as warehouses:
+                        self.warehouses = luadata.unserialize(io.TextIOWrapper(warehouses, encoding='utf-8').read(),
+                                                              'utf-8')
                 except FileNotFoundError:
                     pass
         except Exception:
@@ -59,6 +65,9 @@ class MizFile:
                     elif item.filename == 'options':
                         zout.writestr(item, "options = " + luadata.serialize(self.options, 'utf-8', indent='\t',
                                                                              indent_level=0))
+                    elif item.filename == 'warehouses':
+                        zout.writestr(item, "warehouses = " + luadata.serialize(self.warehouses, 'utf-8', indent='\t',
+                                                                                indent_level=0))
                     elif item.filename not in filenames:
                         zout.writestr(item, zin.read(item.filename))
                 for item in self._files:
@@ -84,6 +93,7 @@ class MizFile:
             os.remove(tmpname)
         except PermissionError as ex:
             self.log.error(f"Can't write new mission file: {ex}")
+            raise
 
     def apply_preset(self, preset: Union[dict, list]):
         if isinstance(preset, list):
@@ -94,7 +104,10 @@ class MizFile:
         for key, value in preset.items():
             # handle special cases
             if key == 'date':
-                self.date = datetime.strptime(value, '%Y-%m-%d')
+                if isinstance(value, str):
+                    self.date = datetime.strptime(value, '%Y-%m-%d')
+                else:
+                    self.date = value
             elif key == 'clouds':
                 if isinstance(value, str):
                     self.clouds = {"preset": value}
@@ -247,6 +260,14 @@ class MizFile:
         self.mission['requiredModules'] = values
 
     @property
+    def failures(self) -> dict:
+        return self.mission['failures']
+
+    @failures.setter
+    def failures(self, values: dict) -> None:
+        self.mission['failures'] = values
+
+    @property
     def accidental_failures(self) -> bool:
         return self.mission['forcedOptions']['accidental_failures'] if 'forcedOptions' in self.mission else False
 
@@ -260,7 +281,7 @@ class MizFile:
             }
         else:
             self.mission['forcedOptions']['accidental_failures'] = value
-        self.mission['failures'] = []
+        self.failures = {}
 
     @property
     def forcedOptions(self) -> dict:
@@ -311,55 +332,80 @@ class MizFile:
                 self._files.append(file)
 
     def modify(self, config: Union[list, dict]) -> None:
+
+        def sort_dict(d):
+            sorted_items = sorted(d.items())
+            d.clear()
+            for k, v in sorted_items:
+                d[k] = v
+
         def process_elements(reference: dict, **kwargs):
             if 'select' in config:
                 if debug:
-                    print("Processing SELECT ...")
+                    self.log.debug("Processing SELECT ...")
                 if config['select'].startswith('/'):
-                    elements = list(utils.for_each(self.mission, config['select'][1:].split('/'),
+                    elements = list(utils.for_each(source, config['select'][1:].split('/'),
                                                    debug=debug, **kwargs))
                 else:
                     elements = list(utils.for_each(reference, config['select'].split('/'), debug=debug, **kwargs))
             else:
                 elements = [reference]
             for element in elements:
-                if not element:
+                # Lua lists sometimes are represented as dictionaries with numeric keys. We can't use them as kwargs
+                if isinstance(element, dict) and not any(isinstance(key, (int, float)) for key in element.keys()):
+                    kkwargs = element
+                else:
+                    kkwargs = {}
+                if element is None:
                     if reference and 'insert' in config:
                         if debug:
-                            print(f"Inserting new value: {config['insert']}")
-                        reference |= config['insert']
+                            self.log.debug(f"Inserting new value: {config['insert']}")
+                        reference |= utils.evaluate(config['insert'], reference=reference, **kkwargs)
                 elif 'replace' in config:
+                    sort = False
                     for _what, _with in config['replace'].items():
                         if debug:
-                            print(f"Replacing {_what} with {_with}")
-                        if isinstance(_what, int) and isinstance(element, list):
-                            element[_what - 1] = utils.evaluate(_with, reference=reference)
-                        elif isinstance(_with, dict):
+                            self.log.debug(f"Replacing {_what} with {_with}")
+                        if isinstance(_what, int) and isinstance(element, (list, dict)):
+                            if isinstance(element, list):
+                                try:
+                                    element[_what - 1] = utils.evaluate(_with, reference=reference, **kkwargs)
+                                except IndexError:
+                                    element.append(utils.evaluate(_with, reference=reference, **kkwargs))
+                            elif isinstance(element, dict) and any(isinstance(key, (int, float)) for key in element.keys()):
+                                element[_what] = utils.evaluate(_with, reference=reference, **kkwargs)
+                                sort = True
+                        elif isinstance(_with, dict) and isinstance(element[_what], (int, str, float, bool)):
                             for key, value in _with.items():
-                                if utils.evaluate(key, **element, reference=reference):
-                                    element[_what] = utils.evaluate(value, **element, reference=reference)
+                                if utils.evaluate(key, reference=reference):
+                                    element[_what] = utils.evaluate(value, reference=reference, **kkwargs)
                                     break
                         else:
-                            element[_what] = utils.evaluate(_with, **element, reference=reference)
+                            element[_what] = utils.evaluate(_with, reference=reference, **kkwargs)
+                    if sort:
+                        sort_dict(element)
                 elif 'merge' in config:
                     for _what, _with in config['merge'].items():
                         if debug:
-                            print(f"Merging {_what} with {_with}")
+                            self.log.debug(f"Merging {_what} with {_with}")
                         if isinstance(_with, dict):
-                            element[_what] |= _with
+                            if not element[_what]:
+                                element[_what] = _with
+                            else:
+                                element[_what] |= _with
                         else:
-                            for value in utils.for_each(self.mission, _with[1:].split('/'), debug=debug, **kwargs):
+                            for value in utils.for_each(source, _with[1:].split('/'), debug=debug, **kwargs):
                                 if isinstance(element[_what], dict):
                                     element[_what] |= value
                                 else:
                                     element[_what] += value
                             if _with.startswith('/'):
-                                utils.tree_delete(self.mission, _with[1:])
+                                utils.tree_delete(source, _with[1:])
                             else:
                                 utils.tree_delete(reference, _with)
                 elif 'delete' in config:
                     if debug:
-                        print("Processing DELETE ...")
+                        self.log.debug("Processing DELETE ...")
                     if isinstance(element, list):
                         for _what in element.copy():
                             if utils.evaluate(config['delete'], **_what):
@@ -383,22 +429,32 @@ class MizFile:
                 self.modify(cfg)
             return
         debug = config.get('debug', False)
+        file = config.get('file', 'mission')
+        if file == 'mission':
+            source = self.mission
+        elif file == 'options':
+            source = self.options
+        elif file == 'warehouses':
+            source = self.warehouses
+        else:
+            self.log.error(f"File {file} can not be changed.")
+            return
         kwargs = {}
         if 'variables' in config:
             for name, value in config['variables'].items():
                 if value.startswith('$'):
                     kwargs[name] = utils.evaluate(value, **kwargs)
                 else:
-                    kwargs[name] = next(utils.for_each(self.mission, value.split('/'), debug=debug, **kwargs))
+                    kwargs[name] = next(utils.for_each(source, value.split('/'), debug=debug, **kwargs))
         try:
             for_each = config['for-each'].lstrip('/')
         except KeyError:
             self.log.error("MizEdit: for-each missing in modify preset, skipping!")
             return
-        for reference in utils.for_each(self.mission, for_each.split('/'), debug=debug, **kwargs):
+        for reference in utils.for_each(source, for_each.split('/'), debug=debug, **kwargs):
             if 'where' in config:
                 if debug:
-                    print("Processing WHERE ...")
+                    self.log.debug("Processing WHERE ...")
                 if check_where(reference, config['where'], debug=debug, **kwargs):
                     process_elements(reference, **kwargs)
             else:
@@ -406,5 +462,7 @@ class MizFile:
 
 
 class UnsupportedMizFileException(Exception):
-    def __init__(self, mizfile: str):
-        super().__init__(f'The mission {mizfile} is not compatible with MizEdit. Please re-save it in DCS World.')
+    def __init__(self, mizfile: str, message: Optional[str] = None):
+        if not message:
+            message = f'The mission {mizfile} is not compatible with MizEdit. Please re-save it in DCS World.'
+        super().__init__(message)

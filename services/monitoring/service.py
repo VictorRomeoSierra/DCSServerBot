@@ -1,9 +1,13 @@
 from __future__ import annotations
+
 import asyncio
+import ctypes
 import logging
 import os
 import psutil
+import shutil
 import sys
+
 if sys.platform == 'win32':
     import win32gui
     import win32process
@@ -11,9 +15,8 @@ if sys.platform == 'win32':
 
 from datetime import datetime, timezone
 from discord.ext import tasks
-from typing import Union
 
-from core import Status, utils, Server, ServerImpl, Autoexec
+from core import Status, Server, ServerImpl, Autoexec, utils
 from core.services.base import Service
 from core.services.registry import ServiceRegistry
 
@@ -34,13 +37,47 @@ class MonitoringService(Service):
         self.bus = ServiceRegistry.get(ServiceBus)
         self.io_counters = {}
         self.net_io_counters = None
+        self.space_warning_sent: dict[str, bool] = {}
+        self.space_alert_sent: dict[str, bool] = {}
 
     async def start(self):
         await super().start()
+        install_drive = os.path.splitdrive(os.path.expandvars(self.node.locals['DCS']['installation']))[0]
+        self.space_warning_sent[install_drive] = False
+        self.space_alert_sent[install_drive] = False
+        if install_drive != 'C:':
+            self.space_warning_sent['C:'] = False
+            self.space_alert_sent['C:'] = False
         self.check_autoexec()
         self.monitoring.start()
+        if self.get_config().get('time_sync', False):
+            time_server = self.get_config().get('time_server', None)
+            if time_server:
+                if sys.platform == 'win32':
+                    try:
+                        retval = ctypes.windll.shell32.ShellExecuteW(
+                            None,
+                            "runas", 'w32tm', f'/config /manualpeerlist:{time_server} /syncfromflags:MANUAL',
+                            None, 1
+                        )
+                        if retval > 31:
+                            self.log.info(f"- Time server configured as {time_server}.")
+                        else:
+                            self.log.info(f"- Could not configure time server, errorcode: {retval}")
+                    except OSError as ex:
+                        if ex.winerror == 740:
+                            self.log.error("You need to disable User Access Control (UAC), "
+                                           "to use the automated time sync.")
+                        raise
+                else:
+                    # not implemented for UNIX
+                    pass
+
+            self.time_sync.start()
 
     async def stop(self):
+        if self.get_config().get('time_sync', False):
+            self.time_sync.cancel()
         self.monitoring.cancel()
         await super().stop()
 
@@ -58,44 +95,26 @@ class MonitoringService(Service):
             except Exception as ex:
                 self.log.error(f"  => Error while parsing autoexec.cfg: {ex.__repr__()}")
 
-    async def check_nodes(self):
-        active_nodes: list[str] = await self.node.get_active_nodes()
-        used_nodes: set[str] = set()
-        for server in [x for x in self.bus.servers.values() if x.is_remote]:
-            if server.node.name not in active_nodes:
-                self.log.warning(f"- Node {server.node.name} not responding, removing server {server.name}.")
-                self.bus.servers[server.name].status = Status.UNREGISTERED
-                del self.bus.servers[server.name]
-            else:
-                used_nodes.add(server.node.name)
-        # any new nodes detected?
-        for node in set(active_nodes) - used_nodes:
-            await self.bus.register_remote_node(node)
-
-    @staticmethod
-    async def check_affinity(server: Server, affinity: Union[list[int], str]):
-        if isinstance(affinity, str):
-            affinity = [int(x.strip()) for x in affinity.split(',')]
-        elif isinstance(affinity, int):
-            affinity = [affinity]
-        if not server.process:
-            server.process = utils.find_process("DCS_server.exe|DCS.exe", server.instance.name)
-        if server.process:
-            server.process.cpu_affinity(affinity)
+    async def send_alert(self, title: str, message: str, **kwargs):
+        params = {
+            "title": title,
+            "message": message
+        }
+        if 'server' in kwargs:
+            params['server'] = kwargs['server'].name
+        else:
+            params['node'] = self.node.name
+        await self.bus.send_to_node({
+            "command": "rpc",
+            "service": BotService.__name__,
+            "method": "alert",
+            "params": params
+        })
 
     async def warn_admins(self, server: Server, title: str, message: str) -> None:
         message += f"\nLatest dcs-<timestamp>.log can be pulled with /download\n" \
                    f"If the scheduler is configured for this server, it will relaunch it automatically."
-        self.bus.send_to_node({
-            "command": "rpc",
-            "service": BotService.__name__,
-            "method": "alert",
-            "params": {
-                "server": server.name,
-                "title": title,
-                "message": message
-            }
-        })
+        await self.send_alert(title, message, server=server)
 
     async def check_popups(self):
         # check for blocked processes due to window popups
@@ -104,7 +123,8 @@ class MonitoringService(Service):
             "Login Failed",
             "DCS Login",
             "Authorization failed",
-            "Login session has expired"
+            "Login session has expired",
+            "Mission script error"
         ]:
             handle = win32gui.FindWindowEx(None, None, None, title)
             if handle:
@@ -121,14 +141,20 @@ class MonitoringService(Service):
         self.log.warning(message)
         if server.process and server.process.is_running():
             now = datetime.now(timezone.utc)
-            filename = os.path.join(server.instance.home, 'Logs',
-                                    f"{now.strftime('dcs-%Y%m%d-%H%M%S')}.dmp")
             if sys.platform == 'win32':
-                await asyncio.to_thread(create_dump, server.process.pid, filename,
-                                        MINIDUMP_TYPE.MiniDumpNormal, True)
-                root = logging.getLogger()
-                if root.handlers:
-                    root.removeHandler(root.handlers[0])
+                try:
+                    filename = os.path.join(server.instance.home, 'Logs',
+                                            f"{now.strftime('dcs-%Y%m%d-%H%M%S')}.dmp")
+                    await asyncio.to_thread(create_dump, server.process.pid, filename,
+                                            MINIDUMP_TYPE.MiniDumpNormal, True)
+
+                    root = logging.getLogger()
+                    if root.handlers:
+                        root.removeHandler(root.handlers[0])
+                except OSError:
+                    self.log.debug("No minidump created due to an error (Linux?).")
+            shutil.copy2(os.path.join(server.instance.home, 'Logs', 'dcs.log'),
+                         os.path.join(server.instance.home, 'Logs', f"dcs-{now.strftime('%Y%m%d-%H%M%S')}.log"))
             server.process.kill()
         else:
             await server.shutdown(True)
@@ -139,9 +165,9 @@ class MonitoringService(Service):
             await self.warn_admins(server, title=f'Server \"{server.name}\" unreachable', message=message)
 
     async def heartbeat(self):
-        for server in list(self.bus.servers.values()):  # type: ServerImpl
+        for server in self.bus.servers.values():  # type: ServerImpl
             # don't test remote servers or servers that are not initialized or shutdown
-            if server.is_remote or server.status in [Status.UNREGISTERED, Status.SHUTDOWN]:
+            if server.is_remote or server.status in [Status.UNREGISTERED, Status.SHUTTING_DOWN, Status.SHUTDOWN]:
                 continue
             # check if the process is dead (on load it might take some seconds for the process to appear)
             if server.process and not await server.is_running():
@@ -150,6 +176,9 @@ class MonitoringService(Service):
                     return
                 # only escalate, if the server was not stopped (maybe the process was manually shut down)
                 if server.status != Status.STOPPED:
+                    now = datetime.now(timezone.utc)
+                    shutil.copy2(os.path.join(server.instance.home, 'Logs', 'dcs.log'),
+                                 os.path.join(server.instance.home, 'Logs', f"dcs-{now.strftime('%Y%m%d-%H%M%S')}.log"))
                     title = f'Server "{server.name}" died!'
                     message = 'Setting state to SHUTDOWN.'
                     self.log.warning(title + ' ' + message)
@@ -170,12 +199,10 @@ class MonitoringService(Service):
                     await self.kill_hung_server(server)
                     continue
                 if server.status in [Status.RUNNING, Status.PAUSED]:
-                    # check affinity
-                    if 'affinity' in server.instance.locals:
-                        await self.check_affinity(server, server.instance.locals['affinity'])
                     # check extension states
                     for ext in [x for x in server.extensions.values() if not await asyncio.to_thread(x.is_running)]:
                         try:
+                            self.log.warning(f"{ext.name} died - restarting ...")
                             await ext.startup()
                         except Exception as ex:
                             self.log.exception(ex)
@@ -187,19 +214,19 @@ class MonitoringService(Service):
 
         bus = ServiceRegistry.get(ServiceBus)
         pstats: dict = self.apool.get_stats()
-        wait_time = pstats.get('requests_wait_ms', 0) - last_wait_time
         async with self.apool.connection() as conn:
             async with conn.transaction():
                 await conn.execute("""
-                    INSERT INTO nodestats (node, pool_size, pool_available, requests_waiting, requests_wait_ms, 
-                                           workers, qsize)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                """, (self.node.name, pstats.get('pool_size', 0), pstats.get('pool_available', 0),
-                      pstats.get('requests_waiting', 0), wait_time, len(bus.executor._threads),
-                      sum(x.qsize() for x in bus.udp_server.message_queue.values())))
-        last_wait_time = pstats.get('requests_wait_ms', 0)
+                    INSERT INTO nodestats (
+                        node, pool_available, requests_queued, requests_wait_ms, dcs_queue, asyncio_queue
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """, (self.node.name, pstats.get('pool_available', 0), pstats.get('requests_queued', 0),
+                      pstats.get('requests_wait_ms', 0), sum(x.qsize() for x in bus.udp_server.message_queue.values()),
+                      len(asyncio.all_tasks(self.bus.loop))))
+        self.apool.pop_stats()
 
-    def _pull_load_params(self, server: Server):
+    def _pull_load_params(self, server: Server) -> dict:
         cpu = server.process.cpu_percent()
         memory = server.process.memory_full_info()
         io_counters = server.process.io_counters()
@@ -216,7 +243,7 @@ class MonitoringService(Service):
             bytes_sent = int((net_io_counters.bytes_sent - self.net_io_counters.bytes_sent) / 7200)
             bytes_recv = int((net_io_counters.bytes_recv - self.net_io_counters.bytes_recv) / 7200)
         self.net_io_counters = net_io_counters
-        self.bus.send_to_node({
+        return {
             "command": "serverLoad",
             "cpu": cpu,
             "mem_total": memory.vms,
@@ -226,29 +253,47 @@ class MonitoringService(Service):
             "bytes_recv": bytes_recv,
             "bytes_sent": bytes_sent,
             "server_name": server.name
-        })
+        }
 
     async def serverload(self):
-        for server in self.bus.servers.copy().values():
+        for server in self.bus.servers.values():
             if server.is_remote or server.status not in [Status.RUNNING, Status.PAUSED]:
                 continue
-            if not server.process:
+            if not server.process or not server.process.is_running():
                 self.log.warning(f"DCSServerBot is not attached to a DCS.exe or DCS_Server.exe process on "
                                  f"server {server.name}, skipping server load gathering.")
                 continue
             try:
-                await asyncio.to_thread(self._pull_load_params, server)
+                await self.bus.send_to_node(await asyncio.to_thread(self._pull_load_params, server))
             except (psutil.AccessDenied, PermissionError):
                 self.log.debug(f"Server {server.name} was not started by the bot, skipping server load gathering.")
+            except psutil.NoSuchProcess:
+                self.log.debug(f"Server {server.name} died, skipping server load gathering.")
+
+    async def drive_check(self):
+        for drive in self.space_warning_sent.keys():
+            total, free = utils.get_drive_space(drive)
+            warn_pct = (self.get_config().get('drive_warn_threshold', 10)) / 100
+            alert_pct = (self.get_config().get('drive_alert_threshold', 5)) / 100
+            if (free < total * warn_pct) and not self.space_warning_sent[drive]:
+                message = f"Your freespace on {drive} is below {warn_pct * 100}%!"
+                self.log.warning(message)
+                await self.node.audit(message)
+                self.space_warning_sent[drive] = True
+            if (free < total * alert_pct) and not self.space_alert_sent[drive]:
+                message = f"Your freespace on {drive} is below {alert_pct * 100}%!"
+                self.log.error(message)
+                await self.send_alert(title=f"Your DCS drive on node {self.node.name} is running out of space!",
+                                      message=message)
+                self.space_alert_sent[drive] = True
 
     @tasks.loop(minutes=1.0)
     async def monitoring(self):
         try:
-            if self.node.master:
-                await self.check_nodes()
             if sys.platform == 'win32':
                 await self.check_popups()
             await self.heartbeat()
+            await self.drive_check()
             if 'serverstats' in self.node.config.get('opt_plugins', []):
                 await self.serverload()
             if self.node.locals.get('nodestats', True):
@@ -261,3 +306,21 @@ class MonitoringService(Service):
         if self.node.master:
             bot = ServiceRegistry.get(BotService).bot
             await bot.wait_until_ready()
+
+    @tasks.loop(hours=12)
+    async def time_sync(self):
+        if sys.platform == 'win32':
+            try:
+                retval = ctypes.windll.shell32.ShellExecuteW(None, "runas", 'w32tm', '/resync', None, 1)
+                if retval > 31:
+                    self.log.info("- Windows time synced.")
+                else:
+                    self.log.info(f"- Windows time NOT synced, errorcode: {retval}")
+            except OSError as ex:
+                if ex.winerror == 740:
+                    self.log.error("You need to disable User Access Control (UAC), "
+                                   "to use the automated time sync.")
+                raise
+        else:
+            # not implemented for UNIX
+            pass

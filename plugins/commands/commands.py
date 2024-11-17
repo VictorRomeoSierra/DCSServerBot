@@ -9,7 +9,7 @@ import traceback
 from core import Plugin, TEventListener, utils, Server, Status, Report, DEFAULT_TAG
 from discord.ext import commands
 from discord.ext.commands import Command
-from services import DCSServerBot
+from services.bot import DCSServerBot
 from typing import Type, Optional
 
 
@@ -20,8 +20,9 @@ class Commands(Plugin):
         self.prefix = self.locals.get(DEFAULT_TAG, {}).get('command_prefix', '.')
         self.register_commands()
 
-    def cog_unload(self):
+    async def cog_unload(self):
         self._unregister_commands()
+        await super().cog_unload()
 
     @staticmethod
     async def execute(ctx: commands.Context, config: dict, **kwargs) -> Optional[dict]:
@@ -35,7 +36,7 @@ class Commands(Plugin):
         if config.get('shell', False):
             try:
                 def run_cmd():
-                    result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+                    result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, shell=True)
                     return result.stdout, result.stderr
 
                 stdout, stderr = await asyncio.to_thread(run_cmd)
@@ -78,7 +79,7 @@ class Commands(Plugin):
                     return None
             else:
                 if server.status != Status.SHUTDOWN:
-                    server.send_to_dcs(config)
+                    await server.send_to_dcs(config)
                     await ctx.send(f'Event sent to {server.name}.')
                 else:
                     await ctx.send(f'Server {server.name} is {server.status.name}.')
@@ -141,7 +142,7 @@ class Commands(Plugin):
                 return
             report = Report(self.bot, self.plugin_name, config['report'])
             env = await report.render(**kwargs)
-            await ctx.send(embed=env.embed)
+            await ctx.send(env.mention, embed=env.embed)
         elif data:
             if len(data) > 1:
                 embed = discord.Embed(color=discord.Color.blue())
@@ -154,6 +155,9 @@ class Commands(Plugin):
                 await ctx.send(data[0]['value'])
 
     def register_commands(self):
+        if 'commands' not in self.locals:
+            self.log.warning(f"No commands defined in {self.plugin_name}.yaml!")
+            return
         for cmd in self.locals['commands']:
             try:
                 checks = []

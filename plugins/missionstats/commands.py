@@ -5,7 +5,7 @@ from core import Plugin, PluginRequiredError, utils, Report, Status, Server, com
 from discord import app_commands
 from plugins.userstats.filter import StatisticsFilter, MissionStatisticsFilter, PeriodTransformer, PeriodFilter, \
     CampaignFilter, MissionFilter
-from services import DCSServerBot
+from services.bot import DCSServerBot
 from typing import Optional, Union
 
 from .listener import MissionStatisticsEventListener
@@ -77,14 +77,14 @@ class MissionStatistics(Plugin):
     async def missionstats(self, interaction: discord.Interaction,
                            server: app_commands.Transform[Server, utils.ServerTransformer(
                                status=[Status.RUNNING, Status.PAUSED])]):
-        if server.name not in self.bot.mission_stats:
+        stats = self.eventlistener.mission_stats.get(server.name)
+        if not stats:
             # noinspection PyUnresolvedReferences
             await interaction.response.send_message(
                 _("Mission statistics not initialized yet or not active for this server."), ephemeral=True)
             return
         # noinspection PyUnresolvedReferences
         await interaction.response.defer(ephemeral=True)
-        stats = self.bot.mission_stats[server.name]
         report = Report(self.bot, self.plugin_name, 'missionstats.json')
         env = await report.render(stats=stats, mission_id=server.mission_id,
                                   sides=utils.get_sides(interaction.client, interaction, server))

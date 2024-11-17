@@ -6,8 +6,8 @@ import psycopg
 from core import Status, Plugin, utils, Server, ServiceRegistry, PluginInstallationError, Group, get_translation
 from discord import SelectOption, TextStyle, app_commands
 from discord.ui import View, Select, Button, Modal, TextInput
-
-from services import DCSServerBot, OvGMEService
+from services.bot import DCSServerBot
+from services.ovgme import OvGMEService
 from typing import Optional, Literal
 
 _ = get_translation(__name__.split('.')[1])
@@ -124,7 +124,8 @@ class OvGME(Plugin):
 
     def __init__(self, bot: DCSServerBot):
         super().__init__(bot)
-        if os.path.exists(os.path.join(self.node.config_dir, 'plugins', 'ovgme.yaml')):
+        if (os.path.exists(os.path.join(self.node.config_dir, 'plugins', 'ovgme.yaml')) and
+                not os.path.exists(os.path.join(self.node.config_dir, 'services', 'ovgme.yaml'))):
             self.log.warning(f"  => OvGME: your ovgme.yaml belongs into {self.node.config_dir}/services/ovgme.yaml, "
                              f"not in {self.node.config_dir}/plugins!")
         self.service = ServiceRegistry.get(OvGMEService)

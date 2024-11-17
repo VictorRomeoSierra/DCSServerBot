@@ -17,7 +17,10 @@ class SchedulerListener(EventListener):
                     results.append(result)
             return min(results, key=lambda x: x[0]) if results else None
         else:
-            mission_time = restart.get('max_mission_time', restart.get('mission_time'))
+            if server.is_populated():
+                mission_time = restart.get('max_mission_time', restart.get('mission_time'))
+            else:
+                mission_time = restart.get('mission_time')
             if mission_time:
                 delta = mission_time * 60 - int(server.current_mission.mission_time)
                 if delta >= 0:
@@ -26,6 +29,12 @@ class SchedulerListener(EventListener):
                     return 0, restart
             elif 'real_time' in restart:
                 delta = restart['real_time'] * 60 - int(server.current_mission.real_time)
+                if delta >= 0:
+                    return delta, restart
+                else:
+                    return 0, restart
+            elif 'idle_time' in restart and server.idle_since:
+                delta = restart['idle_time'] * 60 - int((datetime.now(timezone.utc) - server.idle_since).total_seconds())
                 if delta >= 0:
                     return delta, restart
                 else:
@@ -45,20 +54,35 @@ class SchedulerListener(EventListener):
                     return min_time_difference, restart
                 else:
                     return None
+            elif 'utc_times' in restart:
+                min_time_difference = 86400
+                for t in restart['utc_times']:
+                    restart_time = utils.parse_time(t, tz=timezone.utc)
+                    check_time = datetime.now(tz=timezone.utc).replace(
+                        year=restart_time.year, month=restart_time.month, day=restart_time.day, second=0, microsecond=0)
+                    if restart_time <= check_time:
+                        restart_time += timedelta(days=1)
+                    time_difference_in_seconds = int((restart_time - check_time).total_seconds())
+                    if 0 < time_difference_in_seconds < min_time_difference:
+                        min_time_difference = time_difference_in_seconds
+                if min_time_difference != 86400:
+                    return min_time_difference, restart
+                else:
+                    return None
 
     async def run(self, server: Server, method: str) -> None:
         if method.startswith('load:'):
-            server.send_to_dcs({
+            await server.send_to_dcs({
                 "command": "do_script_file",
                 "file": method[5:].strip().replace('\\', '/')
             })
         elif method.startswith('lua:'):
-            server.send_to_dcs({
+            await server.send_to_dcs({
                 "command": "do_script",
                 "script": method[4:].strip()
             })
         elif method.startswith('call:'):
-            server.send_to_dcs({
+            await server.send_to_dcs({
                 "command": method[5:].strip()
             })
         elif method.startswith('run:'):
@@ -70,7 +94,7 @@ class SchedulerListener(EventListener):
             asyncio.create_task(self.node.shell_command(cmd))
 
     async def process(self, server: Server, what: dict) -> None:
-        if 'shutdown' in what['command']:
+        if 'shutdown' in what['command'] or what.get('shutdown', False):
             await server.shutdown()
             message = 'shut down DCS server'
             if 'user' not in what:
@@ -94,14 +118,16 @@ class SchedulerListener(EventListener):
             asyncio.create_task(self.bot.audit(f"{self.plugin_name.title()} rotated to mission "
                                                f"{server.current_mission.display_name}", server=server))
         elif what['command'] == 'load':
-            await server.loadMission(what['id'])
-            message = f'loaded mission {server.current_mission.display_name}'
-            if 'user' not in what:
-                message = self.plugin_name.title() + ' ' + message
-            # noinspection PyAsyncCall
-            asyncio.create_task(self.bot.audit(message, server=server, user=what.get('user')))
+            if not await server.loadMission(what['id']):
+                self.log.warning(f"Mission {server.current_mission.display_name} NOT loaded.")
+            else:
+                message = f'loaded mission {server.current_mission.display_name}'
+                if 'user' not in what:
+                    message = self.plugin_name.title() + ' ' + message
+                # noinspection PyAsyncCall
+                asyncio.create_task(self.bot.audit(message, server=server, user=what.get('user')))
         elif what['command'] == 'preset':
-            if not server.node.config.get('mission_rewrite', True):
+            if not server.locals.get('mission_rewrite', True):
                 await server.stop()
             filename = await server.get_current_mission_file()
             new_filename = await server.modifyMission(filename,
@@ -115,19 +141,8 @@ class SchedulerListener(EventListener):
                 await server.start()
         server.restart_pending = False
 
-    async def _init_extensions(self, server: Server, data: dict) -> None:
-        try:
-            # init and start extensions if necessary
-            if data['channel'].startswith('sync-'):
-                await server.init_extensions()
-            await server.startup_extensions()
-        except (TimeoutError, asyncio.TimeoutError):
-            self.log.error(f"Timeout while loading extensions for server {server.name}!")
-
     @event(name="registerDCSServer")
     async def registerDCSServer(self, server: Server, data: dict) -> None:
-        # noinspection PyAsyncCall
-        asyncio.create_task(self._init_extensions(server, data))
         if data['channel'].startswith('sync-'):
             self.set_restart_time(server)
 
@@ -135,19 +150,22 @@ class SchedulerListener(EventListener):
     async def onPlayerStart(self, server: Server, data: dict) -> None:
         if data['id'] == 1 or 'ucid' not in data:
             return
-        if server.restart_pending:
-            restart = self.get_config(server).get('restart')
-            if restart:
-                # do not print any chat message when the server is set to restart on populated = False
-                if not restart.get('populated', True):
-                    return
-                restart_in, _ = self.get_next_restart(server, restart)
-                restart_time = f"in {utils.format_time(restart_in)}"
-            else:
-                restart_time = 'soon'
-            player: Player = server.get_player(ucid=data['ucid'])
-            if player:
-                player.sendChatMessage("*** Mission is about to be restarted {}! ***".format(restart_time))
+        action = self.get_config(server).get('action')
+        if action:
+            restart_in, rconf = self.get_next_restart(server, action)
+            # do not print any chat message when the server is set to restart on populated = False
+            if not rconf.get('populated', True):
+                return
+            restart_time = f"in {utils.format_time(restart_in)}"
+        elif server.restart_pending:
+            restart_time = 'soon!'
+        else:
+            return
+        player: Player = server.get_player(ucid=data['ucid'])
+        if player:
+            # noinspection PyAsyncCall
+            asyncio.create_task(player.sendChatMessage(
+                "Server will restart {}".format(restart_time)))
 
     @event(name="onSimulationPause")
     async def onSimulationPause(self, server: Server, _: dict) -> None:
@@ -168,7 +186,8 @@ class SchedulerListener(EventListener):
                 asyncio.create_task(self.process(server, server.on_empty.copy()))
                 server.on_empty.clear()
         elif data['eventName'] == 'mission_end':
-            self.bot.bus.send_to_node({"command": "onMissionEnd", "server_name": server.name})
+            # noinspection PyAsyncCall
+            asyncio.create_task(self.bot.bus.send_to_node({"command": "onMissionEnd", "server_name": server.name}))
             if server.on_mission_end:
                 self.bot.loop.call_soon(asyncio.create_task, self.process(server, server.on_mission_end.copy()))
                 server.on_mission_end.clear()
@@ -196,17 +215,6 @@ class SchedulerListener(EventListener):
             # noinspection PyAsyncCall
             asyncio.create_task(self.run(server, config['onMissionEnd']))
 
-    async def _shutdown_extensions(self, server: Server) -> None:
-        try:
-            await server.shutdown_extensions()
-        except (TimeoutError, asyncio.TimeoutError):
-            self.log.error(f"Timeout while shutting down extensions for server {server.name}!")
-
-    @event(name="onSimulationStop")
-    async def onSimulationStop(self, server: Server, _: dict) -> None:
-        # noinspection PyAsyncCall
-        asyncio.create_task(self._shutdown_extensions(server))
-
     @event(name="onShutdown")
     async def onShutdown(self, server: Server, _: dict) -> None:
         config = self.plugin.get_config(server)
@@ -218,10 +226,10 @@ class SchedulerListener(EventListener):
         config = self.get_config(server)
         if not config or not server.current_mission:
             return
-        restart = config.get('restart')
-        if not restart:
+        action = config.get('action')
+        if not action:
             return
-        result = self.get_next_restart(server, restart)
+        result = self.get_next_restart(server, action)
         if result:
             server.restart_time = datetime.now(tz=timezone.utc) + timedelta(seconds=result[0])
 
@@ -236,36 +244,34 @@ class SchedulerListener(EventListener):
             server.restart_pending = False
             server.on_empty.clear()
             server.on_mission_end.clear()
-            player.sendChatMessage('Maintenance mode enabled.')
-            # noinspection PyAsyncCall
-            asyncio.create_task(self.bot.audit("set maintenance flag", user=player.member, server=server))
+            await player.sendChatMessage('Maintenance mode enabled.')
+            await self.bot.audit("set maintenance flag", user=player.member or player.ucid, server=server)
         else:
-            player.sendChatMessage('Maintenance mode is already active.')
+            await player.sendChatMessage('Maintenance mode is already active.')
 
     @chat_command(name="clear", roles=['DCS Admin'], help="disable maintenance mode")
     async def clear(self, server: Server, player: Player, _: list[str]):
         if server.maintenance:
             server.maintenance = False
-            player.sendChatMessage('Maintenance mode disabled/cleared.')
-            # noinspection PyAsyncCall
-            asyncio.create_task(self.bot.audit("cleared maintenance flag", user=player.member, server=server))
+            await player.sendChatMessage('Maintenance mode disabled/cleared.')
+            await self.bot.audit("cleared maintenance flag", user=player.member or player.ucid, server=server)
         else:
-            player.sendChatMessage("Maintenance mode wasn't enabled.")
+            await player.sendChatMessage("Maintenance mode wasn't enabled.")
 
     @chat_command(name="timeleft", help="Time to the next restart")
     async def timeleft(self, server: Server, player: Player, params: list[str]):
-        restart = self.get_config(server).get('restart')
-        if not restart:
-            player.sendChatMessage("No restart configured for this server.")
+        action = self.get_config(server).get('action')
+        if not action:
+            await player.sendChatMessage("No action configured for this server.")
             return
         elif server.maintenance:
-            player.sendChatMessage("Maintenance mode active, mission will not restart.")
+            await player.sendChatMessage("Maintenance mode active, mission will not restart.")
             return
         elif not server.restart_time:
-            player.sendChatMessage("Please try again in a minute.")
+            await player.sendChatMessage("Please try again in a minute.")
             return
-        restart_in, rconf = self.get_next_restart(server, restart)
+        restart_in, rconf = self.get_next_restart(server, action)
         message = f"The mission will restart in {utils.format_time(restart_in)}"
         if not rconf.get('populated', True) and not rconf.get('max_mission_time'):
             message += ", if all players have left"
-        player.sendChatMessage(message)
+        await player.sendChatMessage(message)

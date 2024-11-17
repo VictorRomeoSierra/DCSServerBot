@@ -69,39 +69,6 @@ msgstr "Кем забанен: {}"
 msgid "Exp.: {}"
 msgstr "Ист: {}"
 
-# /dcs watch
-msgid "Puts a player onto the watchlist"
-msgstr "Добавляет игрока в список отслеживания"
-
-msgid "Player {} was already on the watchlist."
-msgstr "Игрок {} уже народится в списке отслеживания."
-
-msgid "Player {} is now on the watchlist."
-msgstr "Игрок {} теперь в списке отслеживания."
-
-# /dcs unwatch
-msgid "Removes a player from the watchlist"
-msgstr "Удаляет игрока из списка отслеживания"
-
-msgid "Player {} removed from the watchlist."
-msgstr "Игрок {} удален из списка отслеживания."
-
-# /dcs watchlist
-msgid "Shows the watchlist"
-msgstr "Показывает список отслеживания"
-
-msgid "The watchlist is currently empty."
-msgstr "Список отслеживания пуст."
-
-msgid "These players are currently on the watchlist:"
-msgstr "Данные игроки находятся в списке отслеживания:"
-
-msgid "UCIDs"
-msgstr "UCIDы"
-
-msgid "Names"
-msgstr "Имена"
-
 # /dcs update
 msgid "Update your DCS installations"
 msgstr "Обновить вашу инсталляцию DCS"
@@ -122,11 +89,19 @@ msgstr ""
 "Вы хотите обновиться с версии {old_version}@{old_branch} на версию {new_version}@{new_branch}?\n"
 "Все запущенные DCS серверы будут выключены!"
 
-msgid "Updating DCS to version {version}@{branch}, please wait ..."
-msgstr "Обновление DCS до версии {version}@{branch}, пожалуйста подождите ..."
+msgid "Updating DCS World to the newest version, please wait ..."
+msgstr "Обновляю сервер DCS World до самоей новой версии, пожалуйста подождите ..."
 
 msgid "DCS updated to version {version}@{branch} on node {name}."
 msgstr "DCS обновлен до версии {version}@{branch} на ноде {name}."
+
+msgid "DCS World could not be updated on node {name} due to missing disk space!"
+msgstr "DCS World не был обновлен на ноде {name}, недостаточно дискового пространства!"
+
+msgid "DCS World updated to version {version}@{branch} on node {name}.\n"
+"The updater has requested a **reboot** of the system!"
+msgstr "DCS World был обновлен до {version}@{branch} на ноде {name}.\n"
+"Обновление запросило **перезагрузку** системы!"
 
 msgid "Error while updating DCS on node {name}, code={rc}"
 msgstr "Ошибка во время обновления DCS на ноде {name}, код={rc}"
@@ -166,6 +141,9 @@ msgstr "Модуль {module} удалён с ноды {node}."
 # /download
 msgid "Download files from your server"
 msgstr "Скачать файлы с вашего сервера"
+
+msgid "File {file} not found in directory {dir}."
+msgstr "Файл {file} не найден в каталоге {dir}."
 
 msgid "File sent as a DM."
 msgstr "Файл отправлен в личные сообщения."
@@ -295,12 +273,18 @@ msgstr "Перезапуск конкретной ноды"
 msgid "Shuts down all servers, enables maintenance"
 msgstr "Выключает все сервера, включает режим обслуживания"
 
+msgid "Shuts all servers down (default: on)"
+msgstr "Отключает все сервера (по умолчанию: вкл.)"
+
 msgid "Node {} is now offline."
 msgstr "Нода {} переведена в режим оффлайн."
 
 # /node online
 msgid "Clears the maintenance mode for all servers"
 msgstr "Отключение режима обслуживания на всех серверах"
+
+msgid "Start all your servers (default: off)"
+msgstr "Запускает все сервера (по умолчанию: выкл.)"
 
 msgid "Node {} is now online."
 msgstr "Нода {} теперь онлайн."
@@ -381,12 +365,10 @@ msgstr ""
 msgid "Delete an instance\n"
 msgstr "Удаление инстанса\n"
 
-msgid ""
-"The instance is in use by server \"{}\".\n"
-"Please migrate this server to another node first."
-msgstr ""
-"Инстанс используется другим сервером \"{}\".\n"
-"Пожалуйста, сначала выполните миграцию сервера на другую ноду."
+msgid "The instance is in use by server \"{}\".\n"
+"Do you really want to delete it?"
+msgstr "Этот инстанс используется на сервере \"{}\".\n"
+"Вы действительно хотите удалить его?"
 
 msgid "Do you really want to delete instance {}?"
 msgstr "Вы действительно хотите удалить инстанс {}?"
@@ -396,6 +378,9 @@ msgstr "Вы хотите удалить директорию {}?"
 
 msgid "Instance {instance} removed from node {node}."
 msgstr "Инстанс {instance} удален с ноды {node}."
+
+msgid "Instance {} could not be deleted, because the directory is in use."
+msgstr "Инстанс {} не может быть удален, так как директория уже используется."
 
 # /node rename_instance
 msgid "Rename an instance\n"
@@ -409,6 +394,9 @@ msgstr "Вы действительно хотите переименовать 
 
 msgid "Instance {old_name} renamed to {new_name}."
 msgstr "Инстанс {old_name} переименован в {new_name}."
+
+msgid "Instance {} could not be renamed, because the directory is in use."
+msgstr "Инстанс {} не может быть переименован, так как директория уже используется."
 
 # Config upload
 msgid "To which server do you want to upload this configuration to?"

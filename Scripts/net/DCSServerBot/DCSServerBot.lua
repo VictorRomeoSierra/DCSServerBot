@@ -22,6 +22,7 @@ if dcsbot.UDPSendSocket == nil then
 	package.cpath = package.cpath..";.\\LuaSocket\\?.dll;"
 	local socket = require("socket")
 	dcsbot.UDPSendSocket = socket.udp()
+	dcsbot.UDPSendSocket:setsockname("*", 0)
 end
 
 dcsbot.sendBotMessage = dcsbot.sendBotMessage or function (msg, channel)
@@ -36,60 +37,6 @@ dcsbot.sendBotTable = dcsbot.sendBotTable or function (tbl, channel)
 	tbl.channel = channel or "-1"
 	local tbl_json_txt = JSON:encode(tbl)
 	socket.try(dcsbot.UDPSendSocket:sendto(tbl_json_txt, config.BOT_HOST, config.BOT_PORT))
-end
-
-dcsbot.sendEmbed = dcsbot.sendEmbed or function(title, description, img, fields, footer, channel)
-	dcsbot.updateEmbed(nil, title, description, img, fields, footer, channel)
-end
-
-dcsbot.updateEmbed = dcsbot.updateEmbed or function (id, title, description, img, fields, footer, channel)
-	local msg = {
-		command = 'sendEmbed',
-		id = id,
-		title = title,
-		description = description,
-		img = img,
-		fields = fields,
-		footer = footer
-	}
-	dcsbot.sendBotTable(msg, channel)
-end
-
-dcsbot.callback = dcsbot.callback or function (msg, channel)
-	local newmsg = msg
-	newmsg.subcommand = msg.command
-	newmsg.command = 'callback'
-	dcsbot.sendBotTable(newmsg, channel)
-end
-
-dcsbot.startMission = dcsbot.startMission or function (id)
-	local msg = {
-		command = 'startMission',
-		id = id
-	}
-	dcsbot.callback(msg)
-end
-
-dcsbot.shutdown = dcsbot.shutdown or function ()
-	local msg = {
-		command = 'shutdown'
-	}
-	dcsbot.callback(msg)
-end
-
-dcsbot.restartMission = dcsbot.restartMission or function ()
-	local msg = {
-		command = 'restartMission'
-	}
-	dcsbot.callback(msg)
-end
-
-dcsbot.disableUserStats = dcsbot.disableUserStats or function ()
-	local msg = {
-		command = 'disableUserStats'
-	}
-	dcsbot.sendBotTable(msg, channel)
-	env.info('User Statistics disabled.')
 end
 
 do

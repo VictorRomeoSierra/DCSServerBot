@@ -8,7 +8,7 @@ import tempfile
 
 from core import Plugin, command, utils, Status, Server, PluginInstallationError, MizFile, UnsupportedMizFileException
 from discord import app_commands
-from services import DCSServerBot
+from services.bot import DCSServerBot
 
 
 class RealWeather(Plugin):
@@ -85,7 +85,7 @@ class RealWeather(Plugin):
         airbase = server.current_mission.airbases[idx]
         startup = False
         msg = await interaction.followup.send('Changing weather...', ephemeral=ephemeral)
-        if not server.node.config.get('mission_rewrite', True) and server.status != Status.STOPPED:
+        if not server.locals.get('mission_rewrite', True) and server.status != Status.STOPPED:
             await server.stop()
             startup = True
         filename = await server.get_current_mission_file()
@@ -93,7 +93,7 @@ class RealWeather(Plugin):
             new_filename = await self.change_weather(server, filename, airbase)
             self.log.info(f"Realweather applied on server {server.name}.")
         except (FileNotFoundError, UnsupportedMizFileException):
-            await msg.edit(content='Could not apply weather due to an error in RealWeather.', ephemeral=ephemeral)
+            await msg.edit(content='Could not apply weather due to an error in RealWeather.')
             return
         message = 'Weather changed.'
         if new_filename != filename:

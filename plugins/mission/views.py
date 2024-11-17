@@ -2,12 +2,12 @@ import asyncio
 import discord
 import os
 from contextlib import suppress
-from core import Server, Report, Status, ReportEnv, Player, Member, DataObjectFactory
+from core import Server, Report, Status, ReportEnv, Player, Member, DataObjectFactory, utils
 from discord import SelectOption
 from discord.ui import View, Select, Button
 from typing import cast, Optional, Union
 
-from services import DCSServerBot
+from services.bot import DCSServerBot
 
 
 class ServerView(View):
@@ -63,11 +63,14 @@ class ServerView(View):
         await interaction.response.defer()
         self.env.embed.set_footer(text="Loading mission, please wait ...")
         await interaction.edit_original_response(embed=self.env.embed)
-        await self.server.loadMission(int(interaction.data['values'][0]) + 1)
-        with suppress(TimeoutError, asyncio.TimeoutError):
-            await self.server.wait_for_status_change([Status.RUNNING], 2)
-        await self.render(interaction)
-        await interaction.edit_original_response(embed=self.env.embed, view=self)
+        if not await self.server.loadMission(int(interaction.data['values'][0]) + 1):
+            self.env.embed.set_footer(text="Mission loading failed.")
+            await interaction.edit_original_response(embed=self.env.embed)
+        else:
+            with suppress(TimeoutError, asyncio.TimeoutError):
+                await self.server.wait_for_status_change([Status.RUNNING], 2)
+            await self.render(interaction)
+            await interaction.edit_original_response(embed=self.env.embed, view=self)
 
     async def change_preset(self, interaction: discord.Interaction):
         pass
@@ -186,10 +189,6 @@ class InfoView(View):
                 button = Button(emoji="⛔")
                 button.callback = self.on_ban
                 self.add_item(button)
-            if self.player:
-                button = Button(emoji="⏏️")
-                button.callback = self.on_kick
-                self.add_item(button)
             watchlist = await self.is_watchlist()
             if watchlist:
                 button = Button(emoji="🆓")
@@ -199,13 +198,18 @@ class InfoView(View):
                 button = Button(emoji="🔍")
                 button.callback = self.on_watch
                 self.add_item(button)
+            if self.player:
+                button = Button(emoji="⏏️")
+                button.callback = self.on_kick
+                self.add_item(button)
         else:
             banned = watchlist = False
         button = Button(label="Cancel", style=discord.ButtonStyle.red)
         button.callback = self.on_cancel
         self.add_item(button)
         report = Report(self.bot, 'mission', 'info.json')
-        env = await report.render(member=self.member, player=self.player, banned=banned, watchlist=watchlist)
+        env = await report.render(member=self.member, ucid=self.ucid, player=self.player, banned=banned,
+                                  watchlist=watchlist)
         return env.embed
 
     async def is_banned(self) -> bool:
@@ -213,7 +217,7 @@ class InfoView(View):
 
     async def is_watchlist(self) -> bool:
         async with self.bot.apool.connection() as conn:
-            cursor = await conn.execute("SELECT watchlist FROM players WHERE ucid = %s", (self.ucid,))
+            cursor = await conn.execute("SELECT True FROM watchlist WHERE player_ucid = %s", (self.ucid,))
             row = await cursor.fetchone()
         return row[0] if row else False
 
@@ -228,6 +232,12 @@ class InfoView(View):
         # TODO: reason modal
         await self.bot.bus.ban(ucid=self.ucid, reason='n/a', banned_by=interaction.user.display_name)
         await interaction.followup.send("User has been banned.", ephemeral=self.ephemeral)
+        name = self.player.name if self.player else self.member.display_name if isinstance(self.member, discord.Member) else self.member
+        message = f'banned user {name} '
+        if not utils.is_ucid(name):
+            message += '(ucid={self.ucid}) '
+        message += 'permanently'
+        await self.bot.audit(message, user=interaction.user)
         self.stop()
 
     async def on_unban(self, interaction: discord.Interaction):
@@ -235,14 +245,16 @@ class InfoView(View):
         await interaction.response.defer()
         await self.bot.bus.unban(self.ucid)
         await interaction.followup.send("User has been unbanned.", ephemeral=self.ephemeral)
+        await self.bot.audit(f'unbanned user {self.ucid}.', user=interaction.user)
         self.stop()
 
     async def on_kick(self, interaction: discord.Interaction):
         # noinspection PyUnresolvedReferences
         await interaction.response.defer()
         # TODO: reason modal
-        self.server.kick(player=self.player)
+        await self.server.kick(player=self.player)
         await interaction.followup.send("User has been kicked.", ephemeral=self.ephemeral)
+        await self.bot.audit(f'kicked player {self.player.name} (ucid={self.player.ucid}).', user=interaction.user)
         self.stop()
 
     async def on_unlink(self, interaction: discord.Interaction):
@@ -250,7 +262,7 @@ class InfoView(View):
         await interaction.response.defer()
         member: discord.Member = self._member.member
         self._member.unlink()
-        self.bot.bus.send_to_node({
+        await self.bot.bus.send_to_node({
             "command": "rpc",
             "service": "ServiceBus",
             "method": "propagate_event",
@@ -271,6 +283,7 @@ class InfoView(View):
                 await member.remove_roles(self.bot.get_role(autorole))
             except discord.Forbidden:
                 await self.bot.audit('permission "Manage Roles" missing.', user=self.bot.member)
+        await self.bot.audit(f'unlinked member {member.display_name} from UCID {self.ucid}.', user=interaction.user)
         self.stop()
 
     async def on_verify(self, interaction: discord.Interaction):
@@ -278,7 +291,7 @@ class InfoView(View):
         await interaction.response.defer()
         member: discord.Member = self._member.member
         self._member.verified = True
-        self.bot.bus.send_to_node({
+        await self.bot.bus.send_to_node({
             "command": "rpc",
             "service": "ServiceBus",
             "method": "propagate_event",
@@ -299,6 +312,7 @@ class InfoView(View):
                 await member.add_roles(self.bot.get_role(autorole))
             except discord.Forbidden:
                 await self.bot.audit(f'permission "Manage Roles" missing.', user=self.bot.member)
+        await self.bot.audit(f'linked member {member.display_name} to UCID {self.ucid}.', user=interaction.user)
         self.stop()
 
     async def on_watch(self, interaction: discord.Interaction):
@@ -306,7 +320,8 @@ class InfoView(View):
         await interaction.response.defer()
         async with self.bot.apool.connection() as conn:
             async with conn.transaction():
-                await conn.execute("UPDATE players SET watchlist = TRUE WHERE ucid = %s", (self.ucid, ))
+                await conn.execute("INSERT INTO watchlist (player_ucid, reason, created_by) VALUES (%s, %s, %s)",
+                                   (self.ucid, 'n/a', interaction.user.display_name))
         await interaction.followup.send("User is now on the watchlist.", ephemeral=self.ephemeral)
         self.stop()
 
@@ -315,6 +330,12 @@ class InfoView(View):
         await interaction.response.defer()
         async with self.bot.apool.connection() as conn:
             async with conn.transaction():
-                await conn.execute("UPDATE players SET watchlist = FALSE WHERE ucid = %s", (self.ucid, ))
+                await conn.execute("DELETE FROM watchlist WHERE player_ucid = %s", (self.ucid, ))
         await interaction.followup.send("User removed from the watchlist.", ephemeral=self.ephemeral)
+        name = self.player.name if self.player else self.member.display_name if isinstance(self.member, discord.Member) else self.member
+        message = f'removed player {name} '
+        if not utils.is_ucid(name):
+            message += '(ucid={self.ucid}) '
+        message += 'from the watchlist'
+        await self.bot.audit(message, user=interaction.user)
         self.stop()

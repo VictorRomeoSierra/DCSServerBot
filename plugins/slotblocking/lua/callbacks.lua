@@ -58,30 +58,26 @@ function slotblock.onPlayerTryConnect(addr, name, ucid, playerID)
         local current = #net.get_player_list() + 1
         if current >= (max - tonumber(cfg['slots'])) then
             if not is_vip(ucid) then
-                return false, config.MESSAGE_SERVER_FULL
+                return false, cfg['message_server_full'] or 'The server is full, please try again later!'
             end
         end
     end
 end
 
-function slotblock.onPlayerTryChangeSlot(playerID, side, slotID)
-    log.write('DCSServerBot', log.DEBUG, 'Slotblocking: onPlayerTryChangeSlot()')
+function restrict_slots(playerID, side, slotID)
     local player = net.get_player_info(playerID, 'ucid')
     local unit_name = DCS.getUnitProperty(slotID, DCS.UNIT_NAME)
     local group_name = DCS.getUnitProperty(slotID, DCS.UNIT_GROUPNAME)
     local unit_type = DCS.getUnitType(slotID)
     local points
-    if not dcsbot.params or not dcsbot.params['slotblocking'] or not dcsbot.params['slotblocking']['restricted'] then
-        log.write('DCSServerBot', log.ERROR, 'Slotblocking: No configuration found, skipping.')
-        return
-    end
     -- check levels if any
     for id, unit in pairs(dcsbot.params['slotblocking']['restricted']) do
         local is_unit_type_match = unit['unit_type'] and unit['unit_type'] == unit_type
         local is_unit_name_match = unit['unit_name'] and string.match(unit_name, unit['unit_name'])
         local is_group_name_match = unit['group_name'] and string.match(group_name, unit['group_name'])
+        local is_side = (tonumber(unit['side']) or side) == side
 
-        if is_unit_type_match or is_unit_name_match or is_group_name_match then
+        if is_side and (is_unit_type_match or is_unit_name_match or is_group_name_match) then
             -- blocking slots by points // check multicrew
             if tonumber(slotID) then
                 points = tonumber(unit['points'])
@@ -107,7 +103,7 @@ function slotblock.onPlayerTryChangeSlot(playerID, side, slotID)
                 local message = unit['message'] or 'This slot is only accessible to certain users.'
                 net.send_chat_to(message, playerID)
                 return false
-            -- blocking slots by discord groups
+                -- blocking slots by discord groups
             elseif unit['discord'] and not has_value(unit['discord'], dcsbot.userInfo[player].roles) then
                 local message = unit['message'] or 'This slot is only accessible to members with a specific Discord role.'
                 net.send_chat_to(message, playerID)
@@ -118,6 +114,82 @@ function slotblock.onPlayerTryChangeSlot(playerID, side, slotID)
                 return false
             end
         end
+    end
+end
+
+function calculate_balance(numPlayersBlue, numPlayersRed, blue_vs_red)
+    local total = numPlayersBlue + numPlayersRed
+    local balance
+
+    if total ~= 0 then
+        balance = numPlayersBlue / total
+    else
+        balance = blue_vs_red
+    end
+
+    return balance
+end
+
+function balance_slots(playerID, side, slotID)
+    local config = dcsbot.params['slotblocking']['balancing']
+    local blue_vs_red = config['blue_vs_red'] or 0.5
+    local threshold = config['threshold'] or 0.1
+    local activation_threshold = tonumber(config['activation_threshold'] or 0)
+    local message = config['message'] or 'You need to take a slot of the opposite coalition to keep the balance!'
+    local players = net.get_player_list()
+    local numPlayersBlue = 0
+    local numPlayersRed = 0
+
+    log.write('DCSServerBot', log.DEBUG, 'Slotblocking: balance_slots()')
+    if #players < activation_threshold then
+        log.write('DCSServerBot', log.DEBUG, 'Slotblocking: activation_threshold not reached')
+        return
+    end
+
+    for _, id in base.pairs(players) do
+        local player_info = net.get_player_info(id)
+        local _, slot, sub_slot = utils.getMulticrewAllParameters(id)
+
+        -- only count real seats
+        if sub_slot == 0 and slot ~= -1 then
+            if player_info.side == 2 then
+                numPlayersBlue = numPlayersBlue + 1
+            end
+            if player_info.side == 1 then
+                numPlayersRed = numPlayersRed + 1
+            end
+        end
+    end
+    local balance = calculate_balance(numPlayersBlue, numPlayersRed, blue_vs_red)
+    log.write('DCSServerBot', log.DEBUG, 'Slotblocking: balance: ' .. tostring(balance))
+    if (side == 2 and balance > blue_vs_red + threshold) or (side == 1 and balance < blue_vs_red - threshold) then
+        net.send_chat_to(message, playerID)
+        return false
+    end
+end
+
+function slotblock.onPlayerTryChangeSlot(playerID, side, slotID)
+    log.write('DCSServerBot', log.DEBUG, 'Slotblocking: onPlayerTryChangeSlot()')
+    -- we will not block spectator slots
+    if side == 0 then
+        return
+    end
+    if not dcsbot.params or not dcsbot.params['slotblocking'] then
+        log.write('DCSServerBot', log.ERROR, 'Slotblocking: No configuration found, skipping.')
+        return
+    end
+    -- check slot restrictions by role and points
+    if dcsbot.params['slotblocking']['restricted'] then
+        if restrict_slots(playerID, side, slotID) == false then
+            return false
+        end
+    end
+    -- check slot restrictions by balance
+    local player_info = net.get_player_info(playerID)
+    local old_side = player_info.side
+    -- if not side change happens or they want in a sub-slot, do not run balancing
+    if old_side ~= side and tonumber(slotID) and dcsbot.params['slotblocking']['balancing'] then
+        return balance_slots(playerID, side, slotID)
     end
 end
 

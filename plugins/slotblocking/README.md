@@ -2,7 +2,7 @@
 This is a slot blocking plugin that can be used in several ways (more to come).
 Slots can be either blocked by Discord roles (specific planes blocked for Discord Members, other ones blocked for 
 Donators for instance), by credit points (see [CreditSystem](../creditsystem/README.md)) that people earn by kills or a specific VIP role
-assigned in this plugins configuration.
+assigned in this plugin's configuration.
 
 ## Configuration
 As SlotBlocking is an optional plugin, you need to activate it in main.yaml first like so:
@@ -18,12 +18,13 @@ DEFAULT:            # Default section - true for all your servers.
   VIP:              # define a VIP group
     audit: true     # you want to be informed, if someone of that group enters your server
     discord:        # you can define VIPs by a specific discord role
-    - Admin
-    - DCS Admin
+      - Admin
+      - DCS Admin
     ucid:           # and a list of UCIDs (can be a single one also)
       - aabbccddeeffgghh
       - 11aa22bb33dd44ee
     slots: 2        # Optional: These number of slots are locked for VIPs only 
+    message_server_full: The server is full, please try again later!  # default message, if the server is considered full
   restricted:       # These slots are restricted in any way. Here we restrict CA slots for Donators or members or the Discord.
   - unit_type: artillery_commander
     discord: Donators
@@ -35,8 +36,14 @@ DEFAULT:            # Default section - true for all your servers.
     discord: Donators
     message: This slot is reserved for Donators!
   - unit_type: observer
+    side: 2               # side 1 = red, 2 = blue, not given - both sides
     discord: '@everyone'  # Only the "everyone" role needs the @ at the beginning, all other roles don't.
-    message: This slot is reserved for members of http://invite.link!
+    message: This slot is reserved for members of https://invite.link!
+  balancing:                  # Optional: Allows balancing for your server (blue vs red)
+    blue_vs_red: 0.5          # 50% balance blue vs red
+    threshold: 0.1            # 10% threshold until slots are blocked
+    activation_threshold: 10  # do not balance, if the number of players is below this threshold
+    message: You need to take a slot of the opposite coalition to keep the balance!
 DCS.release_server:
   restricted:             # in this example we restrict by credit points
   - group_name: Rookie    # this tag has to be in the group name of the respective units (best is to prepend it)
@@ -113,3 +120,17 @@ initial_points: 1   # you get one initial credit point (your "lifes")
 points_per_kill:
   - default: 0      # you don't get new lifes by kills
 ```
+
+### Balancing
+If you have a PvP server and want to enable balancing, this is how you can set it up.
+```yaml
+DEFAULT:
+  balancing:                  # Optional: Allows balancing for your server (blue vs red)
+    blue_vs_red: 0.5          # 50% balance blue vs red
+    threshold: 0.1            # 10% threshold until slots are blocked
+    activation_threshold: 10  # do not balance, if the number of players is below this threshold
+    message: You need to take a slot of the opposite coalition to keep the balance!
+``` 
+Balancing will **not** be checked
+- if a user selects another slot on the same side (if you are on blue, you can stay on blue)
+- if a user jumps in a CA (Artillery Commander, etc) or carrier slot (LSO, Airboss)

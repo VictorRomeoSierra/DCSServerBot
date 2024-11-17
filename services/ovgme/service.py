@@ -36,7 +36,6 @@ class OvGMEService(Service):
         if not os.path.exists('config/services/ovgme.yaml'):
             raise ServiceInstallationError(service='OvGME', reason="config/services/ovgme.yaml missing!")
         self.bus = ServiceRegistry.get(ServiceBus)
-        self._config: dict[str, dict] = {}
 
     async def start(self):
         await super().start()
@@ -62,7 +61,7 @@ class OvGMEService(Service):
         await self.install_packages()
 
     async def install_packages(self):
-        for server_name, server in self.bus.servers.copy().items():
+        for server_name, server in self.bus.servers.items():
             if server.is_remote:
                 continue
             # wait for the servers to be registered
@@ -112,10 +111,10 @@ class OvGMEService(Service):
     def parse_filename(filename: str) -> tuple[Optional[str], Optional[str]]:
         if filename.endswith('.zip'):
             filename = filename[:-4]
-        exp = re.compile('(?P<package>.*)_v?(?P<version>.*)')
+        exp = re.compile(r'(?P<package>.*?)(?P<version>[0-9]+\.[A-Za-z0-9.-]*)$')
         match = exp.match(filename)
         if match:
-            return match.group('package'), match.group('version')
+            return match.group('package').rstrip('v').rstrip('_').rstrip('-'), match.group('version')
         else:
             return None, None
 
@@ -299,6 +298,7 @@ class OvGMEService(Service):
                         os.makedirs(os.path.join(target, _name), exist_ok=True)
                     else:
                         with zfile.open(name) as infile:
+                            self.log.debug(f"Extracting file {name} to {target}/{_name}")
                             with open(os.path.join(target, _name), mode='wb') as outfile:
                                 outfile.write(infile.read())
             return log_entries
@@ -357,7 +357,11 @@ class OvGMEService(Service):
                 await self.download_from_repo(repo, folder, package_name=package_name, version=version)
                 return await self.install_package(server, folder, package_name, version)
             return False
-        return await self.do_install(server, folder, package_name, version, path, filename)
+        try:
+            return await self.do_install(server, folder, package_name, version, path, filename)
+        except Exception as ex:
+            self.log.exception(ex)
+            raise
 
     async def do_uninstall(self, server: Server, folder: str, package_name: str, version: str, ovgme_path: str) -> bool:
         target = self.node.installation if folder == 'RootFolder' else server.instance.home
@@ -369,7 +373,7 @@ class OvGMEService(Service):
                 if lines[i].startswith('w'):
                     if os.path.isfile(file):
                         os.remove(file)
-                    elif os.path.isdir(file):
+                    elif os.path.isdir(file) and not os.listdir(file):
                         with suppress(Exception):
                             os.removedirs(file)
                 elif lines[i].startswith('x'):

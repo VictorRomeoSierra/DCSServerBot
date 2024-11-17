@@ -111,6 +111,9 @@ msgstr "Lade Mission {} ..."
 msgid "Mission {} loaded."
 msgstr "Mission {} geladen."
 
+msgid "Mission {} NOT loaded. Check that you have installed the pre-requisites (terrains, mods)."
+msgstr "Mission {} konnte nicht geladen werden. Prüfe, ob Du die Map oder die notwendigen Mods installiert hast."
+
 msgid "Timeout while loading mission {}!"
 msgstr "Timeout während des Ladens der Mission {}!"
 
@@ -297,7 +300,7 @@ msgid "Name"
 msgstr "Name"
 
 msgid "Time"
-msgstr "Zeit"
+msgstr "Uhrzeit"
 
 msgid "Server"
 msgstr "Server"
@@ -335,19 +338,57 @@ msgstr "Nachricht gesendet."
 msgid "Sends a chat message to a player\n"
 msgstr "Sendet einem Spieler eine Nachricht\n"
 
-# /player watch
-msgid "Adds a player to the watchlist"
-msgstr "Fügt Spieler der Watchliste hinzu"
+# /player screenshot
+msgid "Server can not take screenshots."
+msgstr "Der Server kann keine Bildschirmaufnahmen machen."
+
+msgid "Requesting screenshot ..."
+msgstr "Mache Bildschirmaufnahme ..."
+
+msgid "Timeout while waiting for screenshot!"
+msgstr "Zeitüberschreitung bei der Bildschirmaufnahme!"
+
+msgid "Screenshot of Player {}"
+msgstr "Bildschirmaufnahme von Spieler {}"
+
+msgid "Taken by"
+msgstr "Aufgenommen von"
+
+# /watch add
+msgid "Puts a player onto the watchlist"
+msgstr "Fügt Spieler zur Watchliste hinzu"
+
+msgid "Member {} is not linked!"
+msgstr "Spieler {} hat seine Accounts nicht verknüpft!"
+
+msgid "Player {} was already on the watchlist."
+msgstr "Spieler {} war bereits auf der Watchliste."
 
 msgid "Player {} is now on the watchlist."
 msgstr "Spieler {} ist jetzt auf der Watchliste."
 
-# /player unwatch
+# /watch delete
 msgid "Removes a player from the watchlist"
-msgstr "Entfernt Spieler von der Watchliste"
+msgstr "Löscht Spieler von der Watchliste"
 
-msgid "Player {} removed from watchlist."
-msgstr "Spieler {} von der Watchliste entfernt."
+msgid "Player {} removed from the watchlist."
+msgstr "Spieler {} von der Watchliste gelöscht."
+
+# /watch list
+msgid "Shows the watchlist"
+msgstr "Zeigt die Watchliste an"
+
+msgid "The watchlist is currently empty."
+msgstr "Die Watchliste ist leer."
+
+msgid "These players are currently on the watchlist:"
+msgstr "Diese Spieler sind zurzeit auf der Watchliste:"
+
+msgid "UCID"
+msgstr "UCID"
+
+msgid "Created by"
+msgstr "Erzeugt von"
 
 # / group
 msgid "Commands to manage DCS groups"
@@ -493,6 +534,9 @@ msgstr "Die Datei existiert. Möchtest Du sie überschreiben?"
 
 msgid "Error while uploading: {}"
 msgstr "Fehler beim Upload: {}"
+
+msgid "Mission \"{mission}\" uploaded to server {server} and NOT added."
+msgstr "Mission \"{mission}\" wurde auf den Server {server} geladen, aber nicht zur Liste zugefügt."
 
 msgid "Mission \"{mission}\" uploaded to server {server}.\n"
 "As you have \"autoscan\" enabled, it might take some seconds to appear in your mission list."

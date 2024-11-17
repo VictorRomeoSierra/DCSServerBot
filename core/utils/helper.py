@@ -1,15 +1,22 @@
 from __future__ import annotations
 
+import asyncio
+import base64
 import builtins
+import functools
+import hashlib
 import importlib
 import json
+import logging
 import luadata
 import os
 import pkgutil
 import re
+import secrets
 import shutil
 import string
 import tempfile
+import threading
 import time
 import unicodedata
 
@@ -18,10 +25,10 @@ import random
 import math
 
 from croniter import croniter
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from importlib import import_module
 from pathlib import Path
-from typing import Optional, Union, TYPE_CHECKING, Generator, Iterable
+from typing import Optional, Union, TYPE_CHECKING, Generator, Iterable, Callable, Any
 from urllib.parse import urlparse
 
 # ruamel YAML support
@@ -42,7 +49,6 @@ __all__ = [
     "sanitize_string",
     "convert_time",
     "format_time",
-    "get_utc_offset",
     "format_period",
     "slugify",
     "alternate_parse_settings",
@@ -54,22 +60,31 @@ __all__ = [
     "is_github_repo",
     "matches_cron",
     "dynamic_import",
+    "async_cache",
+    "cache_with_expiration",
+    "ThreadSafeDict",
     "SettingsDict",
     "RemoteSettingsDict",
     "tree_delete",
+    "hash_password",
     "evaluate",
     "for_each",
     "YAMLError"
 ]
 
+logger = logging.getLogger(__name__)
 
-def parse_time(time_str: str) -> datetime:
+
+def parse_time(time_str: str, tz: datetime.tzinfo = None) -> datetime:
     fmt, time_str = ('%H:%M', time_str.replace('24:', '00:')) \
         if time_str.find(':') > -1 else ('%H', time_str.replace('24', '00'))
-    return datetime.strptime(time_str, fmt)
+    ret = datetime.strptime(time_str, fmt)
+    if tz is not None:
+        ret = ret.replace(tzinfo=tz)
+    return ret
 
 
-def is_in_timeframe(time: datetime, timeframe: str) -> bool:
+def is_in_timeframe(time: datetime, timeframe: str, tz: datetime.tzinfo = None) -> bool:
     """
     Check if a given time falls within a specified timeframe.
 
@@ -77,18 +92,23 @@ def is_in_timeframe(time: datetime, timeframe: str) -> bool:
     :type time: datetime
     :param timeframe: The timeframe to check against. Format: 'HH:MM-HH:MM' or 'HH:MM'.
     :type timeframe: str
+    :param tz: timezone to be used
+    :type tz: datetime.tzinfo
     :return: True if the time falls within the timeframe, False otherwise.
     :rtype: bool
     """
     pos = timeframe.find('-')
     if pos != -1:
-        start_time = parse_time(timeframe[:pos])
-        end_time = parse_time(timeframe[pos + 1:])
+        start_time = parse_time(timeframe[:pos], tz).replace(year=time.year, month=time.month, day=time.day,
+                                                             second=0, microsecond=0)
+        end_time = parse_time(timeframe[pos + 1:], tz).replace(year=time.year, month=time.month, day=time.day,
+                                                               second=0, microsecond=0)
         if end_time <= start_time:
             end_time += timedelta(days=1)
     else:
-        start_time = end_time = parse_time(timeframe)
-    check_time = time.replace(year=start_time.year, month=start_time.month, day=start_time.day, second=0, microsecond=0)
+        start_time = end_time = parse_time(timeframe, tz).replace(year=time.year, month=time.month, day=time.day,
+                                                                  second=0, microsecond=0)
+    check_time = time.replace(second=0, microsecond=0)
     return start_time <= check_time <= end_time
 
 
@@ -144,7 +164,7 @@ def format_string(string_: str, default_: Optional[str] = None, **kwargs) -> str
 
     try:
         string_ = NoneFormatter().format(string_, **kwargs)
-    except KeyError:
+    except (KeyError, TypeError):
         string_ = ""
     return string_
 
@@ -220,34 +240,6 @@ def format_time(seconds: int):
     :return: The formatted time string in HH:MM:SS format.
     """
     return convert_time_and_format(int(seconds), False)
-
-
-def get_utc_offset() -> str:
-    """
-    Return the UTC offset of the current local time in the format HH:MM.
-
-    :return: The UTC offset in the format HH:MM.
-    :rtype: str
-    """
-    # Get the struct_time objects for the current local time and UTC time
-    current_time = time.time()
-    localtime = time.localtime(current_time)
-    gmtime = time.gmtime(current_time)
-
-    # Convert these to datetime objects
-    local_dt = datetime(*localtime[:6], tzinfo=timezone.utc)
-    utc_dt = datetime(*gmtime[:6], tzinfo=timezone.utc)
-
-    # Compute the UTC offset
-    offset = local_dt - utc_dt
-
-    # Express the offset in hours:minutes
-    offset_minutes = int(offset.total_seconds() / 60)
-    offset_hours = offset_minutes // 60
-    offset_minutes %= 60
-    if offset.total_seconds() == 0:
-        return ""
-    return f"{offset_hours:+03d}:{offset_minutes:02d}"
 
 
 def format_period(period: str) -> str:
@@ -328,16 +320,20 @@ def get_all_players(self, linked: Optional[bool] = None, watchlist: Optional[boo
     :return: A list of tuples containing the UCID and name of players from the database.
 
     """
-    sql = "SELECT ucid, name FROM players WHERE length(ucid) = 32"
+    sql = "SELECT p.ucid, p.name FROM players p{} WHERE length(p.ucid) = 32"
+    sub_sql = ""
     if watchlist:
-        sql += " AND watchlist IS NOT FALSE"
+        sub_sql = " JOIN watchlist w ON p.ucid = w.player_ucid"
+    elif watchlist is False:
+        sql += " AND p.ucid NOT IN (SELECT player_ucid FROM watchlist)"
     if vip:
-        sql += " AND vip IS NOT FALSE"
+        sql += " AND p.vip IS NOT FALSE"
     if linked is not None:
         if linked:
-            sql += " AND discord_id != -1 AND manual IS TRUE"
+            sql += " AND p.discord_id != -1 AND p.manual IS TRUE"
         else:
-            sql += " AND manual IS FALSE"
+            sql += " AND p.manual IS FALSE"
+    sql = sql.format(sub_sql)
     with self.pool.connection() as conn:
         return [(row[0], row[1]) for row in conn.execute(sql)]
 
@@ -452,6 +448,104 @@ def dynamic_import(package_name: str):
             globals()[module_name] = importlib.import_module(f"{package_name}.{module_name}")
 
 
+def async_cache(func):
+    cache = {}
+
+    @functools.wraps(func)
+    async def wrapper(*args):
+        if args in cache:
+            return cache[args]
+        result = await func(*args)
+        cache[args] = result
+        return result
+
+    return wrapper
+
+
+def cache_with_expiration(expiration: int):
+    """
+    Decorator to cache function results for a specific duration.
+
+    :param expiration: Cache duration in seconds.
+    """
+
+    def decorator(func: Callable) -> Callable:
+        cache: dict[Any, Any] = {}
+        cache_expiry: dict[Any, float] = {}
+
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            # Generate a key based on function arguments
+            hashable_kwargs = {k: tuple(v) if isinstance(v, list) else v for k, v in kwargs.items()}
+            cache_key = (args, frozenset(hashable_kwargs.items()))
+
+            # Check if the cache is still valid
+            if cache_key in cache and cache_key in cache_expiry:
+                if time.time() < cache_expiry[cache_key]:
+                    return cache[cache_key]
+
+            # Call the original function and cache its result
+            result = await func(*args, **kwargs)
+            cache[cache_key] = result
+            cache_expiry[cache_key] = time.time() + expiration
+            return result
+
+        return wrapper
+
+    return decorator
+
+
+class ThreadSafeDict(dict):
+    def __init__(self, *args, **kwargs):
+        self.lock = threading.Lock()
+        super(ThreadSafeDict, self).__init__(*args, **kwargs)
+
+    def __getitem__(self, key):
+        with self.lock:
+            return super(ThreadSafeDict, self).__getitem__(key)
+
+    def __setitem__(self, key, value):
+        with self.lock:
+            return super(ThreadSafeDict, self).__setitem__(key, value)
+
+    def __delitem__(self, key):
+        with self.lock:
+            return super(ThreadSafeDict, self).__delitem__(key)
+
+    def __iter__(self):
+        with self.lock:
+            for key in dict.keys(self):
+                yield key, dict.__getitem__(self, key)
+
+    def items(self):
+        with self.lock:
+            return list(super().items())
+
+    def values(self):
+        with self.lock:
+            return list(super().values())
+
+    def keys(self):
+        with self.lock:
+            return list(super().keys())
+
+    def get(self, key, default=None):
+        with self.lock:
+            return super().get(key, default)
+
+    def pop(self, key, *default):
+        with self.lock:
+            return super().pop(key, *default)
+
+    def update(self, *args, **kwargs):
+        with self.lock:
+            return super().update(*args, **kwargs)
+
+    def clear(self):
+        with self.lock:
+            super().clear()
+
+
 class SettingsDict(dict):
     """
     A dictionary subclass that represents settings stored in a file.
@@ -474,9 +568,6 @@ class SettingsDict(dict):
 
     def read_file(self):
         if not os.path.exists(self.path):
-            self.log.error(f"- File {self.path} does not exist! Creating an empty file.")
-            with open(self.path, mode='w', encoding='utf-8') as f:
-                f.write(f"{self.root} = {{}}")
             return
         self.mtime = os.path.getmtime(self.path)
         if self.path.lower().endswith('.lua'):
@@ -505,14 +596,21 @@ class SettingsDict(dict):
             with open(tmpname, mode='wb') as outfile:
                 outfile.write((f"{self.root} = " + luadata.serialize(self, indent='\t',
                                                                      indent_level=0)).encode('utf-8'))
-        elif self.path.lower().endswith('.json'):
+        elif self.path.lower().endswith('.yaml'):
             with open(tmpname, mode="w", encoding='utf-8') as outfile:
                 yaml.dump(self, outfile)
-        shutil.copy2(tmpname, self.path)
-        self.mtime = os.path.getmtime(self.path)
+        if not os.path.exists(self.path):
+            self.log.info(f"- Creating {self.path} as it did not exist yet.")
+        try:
+            shutil.copy2(tmpname, self.path)
+            self.mtime = os.path.getmtime(self.path)
+        except Exception as ex:
+            self.log.exception(ex)
+        finally:
+            os.remove(tmpname)
 
     def __setitem__(self, key, value):
-        if self.mtime < os.path.getmtime(self.path):
+        if os.path.exists(self.path) and self.mtime < os.path.getmtime(self.path):
             self.log.debug(f'{self.path} changed, re-reading from disk.')
             self.read_file()
         super().__setitem__(key, value)
@@ -522,30 +620,52 @@ class SettingsDict(dict):
             self.log.error("- Writing of {} aborted due to empty set.".format(os.path.basename(self.path)))
 
     def __getitem__(self, item):
-        if self.mtime < os.path.getmtime(self.path):
+        if os.path.exists(self.path) and self.mtime < os.path.getmtime(self.path):
             self.log.debug(f'{self.path} changed, re-reading from disk.')
             self.read_file()
         return super().__getitem__(item)
 
+    def __delitem__(self, key):
+        if os.path.exists(self.path) and self.mtime < os.path.getmtime(self.path):
+            self.log.debug(f'{self.path} changed, re-reading from disk.')
+            self.read_file()
+        super().__delitem__(key)
+        if len(self):
+            self.write_file()
+        else:
+            self.log.error("- Writing of {} aborted due to empty set.".format(os.path.basename(self.path)))
+
+    def get(self, key, default=None):
+        try:
+            return self.__getitem__(key)
+        except KeyError:
+            return default
+
+    def pop(self, key, *default):
+        try:
+            value = self.__getitem__(key)
+            self.__delitem__(key)
+        except KeyError:
+            if default:
+                return default[0]
+            else:
+                raise
+        return value
+
 
 class RemoteSettingsDict(dict):
-    """
-    A dictionary subclass that allows remote access to settings on a server.
+    """A dictionary-like class for managing remote settings.
+
+    This class inherits from the built-in dict class and provides additional functionality for managing settings on a remote server.
 
     Args:
-        server (ServerProxy): The server proxy object used to communicate with the server.
-        obj (str): The name of the object containing the settings.
-        data (dict, optional): The initial data to populate the dictionary with. Defaults to None.
+        server (ServerProxy): The server proxy object that handles communication with the remote server.
+        obj (str): The name of the object on the remote server that the settings belong to.
+        data (Optional[dict]): Optional initial data for the settings dictionary.
 
     Attributes:
-        server (ServerProxy): The server proxy object used to communicate with the server.
-        obj (str): The name of the object containing the settings.
-
-    Raises:
-        None
-
-    Returns:
-        None
+        server (ServerProxy): The server proxy object that handles communication with the remote server.
+        obj (str): The name of the object on the remote server that the settings belong to.
 
     """
     def __init__(self, server: ServerProxy, obj: str, data: Optional[dict] = None):
@@ -559,13 +679,27 @@ class RemoteSettingsDict(dict):
         msg = {
             "command": "rpc",
             "object": "Server",
-            "method": "_settings.__setitem__",
+            "server_name": self.server.name,
+            "method": f"{self.obj}.__setitem__",
             "params": {
                 "key": key,
                 "value": value
             }
         }
-        self.server.send_to_dcs(msg)
+        asyncio.create_task(self.server.send_to_dcs(msg))
+
+    def __delitem__(self, key):
+        super().__delitem__(key)
+        msg = {
+            "command": "rpc",
+            "object": "Server",
+            "server_name": self.server.name,
+            "method": f"{self.obj}.__delitem__",
+            "params": {
+                "key": key
+            }
+        }
+        asyncio.create_task(self.server.send_to_dcs(msg))
 
 
 def tree_delete(d: dict, key: str, debug: Optional[bool] = False):
@@ -586,7 +720,7 @@ def tree_delete(d: dict, key: str, debug: Optional[bool] = False):
         return
 
     if debug:
-        print("  " * len(keys) + f"|_ Deleting {keys[-1]}")
+        logger.debug("  " * len(keys) + f"|_ Deleting {keys[-1]}")
 
     if isinstance(curr_element, dict):
         if isinstance(curr_element[keys[-1]], dict):
@@ -599,7 +733,26 @@ def tree_delete(d: dict, key: str, debug: Optional[bool] = False):
         curr_element.pop(int(keys[-1]))
 
 
-def evaluate(value: Union[str, int, float, bool], **kwargs) -> Union[str, int, float, bool]:
+def hash_password(password: str) -> str:
+    # Generate an 11 character alphanumeric string
+    key = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(11))
+
+    # Create a 32 byte digest using the Blake2b hash algorithm
+    # with the password as the input and the key as the key
+    password_bytes = password.encode('utf-8')
+    key_bytes = key.encode('utf-8')
+    digest = hashlib.blake2b(password_bytes, key=key_bytes, digest_size=32).digest()
+
+    # Base64URL encode the resulting 32 byte digest
+    encoded_digest = base64.urlsafe_b64encode(digest).replace(b'=', b'').decode()
+
+    # Create a string with the salt and the Base64URL encoded digest separated by a ":"
+    hashed_password = key + ':' + encoded_digest
+
+    return hashed_password
+
+
+def evaluate(value: Union[str, int, float, bool, list, dict], **kwargs) -> Union[str, int, float, bool, list, dict]:
     """
     Evaluate the given value, replacing placeholders with keyword arguments if necessary.
 
@@ -608,9 +761,20 @@ def evaluate(value: Union[str, int, float, bool], **kwargs) -> Union[str, int, f
     :return: The evaluated value. Returns the input value if it is not a string or if it does not start with '$'.
              If the input value is a string starting with '$', it will be evaluated with placeholders replaced by keyword arguments.
     """
-    if isinstance(value, (int, float, bool)) or not value.startswith('$'):
-        return value
-    return eval(format_string(value[1:], **kwargs))
+    def _evaluate(value, **kwargs):
+        if isinstance(value, (int, float, bool)) or not value.startswith('$'):
+            return value
+        value = format_string(value[1:], **kwargs)
+        namespace = {k: v for k, v in globals().items() if not k.startswith("__")}
+        return eval(value, namespace, kwargs) if value else False
+
+    if isinstance(value, list):
+        for i in range(len(value)):
+            value[i] = _evaluate(value[i], **kwargs)
+    elif isinstance(value, dict):
+        return {_evaluate(k, **kwargs): _evaluate(v, **kwargs) for k, v in value.items()}
+    else:
+        return _evaluate(value, **kwargs)
 
 
 def for_each(data: dict, search: list[str], depth: Optional[int] = 0, *,
@@ -648,20 +812,20 @@ def for_each(data: dict, search: list[str], depth: Optional[int] = 0, *,
             for index in indexes:
                 if index <= 0 or len(data) < index:
                     if debug:
-                        print("  " * depth + f"|_ {index}. element not found")
+                        logger.debug("  " * depth + f"|_ {index}. element not found")
                     yield None
                 if debug:
-                    print("  " * depth + f"|_ Selecting {index}. element")
+                    logger.debug("  " * depth + f"|_ Selecting {index}. element")
                 yield from for_each(data[index - 1], search, depth + 1, debug=debug)
         elif isinstance(data, dict):
             indexes = [x.strip() for x in _next[1:-1].split(',')]
             for index in indexes:
                 if index not in data:
                     if debug:
-                        print("  " * depth + f"|_ {index}. element not found")
+                        logger.debug("  " * depth + f"|_ {index}. element not found")
                     yield None
                 if debug:
-                    print("  " * depth + f"|_ Selecting element {index}")
+                    logger.debug("  " * depth + f"|_ Selecting element {index}")
                 yield from for_each(data[index], search, depth + 1, debug=debug)
 
     def process_pattern(_next, data, search, depth, debug, **kwargs):
@@ -669,37 +833,37 @@ def for_each(data: dict, search: list[str], depth: Optional[int] = 0, *,
             for idx, value in enumerate(data):
                 if evaluate(_next, **(kwargs | value)):
                     if debug:
-                        print("  " * depth + f"  - Element {idx + 1} matches.")
+                        logger.debug("  " * depth + f"  - Element {idx + 1} matches.")
                     yield from for_each(value, search, depth + 1, debug=debug)
         else:
             if evaluate(_next, **(kwargs | data)):
                 if debug:
-                    print("  " * depth + "  - Element matches.")
+                    logger.debug("  " * depth + "  - Element matches.")
                 yield from for_each(data, search, depth + 1, debug=debug)
 
     if not data or len(search) == depth:
         if debug:
-            print("  " * depth + ("|_ RESULT found => Processing ..." if data else "|_ NO result found, skipping."))
-        yield data
+            logger.debug("  " * depth + ("|_ RESULT found => Processing ..." if len(search) == depth else "|_ NO result found, skipping."))
+        yield data if len(search) == depth else None
     else:
         _next = search[depth]
         if _next == '*':
             if debug:
-                print("  " * depth + f"|_ Iterating over {len(data)} {search[depth - 1]} elements")
+                logger.debug("  " * depth + f"|_ Iterating over {len(data)} {search[depth - 1]} elements")
             yield from process_iteration(_next, data, search, depth, debug)
         elif _next.startswith('['):
             yield from process_indexing(_next, data, search, depth, debug)
         elif _next.startswith('$'):
             if debug:
-                print("  " * depth + f"|_ Searching pattern {_next} on {len(data)} {search[depth - 1]} elements")
+                logger.debug("  " * depth + f"|_ Searching pattern {_next} on {len(data)} {search[depth - 1]} elements")
             yield from process_pattern(_next, data, search, depth, debug, **kwargs)
         elif _next in data:
             if debug:
-                print("  " * depth + f"|_ {_next} found.")
+                logger.debug("  " * depth + f"|_ {_next} found.")
             yield from for_each(data.get(_next), search, depth + 1, debug=debug)
         else:
             if debug:
-                print("  " * depth + f"|_ {_next} not found.")
+                logger.debug("  " * depth + f"|_ {_next} not found.")
             yield None
 
 

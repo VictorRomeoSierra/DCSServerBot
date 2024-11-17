@@ -5,7 +5,7 @@ from datetime import timezone
 from discord import app_commands, SelectOption
 from core import utils, Plugin, PluginRequiredError, Group, get_translation
 from psycopg.rows import dict_row
-from services import DCSServerBot
+from services.bot import DCSServerBot
 from typing import Optional, cast, Union
 
 from .listener import CreditSystemListener
@@ -63,9 +63,9 @@ class CreditSystem(Plugin):
     @utils.app_has_role('DCS')
     @app_commands.rename(member="user")
     async def info(self, interaction: discord.Interaction,
-                   member: app_commands.Transform[Union[discord.Member, str], utils.UserTransformer] = None):
+                   member: Optional[app_commands.Transform[Union[discord.Member, str], utils.UserTransformer]] = None):
         if member:
-            if not utils.check_roles(self.bot.roles['DCS Admin'], interaction.user):
+            if member != interaction.user and not utils.check_roles(self.bot.roles['DCS Admin'], interaction.user):
                 # noinspection PyUnresolvedReferences
                 await interaction.response.send_message(_('You need the DCS Admin role to use this command!'),
                                                         ephemeral=True)

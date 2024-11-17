@@ -6,8 +6,7 @@ import psycopg
 from core import Plugin, TEventListener, utils, command, get_translation
 from discord import app_commands
 from discord.ext import tasks
-from os import path
-from services import DCSServerBot
+from services.bot import DCSServerBot
 from typing import Type
 
 _ = get_translation(__name__.split('.')[1])
@@ -17,8 +16,7 @@ class DBExporter(Plugin):
 
     def __init__(self, bot: DCSServerBot, eventlistener: Type[TEventListener] = None):
         super().__init__(bot, eventlistener)
-        if not path.exists('./export'):
-            os.makedirs('./export')
+        os.makedirs('export', exist_ok=True)
         if self.get_config().get('autoexport', False):
             self.schedule.add_exception_type(psycopg.Error)
             self.schedule.start()
@@ -38,7 +36,7 @@ class DBExporter(Plugin):
             for table in [x[0] async for x in cursor if x[0] not in table_filter]:
                 cursor = await conn.execute(f'SELECT ROW_TO_JSON(t) FROM (SELECT * FROM {table}) t')
                 if cursor.rowcount > 0:
-                    with open(f'export/{table}.json', mode='w', encoding='utf-8') as file:
+                    with open(os.path.join('export', f'{table}.json'), mode='w', encoding='utf-8') as file:
                         file.writelines([json.dumps(x[0]) + '\n' async for x in cursor])
 
     @command(description=_('Exports database tables as json.'))

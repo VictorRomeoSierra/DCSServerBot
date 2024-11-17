@@ -64,39 +64,6 @@ msgstr "Gesperrt von: {}"
 msgid "Exp.: {}"
 msgstr "Bis: {}"
 
-# /dcs watch
-msgid "Puts a player onto the watchlist"
-msgstr "Fügt Spieler zur Watchliste hinzu"
-
-msgid "Player {} was already on the watchlist."
-msgstr "Spieler {} war bereits auf der Watchliste."
-
-msgid "Player {} is now on the watchlist."
-msgstr "Spieler {} ist jetzt auf der Watchliste."
-
-# /dcs unwatch
-msgid "Removes a player from the watchlist"
-msgstr "Löscht Spieler von der Watchliste"
-
-msgid "Player {} removed from the watchlist."
-msgstr "Spieler {} von der Watchliste gelöscht."
-
-# /dcs watchlist
-msgid "Shows the watchlist"
-msgstr "Zeigt die Watchliste an"
-
-msgid "The watchlist is currently empty."
-msgstr "Die Watchliste ist leer."
-
-msgid "These players are currently on the watchlist:"
-msgstr "Diese Spieler sind zurzeit auf der Watchliste:"
-
-msgid "UCIDs"
-msgstr "UCIDs"
-
-msgid "Names"
-msgstr "Namen"
-
 # /dcs update
 msgid "Update your DCS installations"
 msgstr "Aktualisiere die DCS-Installation"
@@ -115,11 +82,19 @@ msgid "Would you like to update from version {old_version}@{old_branch} to {new_
 msgstr "Möchtest Du von Version {old_version}@{old_branch} nach Version {new_version}@{new_branch} updaten?\n"
 "Alle laufenden DCS-Server werden dafür heruntergefahren!"
 
-msgid "Updating DCS to version {version}@{branch}, please wait ..."
-msgstr "Aktualisiere DCS auf Version {version}@{branch}, bitte warten ..."
+msgid "Updating DCS World to the newest version, please wait ..."
+msgstr "Aktualisiere DCS World auf die aktuellste Version, bitte warten ..."
 
 msgid "DCS updated to version {version}@{branch} on node {name}."
 msgstr "DCS wurde auf Knoten {name} auf Version {version}@{branch} aktualisiert."
+
+msgid "DCS World could not be updated on node {name} due to missing disk space!"
+msgstr "DCS konnte nicht auf dem Knoten {name} installiert werden, da die Festplatte zu voll ist!"
+
+msgid "DCS World updated to version {version}@{branch} on node {name}.\n"
+"The updater has requested a **reboot** of the system!"
+msgstr "DCS wurde auf Knoten {name} auf Version {version}@{branch} aktualisiert."
+"Der Update-Prozess benötigt noch einen **Reboot** des Systems!"
 
 msgid "Error while updating DCS on node {name}, code={rc}"
 msgstr "Fehler beim Aktualisieren von DCS auf Knoten {name}: Code={rc}"
@@ -159,6 +134,9 @@ msgstr "Das Modul {module} wurde auf dem Knoten {node} deinstalliert."
 # /download
 msgid "Download files from your server"
 msgstr "Lade Dateien vom Server herunter"
+
+msgid "File {file} not found in directory {dir}."
+msgstr "Die Datei {file} konnte im Verzeichis {dir} nicht gefunden werden."
 
 msgid "File sent as a DM."
 msgstr "Datei als Privatnachricht gesendet."
@@ -282,12 +260,18 @@ msgstr "Startet einen Knoten neu"
 msgid "Shuts down all servers, enables maintenance"
 msgstr "Wartungsmodus für alle Server an"
 
+msgid "Shuts all servers down (default: on)"
+msgstr "Fährt alle Server herunter (default: ein)"
+
 msgid "Node {} is now offline."
 msgstr "Knoten {} ist jetzt im Wartungsmodus."
 
 # /node online
 msgid "Clears the maintenance mode for all servers"
 msgstr "Wartungsmodus für alle Server aus"
+
+msgid "Start all your servers (default: off)"
+msgstr "Startet alle Server (default: aus)"
 
 msgid "Node {} is now online."
 msgstr "Knoten {} ist wieder online."
@@ -336,7 +320,7 @@ msgid "Add/create an instance\n"
 msgstr "Füge eine neue Instanz hinzu\n"
 
 msgid "Either select an existing instance or enter the name of a new one"
-msgstr "Wähle eine vorhanden Instanz aus oder gib den Namen für eine neue an."
+msgstr "Wähle eine unbenutzte Instanz aus oder gib einen Namen für eine neue"
 
 msgid "Take this instance configuration as a reference"
 msgstr "Nutze diese Instanz als Referenz"
@@ -371,18 +355,21 @@ msgid "Delete an instance\n"
 msgstr "Lösche eine Instanz\n"
 
 msgid "The instance is in use by server \"{}\".\n"
-"Please migrate this server to another node first."
+"Do you really want to delete it?"
 msgstr "Die Instanz wird zurzeit vom Server \"{}\" genutzt.\n"
-"Bitte migriere den Server zuerst auf einen anderen Knoten."
+"Möchtest Du sie wirklich löschen?"
 
 msgid "Do you really want to delete instance {}?"
-msgstr "Möchtest Du Instanz {} wiklich löschen?"
+msgstr "Möchtest Du Instanz {} wirklich löschen?"
 
 msgid "Do you want to remove the directory {}?"
 msgstr "Möchtest Du das Verzeichnis {} auch löschen?"
 
 msgid "Instance {instance} removed from node {node}."
 msgstr "Instanz {instance} wurde vom Knoten {node} gelöscht."
+
+msgid "Instance {} could not be deleted, because the directory is in use."
+msgstr "Instanz {} konnte nicht gelöscht werden, da das Verzeichnis in Benutzung ist."
 
 # /node rename_instance
 msgid "Rename an instance\n"
@@ -396,6 +383,9 @@ msgstr "Möchtest Du Instanz {} wirklich umbenennen?"
 
 msgid "Instance {old_name} renamed to {new_name}."
 msgstr "Instanz {old_name} umbenannt zu {new_name}."
+
+msgid "Instance {} could not be renamed, because the directory is in use."
+msgstr "Instanz {} konnte nicht umbenannt werden, da das Verzeichnis in Benutzung ist."
 
 # Config upload
 msgid "To which server do you want to upload this configuration to?"

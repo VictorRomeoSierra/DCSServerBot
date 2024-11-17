@@ -158,7 +158,11 @@ function onEvent(event)
 			elseif category == Object.Category.SCENERY  then
 				msg.initiator.type = 'SCENERY'
 				msg.initiator.unit = event.initiator
-				msg.initiator.unit_name = msg.initiator.unit:getName()
+				if msg.initiator.unit.getName ~= nil then
+					msg.initiator.unit_name = msg.initiator.unit:getName()
+				else
+					msg.initiator.unit_name = 'n/a'
+				end
 				msg.initiator.coalition = coalition.side.NEUTRAL
 				msg.initiator.unit_type = event.initiator:isExist() and msg.initiator.unit:getTypeName() or "SCENERY"
 			elseif category == Object.Category.CARGO then
@@ -210,7 +214,11 @@ function onEvent(event)
 			elseif category == Object.Category.SCENERY then
 				msg.target.type = 'SCENERY'
 				msg.target.unit = event.target
-				msg.target.unit_name = msg.target.unit:getName()
+				if msg.target.unit.getName ~= nil then
+					msg.target.unit_name = msg.target.unit:getName()
+				else
+					msg.target.unit_name = 'n/a'
+				end
                 msg.target.coalition = coalition.side.NEUTRAL
 				msg.target.unit_type = msg.target.unit:getTypeName()
 			elseif category == Object.Category.CARGO then
@@ -226,7 +234,7 @@ function onEvent(event)
 			msg.place.id = event.place.id_
 			msg.place.name = event.place:getName()
 		end
-		if event.weapon then
+		if event.weapon and event.weapon:isExist() then
 			msg.weapon = {}
 			msg.weapon.name = event.weapon:getTypeName()
 			msg.weapon.category = event.weapon:getDesc().category
@@ -273,10 +281,11 @@ function fillCoalitionsData(color)
     end
 
     coalitionColor.statics = {}
-    for _, static in pairs(coalition.getStaticObjects(coalition.side[color])) do
-        table.insert(coalitionColor.statics, static:getName())
+--[[
+	for _, static in pairs(coalition.getStaticObjects(coalition.side[color])) do
+		table.insert(coalitionColor.statics, static:getName())
     end
-
+]]
 	return coalitionColor
 end
 

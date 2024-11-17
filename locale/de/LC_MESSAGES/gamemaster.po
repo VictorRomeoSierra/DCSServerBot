@@ -178,6 +178,19 @@ msgstr "Möchtest Du Kampagne \"{}\" stoppen?"
 msgid "Campaign stopped."
 msgstr "Kampagne gestoppt."
 
+# /message send
+msgid "Sends a message to a user"
+msgstr "Sendet einem User eine Nachricht"
+
+msgid "User is not linked."
+msgstr "Benutzer is nicht verknüpft."
+
+msgid "Unknown user {}!"
+msgstr "Unbekannter Benutzer {}!"
+
+msgid "Message will be displayed to the user."
+msgstr "Nachricht wird dem Nutzer bei nächster Gelegenheit präsentiert."
+
 # Upload of embeds
 msgid "Error while updating embed!"
 msgstr "Fehler beim Update des Embeds!"
@@ -203,8 +216,8 @@ msgstr "{num} LUA files wurden hochgeladen. Du kannst jedes davon nun mit {comma
 msgid "join a coalition"
 msgstr "Trete einer Koalition bei"
 
-msgid "Usage: {}join <blue|red>"
-msgstr "Aufruf: {}join <blue|red>"
+msgid "Usage: {prefix}{command} <blue|red>"
+msgstr "Aufruf: {prefix}{command} <blue|red>"
 
 msgid "You are a member of coalition {} already."
 msgstr "Du bist bereits Mitglied der Koalition {}."
@@ -257,5 +270,5 @@ msgstr "Lese oder setze eine Flagge"
 msgid "<flag> [value]"
 msgstr "<Flagge> [Wert]"
 
-msgid "Usage: {}flag <flag> [value]"
-msgstr "Aufruf: {}flag <Flagge> [Wert]"
+msgid "Usage: {prefix}{command} <flag> [value]"
+msgstr "Aufruf: {prefix}{command} <Flagge> [Wert]"

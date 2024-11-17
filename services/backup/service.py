@@ -1,10 +1,8 @@
 import asyncio
-import glob
 import os
 import shlex
 import subprocess
 import time
-import sys
 
 from core import ServiceRegistry, Service, utils
 from datetime import datetime
@@ -18,13 +16,19 @@ __all__ = ["BackupService"]
 @ServiceRegistry.register(plugin="backup")
 class BackupService(Service):
     def __init__(self, node):
-        from services import ServiceBus
-
         super().__init__(node=node, name="Backup")
         if not self.locals:
             self.log.debug("  - No backup.yaml configured, skipping backup service.")
             return
-        self.bus = ServiceRegistry.get(ServiceBus)
+        if self._secure_password():
+            self.save_config()
+
+    def _secure_password(self):
+        config = self.locals['backups'].get('database')
+        if config and config.get("password"):
+            utils.set_password("postgres", config.pop("password"), self.node.config_dir)
+            return True
+        return False
 
     async def start(self):
         if not self.locals:
@@ -73,10 +77,13 @@ class BackupService(Service):
             zf.close()
 
     def backup_servers(self) -> bool:
+        from services.servicebus import ServiceBus
+
         target = self.mkdir()
         config = self.locals['backups'].get('servers')
         rc = True
-        for server_name, server in self.bus.servers.items():
+
+        for server_name, server in ServiceRegistry.get(ServiceBus).servers.items():
             self.log.info(f'Backing up server "{server_name}" ...')
             filename = f"{server.instance.name}_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".zip"
             zf = ZipFile(os.path.join(target, filename), mode="w")
@@ -103,7 +110,11 @@ class BackupService(Service):
         url = self.node.config.get("database", self.node.locals.get('database'))['url']
         database = urlparse(url).path.strip('/')
         args = shlex.split(f'--no-owner --no-privileges -U postgres -F t -f "{path}" -d "{database}"')
-        os.environ['PGPASSWORD'] = config['password']
+        try:
+            os.environ['PGPASSWORD'] = utils.get_password('postgres', self.node.config_dir)
+        except ValueError:
+            self.log.error("Backup of database failed. No password set.")
+            return False
         self.log.info("Backing up database...")
         process = subprocess.run([os.path.basename(cmd), *args], executable=cmd,
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -116,10 +127,11 @@ class BackupService(Service):
             return False
 
     def recover_database(self, date: str):
-        target = os.path.expandvars(self.locals.get('target'))
-        path = os.path.join(target, f"{self.node.name.lower()}_{date}", f"db_{date}_*.tar")
-        filename = glob.glob(path)[0]
-        os.execv(sys.executable, [os.path.basename(sys.executable), 'recover.py', '-f', filename] + sys.argv[1:])
+        ...
+#        target = os.path.expandvars(self.locals.get('target'))
+#        path = os.path.join(target, f"{self.node.name.lower()}_{date}", f"db_{date}_*.tar")
+#        filename = glob.glob(path)[0]
+#        os.execv(sys.executable, [os.path.basename(sys.executable), 'recover.py', '-f', filename] + sys.argv[1:])
 
     def recover_bot(self, filename: str):
         ...
@@ -140,17 +152,20 @@ class BackupService(Service):
 
     @tasks.loop(minutes=1)
     async def schedule(self):
-        jobs = []
-        if self.node.master:
-            if 'bot' in self.locals['backups'] and self.can_run(self.locals['backups']['bot']):
-                jobs.append(asyncio.create_task(asyncio.to_thread(self.backup_bot)))
-            if 'database' in self.locals['backups'] and self.can_run(self.locals['backups']['database']):
-                jobs.append(asyncio.create_task(asyncio.to_thread(self.backup_database)))
-        if 'servers' in self.locals['backups'] and self.can_run(self.locals['backups']['servers']):
-            jobs.append(asyncio.create_task(asyncio.to_thread(self.backup_servers)))
-        if jobs:
-            await asyncio.gather(*jobs)
-            self.log.info("Backup finished.")
+        try:
+            jobs = []
+            if self.node.master:
+                if 'bot' in self.locals['backups'] and self.can_run(self.locals['backups']['bot']):
+                    jobs.append(asyncio.create_task(asyncio.to_thread(self.backup_bot)))
+                if 'database' in self.locals['backups'] and self.can_run(self.locals['backups']['database']):
+                    jobs.append(asyncio.create_task(asyncio.to_thread(self.backup_database)))
+            if 'servers' in self.locals['backups'] and self.can_run(self.locals['backups']['servers']):
+                jobs.append(asyncio.create_task(asyncio.to_thread(self.backup_servers)))
+            if jobs:
+                await asyncio.gather(*jobs)
+                self.log.info("Backup finished.")
+        except Exception as ex:
+            self.log.exception(ex)
 
     @tasks.loop(hours=24)
     async def delete(self):

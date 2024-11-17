@@ -54,6 +54,9 @@ class GreenieBoardEventListener(EventListener):
             if config.get('persistent_board', False):
                 channel_id = int(config.get('persistent_channel', server.channels[Channel.STATUS]))
                 num_rows = config.get('num_rows', 10)
+                report = PersistentReport(self.bot, self.plugin_name, 'greenieboard.json',
+                                          embed_name='greenieboard', server=server, channel_id=channel_id)
+                await report.render(server_name=server.name, num_rows=num_rows)
                 squadrons = config.get('squadrons', [])
                 if squadrons:
                     for squadron in squadrons:
@@ -65,15 +68,14 @@ class GreenieBoardEventListener(EventListener):
                                                   embed_name=f"greenieboard_s{row['id']}", server=server,
                                                   channel_id=squadron.get('channel', channel_id))
                         await report.render(server_name=server.name, num_rows=num_rows, squadron=row)
-                else:
-                    report = PersistentReport(self.bot, self.plugin_name, 'greenieboard.json',
-                                              embed_name='greenieboard', server=server, channel_id=channel_id)
-                    await report.render(server_name=server.name, num_rows=num_rows)
             # update the global board
             config = self.get_config()
             if 'persistent_channel' in config and config.get('persistent_board', False):
                 channel_id = int(config.get('persistent_channel'))
                 num_rows = config.get('num_rows', 10)
+                report = PersistentReport(self.bot, self.plugin_name, 'greenieboard.json',
+                                          embed_name='greenieboard', channel_id=channel_id)
+                await report.render(server_name=None, num_rows=num_rows)
                 squadrons = config.get('squadrons', [])
                 if squadrons:
                     for squadron in squadrons:
@@ -85,10 +87,6 @@ class GreenieBoardEventListener(EventListener):
                                                   embed_name=f"greenieboard_s{row['id']}",
                                                   channel_id=squadron.get('channel', channel_id))
                         await report.render(server_name=None, num_rows=num_rows, squadron=row)
-                else:
-                    report = PersistentReport(self.bot, self.plugin_name, 'greenieboard.json',
-                                              embed_name='greenieboard', channel_id=channel_id)
-                    await report.render(server_name=None, num_rows=num_rows)
         except FileNotFoundError as ex:
             self.log.error(f'  => File not found: {ex}')
         except Exception as ex:
@@ -96,7 +94,7 @@ class GreenieBoardEventListener(EventListener):
 
     async def send_chat_message(self, player: Player, data: dict):
         server: Server = self.bot.servers[data['server_name']]
-        events_channel = self.bot.get_channel(server.channels[Channel.EVENTS])
+        events_channel = self.bot.get_channel(server.channels.get(Channel.EVENTS, -1))
         if events_channel is not None:
             carrier = data['place']['name'] if 'place' in data else 'n/a'
             if 'WO' in data['grade']:
@@ -199,16 +197,16 @@ class GreenieBoardEventListener(EventListener):
             self.log.warning(
                 f"Can't process FunkMan event as FunkMan is not configured in your {self.plugin_name}.yaml!")
             return
-        if not data['grade'].startswith('WO'):
-            try:
-                fig, _ = self.funkplot.PlotTrapSheet(data)
-                buf = io.BytesIO()
-                fig.savefig(buf, bbox_inches='tight', facecolor='#2C2F33')
-                data['trapsheet'] = buf.getvalue()
-                buf.close()
-                plt.close(fig)
-            except TypeError:
-                self.log.error("No trapsheet data received from DCS!")
+        try:
+            fig, _ = self.funkplot.PlotTrapSheet(data)
+            buf = io.BytesIO()
+            fig.savefig(buf, bbox_inches='tight', facecolor='#2C2F33')
+            data['trapsheet'] = buf.getvalue()
+            buf.close()
+            plt.close(fig)
+        except TypeError:
+            self.log.warning("No trapsheet data received from DCS!")
+            data.pop('trapsheet', None)
         data['grade'] = self.normalize_airboss_lso_rating(data['grade'])
         data['place'] = {
             'name': data['carriername']

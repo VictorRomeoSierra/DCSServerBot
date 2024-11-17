@@ -1,21 +1,20 @@
-import aiohttp
 import asyncio
-import json
 import discord
 import os
 import psycopg
+from psycopg.rows import dict_row
 
-from core import Plugin, utils, Report, Status, Server, Coalition, Channel, command, Group, Player, UploadStatus, \
-    get_translation
+from core import (Plugin, utils, Report, Status, Server, Coalition, Channel, command, Group, Player, get_translation,
+                  PlayerType)
 from discord import app_commands
 from discord.app_commands import Range
 from discord.ext import commands
-from jsonschema import validate, ValidationError
-from services import DCSServerBot
-from typing import Optional, Literal
+from services.bot import DCSServerBot
+from typing import Optional, Literal, Union
 
 from .listener import GameMasterEventListener
-from .views import CampaignModal, ScriptModal
+from .upload import GameMasterUploadHandler
+from .views import CampaignModal, ScriptModal, MessageModal, MessageView
 
 _ = get_translation(__name__.split('.')[1])
 
@@ -28,13 +27,34 @@ async def scriptfile_autocomplete(interaction: discord.Interaction, current: str
                                                                    utils.get_interaction_param(interaction, 'server'))
         if not server:
             return []
+        base_dir = os.path.join(await server.get_missions_dir(), 'Scripts')
+        exp_base, file_list = await server.node.list_directory(base_dir, pattern='*.lua', traverse=True)
         choices: list[app_commands.Choice[str]] = [
-            app_commands.Choice(name=os.path.basename(x), value=os.path.basename(x))
-            for x in await server.node.list_directory(os.path.join(await server.get_missions_dir(), 'Scripts'),
-                                                      pattern='*.lua')
+            app_commands.Choice(name=os.path.relpath(x, exp_base), value=os.path.relpath(x, exp_base))
+            for x in file_list
             if not current or current.casefold() in x.casefold()
         ]
         return choices[:25]
+    except Exception as ex:
+        interaction.client.log.exception(ex)
+
+
+async def recipient_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[int]]:
+    if not await interaction.command._check_can_run(interaction):
+        return []
+    try:
+        async with interaction.client.apool.connection() as conn:
+            cursor = await conn.execute("""
+                SELECT DISTINCT p.name, p.ucid 
+                FROM players p, messages m
+                WHERE p.ucid = m.player_ucid
+                 AND (name ILIKE %s OR ucid ILIKE %s)
+            """, ('%' + current + '%', '%' + current + '%'))
+            choices: list[app_commands.Choice[int]] = [
+                app_commands.Choice(name=f"{row[0]} (ucid={row[1]})", value=row[1])
+                async for row in cursor
+            ]
+            return choices[:25]
     except Exception as ex:
         interaction.client.log.exception(ex)
 
@@ -82,7 +102,7 @@ class GameMaster(Plugin):
             # noinspection PyUnresolvedReferences
             await interaction.response.send_message(_("Server {} is not running.").format(server.name), ephemeral=True)
             return
-        server.send_to_dcs({
+        await server.send_to_dcs({
             "command": "sendChatMessage",
             "channel": interaction.channel.id,
             "message": message,
@@ -101,7 +121,7 @@ class GameMaster(Plugin):
             # noinspection PyUnresolvedReferences
             await interaction.response.send_message(_("Server {} is not running.").format(server.name), ephemeral=True)
             return
-        server.sendPopupMessage(Coalition(to), message, time, interaction.user.display_name)
+        await server.sendPopupMessage(Coalition(to), message, time, interaction.user.display_name)
         # noinspection PyUnresolvedReferences
         await interaction.response.send_message(_('Message sent.'), ephemeral=utils.get_ephemeral(interaction))
 
@@ -119,7 +139,7 @@ class GameMaster(Plugin):
                                                   ).format(server=server.display_name, status=server.status.name),
                                                 ephemeral=ephemeral)
                 continue
-            server.sendPopupMessage(Coalition(to), message, time, interaction.user.display_name)
+            await server.sendPopupMessage(Coalition(to), message, time, interaction.user.display_name)
             await interaction.followup.send(_('Message sent to server {}.').format(server.display_name),
                                             ephemeral=ephemeral)
 
@@ -135,7 +155,7 @@ class GameMaster(Plugin):
             return
         ephemeral = utils.get_ephemeral(interaction)
         if value is not None:
-            server.send_to_dcs({
+            await server.send_to_dcs({
                 "command": "setFlag",
                 "flag": flag,
                 "value": value
@@ -163,7 +183,7 @@ class GameMaster(Plugin):
         # noinspection PyUnresolvedReferences
         await interaction.response.defer(ephemeral=ephemeral)
         if value is not None:
-            server.send_to_dcs({
+            await server.send_to_dcs({
                 "command": "setVariable",
                 "name": name,
                 "value": value
@@ -213,7 +233,7 @@ class GameMaster(Plugin):
             await interaction.response.send_message(_("Server {} is not running.").format(server.name), ephemeral=True)
             return
         filename = os.path.join('Missions', 'Scripts', filename)
-        server.send_to_dcs({
+        await server.send_to_dcs({
             "command": "do_script_file",
             "file": filename.replace('\\', '/')
         })
@@ -368,6 +388,62 @@ class GameMaster(Plugin):
         else:
             await interaction.followup.send(_('Aborted.'), ephemeral=ephemeral)
 
+    # New command group "/message"
+    message = Group(name="message", description=_("Commands to manage user messages"))
+
+    @message.command(description=_('Sends a message to a user'))
+    @app_commands.guild_only()
+    @utils.app_has_roles(['DCS Admin', 'GameMaster'])
+    async def send(self, interaction: discord.Interaction,
+                   to: app_commands.Transform[Union[discord.Member, str], utils.UserTransformer(
+                       sel_type=PlayerType.PLAYER)], acknowledge: Optional[bool] = True):
+        modal = MessageModal()
+        # noinspection PyUnresolvedReferences
+        await interaction.response.send_modal(modal)
+        if await modal.wait():
+            return
+        if isinstance(to, str):
+            ucid = to
+        elif isinstance(to, discord.Member):
+            ucid = await self.bot.get_ucid_by_member(to)
+            if not ucid:
+                await interaction.followup.send(_("User is not linked."), ephemeral=True)
+                return
+        else:
+            await interaction.followup.send(_("Unknown user {}!").format(to), ephemeral=True)
+            return
+        async with self.apool.connection() as conn:
+            async with conn.transaction():
+                await conn.execute("""
+                    INSERT INTO messages (sender, player_ucid, message, ack) 
+                    VALUES (%s, %s, %s, %s)
+                """, (interaction.user.display_name, ucid, modal.message.value, acknowledge))
+                await interaction.followup.send(_("Message will be displayed to the user."),
+                                                ephemeral=utils.get_ephemeral(interaction))
+
+    @message.command(description=_('Edit or delete a user-message'))
+    @app_commands.guild_only()
+    @utils.app_has_roles(['DCS Admin', 'GameMaster'])
+    @app_commands.autocomplete(ucid=recipient_autocomplete)
+    async def edit(self, interaction: discord.Interaction, ucid: str):
+        ephemeral = utils.get_ephemeral(interaction)
+        # noinspection PyUnresolvedReferences
+        await interaction.response.defer(ephemeral=ephemeral)
+        async with self.apool.connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cursor:
+                await cursor.execute("SELECT * FROM messages WHERE player_ucid = %s ORDER BY id", (ucid, ))
+                messages = await cursor.fetchall()
+        if not messages:
+            await interaction.followup.send(_("No messages found."), ephemeral=ephemeral)
+        user = await self.bot.get_member_or_name_by_ucid(ucid)
+        view = MessageView(messages, user)
+        embed = await view.render()
+        msg = await interaction.followup.send(embed=embed, view=view, ephemeral=ephemeral)
+        try:
+            await view.wait()
+        finally:
+            await msg.delete()
+
     @commands.Cog.listener()
     async def on_member_update(self, before: discord.Member, after: discord.Member):
         # did a member change their roles?
@@ -376,99 +452,29 @@ class GameMaster(Plugin):
         for server in self.bot.servers.values():
             player: Player = server.get_player(discord_id=after.id)
             if player and player.verified:
-                server.send_to_dcs({
+                await server.send_to_dcs({
                     'command': 'uploadUserRoles',
                     'ucid': player.ucid,
                     'roles': [x.id for x in after.roles]
                 })
 
-    async def _create_embed(self, message: discord.Message) -> None:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(message.attachments[0].url) as response:
-                if response.status == 200:
-                    data = await response.json(encoding="utf-8")
-                    with open('plugins/gamemaster/schemas/embed_schema.json', mode='r') as infile:
-                        schema = json.load(infile)
-                    try:
-                        validate(instance=data, schema=schema)
-                    except ValidationError:
-                        return
-                    embed = utils.format_embed(data, bot=self.bot, bus=self.bus, node=self.bus.node,
-                                               user=message.author)
-                    msg = None
-                    if 'message_id' in data:
-                        try:
-                            msg = await message.channel.fetch_message(int(data['message_id']))
-                            await msg.edit(embed=embed)
-                        except discord.errors.NotFound:
-                            msg = None
-                        except discord.errors.DiscordException as ex:
-                            self.log.exception(ex)
-                            await message.channel.send(_('Error while updating embed!'))
-                            return
-                    if not msg:
-                        await message.channel.send(embed=embed)
-                    await message.delete()
-                else:
-                    await message.channel.send(_('Error {} while reading JSON file!').format(response.status))
-
-    async def _upload_lua(self, message: discord.Message) -> int:
-        # check if the upload happens in the servers admin channel (if provided)
-        server: Server = self.bot.get_server(message, admin_only=True)
-        ctx = await self.bot.get_context(message)
-        if not server:
-            # check if there is a central admin channel configured
-            if self.bot.locals.get('admin_channel', 0) == message.channel.id:
-                try:
-                    server = await utils.server_selection(
-                        self.bus, ctx, title=_("To which server do you want to upload this LUA to?"))
-                    if not server:
-                        await ctx.send(_('Aborted.'))
-                        return -1
-                except Exception as ex:
-                    self.log.exception(ex)
-                    return -1
-            else:
-                return -1
-        num = 0
-        for attachment in message.attachments:
-            if not attachment.filename.endswith('.lua'):
-                continue
-            filename = os.path.normpath(os.path.join(await server.get_missions_dir(), 'Scripts', attachment.filename))
-            rc = await server.node.write_file(filename, attachment.url)
-            if rc == UploadStatus.OK:
-                num += 1
-                continue
-            if not await utils.yn_question(ctx, _('File exists. Do you want to overwrite it?')):
-                await message.channel.send(_('Aborted.'))
-                continue
-            rc = await server.node.write_file(filename, attachment.url, overwrite=True)
-            if rc != UploadStatus.OK:
-                await message.channel.send(_("File {} could not be uploaded.").format(attachment.filename))
-            else:
-                num += 1
-        return num
-
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        # ignore bot messages
-        if message.author.bot:
-            return
-        if message.attachments:
-            if (message.attachments[0].filename.endswith('.json') and
-                    utils.check_roles(self.bot.roles['DCS Admin'], message.author)):
-                await self._create_embed(message)
-            elif (message.attachments[0].filename.endswith('.lua') and
-                  utils.check_roles(self.bot.roles['DCS Admin'], message.author)):
-                num = await self._upload_lua(message)
-                if num > 0:
-                    await message.channel.send(
-                        _("{num} LUA files uploaded. You can load any of them with {command} now.").format(
-                            num=num, command=(await utils.get_command(self.bot, name='do_script_file')).mention
-                        )
-                    )
-                    await message.delete()
-        else:
+        pattern = ['.lua', '.json']
+
+        if GameMasterUploadHandler.is_valid(message, pattern=pattern, roles=self.bot.roles['DCS Admin']):
+            server = await GameMasterUploadHandler.get_server(message)
+            if not server:
+                return
+            handler = GameMasterUploadHandler(plugin=self, server=server, message=message, pattern=pattern)
+            try:
+                base_dir = os.path.join(await handler.server.get_missions_dir(), 'Scripts')
+                await handler.upload(base_dir)
+            except Exception as ex:
+                self.log.exception(ex)
+            finally:
+                await message.delete()
+        elif not message.author.bot:
             for server in self.bot.servers.values():
                 if server.status != Status.RUNNING:
                     continue
@@ -476,15 +482,15 @@ class GameMaster(Plugin):
                     sides = utils.get_sides(self.bot, message, server)
                     if Coalition.BLUE in sides and server.channels[Channel.COALITION_BLUE_CHAT] == message.channel.id:
                         # TODO: ignore messages for now, as DCS does not understand the coalitions yet
-                        # server.sendChatMessage(Coalition.BLUE, message.content, message.author.display_name)
+                        # await server.sendChatMessage(Coalition.BLUE, message.content, message.author.display_name)
                         pass
                     elif Coalition.RED in sides and server.channels[Channel.COALITION_RED_CHAT] == message.channel.id:
                         # TODO:  ignore messages for now, as DCS does not understand the coalitions yet
-                        # server.sendChatMessage(Coalition.RED, message.content, message.author.display_name)
+                        # await server.sendChatMessage(Coalition.RED, message.content, message.author.display_name)
                         pass
                 if server.channels[Channel.CHAT] and server.channels[Channel.CHAT] == message.channel.id:
                     if message.content.startswith('/') is False:
-                        server.sendChatMessage(Coalition.ALL, message.content, message.author.display_name)
+                        await server.sendChatMessage(Coalition.ALL, message.content, message.author.display_name)
 
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):

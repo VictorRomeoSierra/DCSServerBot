@@ -9,7 +9,7 @@ class Tempban(VotableItem):
     def __init__(self, server: Server, config: dict, params: Optional[list[str]] = None):
         super().__init__('mission', server, config, params)
         if not params or not len(params):
-            raise TypeError("Usage: .vote tempban <player name>")
+            raise TypeError("You have to provide a player name to tempban!")
         self.player: Player = server.get_player(name=' '.join(params))
         if not self.player:
             raise ValueError('Player "{}" not found.'.format(' '.join(params)))
@@ -29,5 +29,5 @@ class Tempban(VotableItem):
             await self.server.bus.ban(self.player.ucid, banned_by='Other players', reason=f"Annoying people on the server",
                                       days=duration)
             message = f"Player {self.player.name} banned for {duration} days."
-        self.server.sendChatMessage(Coalition.ALL, message)
-        self.server.sendPopupMessage(Coalition.ALL, message)
+        await self.server.sendChatMessage(Coalition.ALL, message)
+        await self.server.sendPopupMessage(Coalition.ALL, message)

@@ -58,7 +58,8 @@ def do_update_git(delete: Optional[bool]) -> int:
 
 def cleanup_local_files(to_delete_set: Iterable):
     # Exclude directories from deletion
-    exclude_dirs = {'__pycache__', '.git', 'config', 'reports', 'sounds', 'services', 'extensions', 'plugins', 'logs'}
+#    exclude_dirs = {'__pycache__', '.git', 'config', 'reports', 'sounds', 'services', 'extensions', 'plugins', 'logs'}
+    exclude_dirs = {'__pycache__', '.git', 'config', 'reports', 'sounds', 'services', 'plugins', 'logs'}
     to_delete_set = {f for f in to_delete_set if not any(excluded_dir in f for excluded_dir in exclude_dirs)}
 
     # Delete each old file that is not in the updated directory.
@@ -126,5 +127,7 @@ if __name__ == '__main__':
         rc = do_update_git(args.delete)
     except ImportError:
         rc = do_update_github(args.delete)
-    if not args.no_restart:
-        os.execv(sys.executable, [os.path.basename(sys.executable), 'run.py', '--noupdate'] + sys.argv[1:])
+    if args.no_restart:
+        exit(-2)
+    else:
+        exit(-1)

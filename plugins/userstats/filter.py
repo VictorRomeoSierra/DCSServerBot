@@ -3,7 +3,7 @@ import discord
 from abc import ABC, abstractmethod
 from core import utils, Pagination, ReportEnv, const
 from discord import app_commands
-from services import DCSServerBot
+from services.bot import DCSServerBot
 from typing import Any, Optional, Type
 
 
@@ -106,8 +106,16 @@ class CampaignFilter(StatisticsFilter):
         else:
             period = self.period
         period = utils.sanitize_string(period)
-        return f"tsrange(s.hop_on, s.hop_off) && (SELECT tsrange(start, stop) FROM campaigns " \
-               f"WHERE name ILIKE '{period}') AND m.server_name in (SELECT server_name FROM campaigns_servers)"
+        return f"""
+            tsrange(s.hop_on, s.hop_off) && (
+                SELECT tsrange(start, stop) FROM campaigns 
+                WHERE name ILIKE '{period}'
+            ) 
+            AND m.server_name in (
+                SELECT server_name FROM campaigns_servers s, campaigns c
+                WHERE c.id = s.campaign_id AND c.name ILIKE '{period}'
+            )
+        """
 
     def format(self, bot: DCSServerBot) -> str:
         if self.period and self.period.lower().startswith('campaign:'):

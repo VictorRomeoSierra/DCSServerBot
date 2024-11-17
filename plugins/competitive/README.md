@@ -4,7 +4,7 @@ With this plugin you can increase your PvP-fun and rank players and teams accord
 
 ## How does it work?
 In short - every player gets a rating, based on the ratings of the people they killed or died against. This means,
-that you get more points, if you kill someone with a higher rating or you lose more points, if you get killed by someone
+that you get more points, if you kill someone with a higher rating, or you lose more points, if you get killed by someone
 with a lower rating than yours.<br>
 Especially users that are using DCSServerBot since longer have gathered a lot of PvP kills already in their databases.
 On the initial installation of the Competitive plugin, DCSServerBot will read all that data and calculate a TrueSkill™️
@@ -56,8 +56,17 @@ As Competitive is an optional plugin, you need to activate it in main.yaml first
 opt_plugins:
   - competitive
 ```
+If you want to disable the plugin for one or more servers, you can do it by creating a config/plugins/competitive.yaml:
+```yaml
+DCS.server:
+  enabled: false    # optional: disable the plugin (default: false)
+  silent: false     # optional: silent mode, only calculate TrueSkill:tm: ratings, but do not tell anybody about it (default: false)
+```
+> ⚠️ **Attention!**<br/>
+> Silent mode can only be used on simple 1vs1 engagements, not on team engagements.
 
-There is no yaml-configuration for now. You can integrate the TrueSkill™️-rating into your highscores though.<br>
+
+You can integrate the TrueSkill™️-rating into your highscores though.<br>
 To do that, you copy your /plugins/userstats/reports/highscore.json to /reports/userstats. Then replace one of the
 "Graph" elements with this: 
 ```json
@@ -77,7 +86,7 @@ Select the col and row of the element you replaced (I took the "Ships" in the ab
 ## In-Game Chat Commands
 | Command    | Parameter | Role      | Description                     |
 |------------|-----------|-----------|---------------------------------|
-| .trueskill |           | all       | Shows your TrueSkill™️ rating.  |
+| -trueskill |           | all       | Shows your TrueSkill™️ rating.  |
 
 ## Tables
 ### trueskill

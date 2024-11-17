@@ -152,6 +152,9 @@ msgstr "Миссия \"{}\" была удалена с диска."
 msgid "Mission \"{}\" was already deleted."
 msgstr "Миссия \"{}\" уже была удалена."
 
+msgid "deleted mission {}"
+msgstr "удалил миссию {}"
+
 msgid "Timeout while deleting mission.\n"
 "Please reconfirm that the deletion was successful."
 msgstr "Истекло время удаления миссии.\n"
@@ -332,19 +335,57 @@ msgstr "Сообщение отправлено."
 msgid "Sends a chat message to a player\n"
 msgstr "Отправляет chat сообщение игроку\n"
 
-# /player watch
-msgid "Adds a player to the watchlist"
+# /player screenshot
+msgid "Server can not take screenshots."
+msgstr "Сервер не может делать скриншоты."
+
+msgid "Requesting screenshot ..."
+msgstr "Запрос скриншота ..."
+
+msgid "Timeout while waiting for screenshot!"
+msgstr "Превышено время ожидания скриншота!"
+
+msgid "Screenshot of Player {}"
+msgstr "Скриншот игрока {}"
+
+msgid "Taken by"
+msgstr "Сделал"
+
+# /watch add
+msgid "Puts a player onto the watchlist"
 msgstr "Добавляет игрока в список отслеживания"
+
+msgid "Member {} is not linked!"
+msgstr "Игрок {} не слинкован!"
+
+msgid "Player {} was already on the watchlist."
+msgstr "Игрок {} уже народится в списке отслеживания."
 
 msgid "Player {} is now on the watchlist."
 msgstr "Игрок {} теперь в списке отслеживания."
 
-# /player unwatch
+# /watch delete
 msgid "Removes a player from the watchlist"
 msgstr "Удаляет игрока из списка отслеживания"
 
-msgid "Player {} removed from watchlist."
+msgid "Player {} removed from the watchlist."
 msgstr "Игрок {} удален из списка отслеживания."
+
+# /watch list
+msgid "Shows the watchlist"
+msgstr "Показывает список отслеживания"
+
+msgid "The watchlist is currently empty."
+msgstr "Список отслеживания пуст."
+
+msgid "These players are currently on the watchlist:"
+msgstr "Данные игроки находятся в списке отслеживания:"
+
+msgid "UCID"
+msgstr "UCID"
+
+msgid "Created by"
+msgstr "Создал"
 
 # / group
 msgid "Commands to manage DCS groups"
@@ -490,6 +531,9 @@ msgstr "Файл существует. Вы хотите перезаписат�
 
 msgid "Error while uploading: {}"
 msgstr "Ошибка во время загрузки: {}"
+
+msgid "Mission \"{mission}\" uploaded to server {server} and NOT added."
+msgstr "Миссия \"{mission}\" загружена на сервер {server} и НЕ добавлена."
 
 msgid "Mission \"{mission}\" uploaded to server {server}.\n"
 "As you have \"autoscan\" enabled, it might take some seconds to appear in your mission list."

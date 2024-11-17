@@ -26,7 +26,7 @@ DEFAULT:
       display_type: chat      # the message will be displayed in the in-game chat
     - delay: 120              # this message will be displayed every 2 mins
       message: "To see your stats, you can link your user by using /linkme in your discord!"
-      receipients: '!@everyone' # and will be sent to anybody that is not linked yet (has not the discord role @everyone)
+      recipients: '!@everyone' # and will be sent to anybody that is not linked yet (has not the discord role @everyone)
       display_type: popup     # Message will be a popup
 DCS.release_server:
   on_join:                    # The message will be displayed in the in-game chat on join of the server.
@@ -35,7 +35,7 @@ DCS.release_server:
 > recipients can be a list of Discord groups that the player either is part of or not (prepend with !).<br>
 > !@everyone means, this message is for people that are not a member of your Discord.
 
-If you want to play sounds, make sure that you loaded them into the mission first (see [MizEdit](../../extensions/MizEdit.md)).
+If you want to play sounds, make sure that you loaded them into the mission first (see [MizEdit](../../extensions/mizedit/README.md)).
 
 ### Optional: Layout for multiple Recipient Groups
 ```yaml

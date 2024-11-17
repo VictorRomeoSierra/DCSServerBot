@@ -4,6 +4,7 @@ import asyncio
 import discord
 import inspect
 import json
+import logging
 import os
 import psycopg
 import sys
@@ -22,7 +23,7 @@ from .__utils import parse_input, parse_params
 
 if TYPE_CHECKING:
     from core import Server
-    from services import DCSServerBot
+    from services.bot import DCSServerBot
 
 __all__ = [
     "Report",
@@ -39,16 +40,30 @@ class Report:
         self.log = bot.log
         self.apool = bot.apool
         self.env = ReportEnv(bot)
+        self.filename, self.report_def = self.load_report_def(plugin, filename)
+
+    def load_report_def(self, plugin: str, filename: str):
         default = f'./plugins/{plugin}/reports/{filename}'
         overwrite = f'./reports/{plugin}/{filename}'
         if os.path.exists(overwrite):
-            self.filename = overwrite
+            filename = overwrite
         elif os.path.exists(default):
-            self.filename = default
+            filename = default
         else:
             raise FileNotFoundError(filename)
-        with open(self.filename, mode='r', encoding='utf-8') as file:
-            self.report_def = json.load(file)
+        with open(filename, mode='r', encoding='utf-8') as file:
+            report_def = json.load(file)
+        if 'include' in report_def:
+            report_def |= self.load_report_def(report_def['include'].get('plugin', plugin),
+                                               report_def['include']['filename'])[1]
+        else:
+            for idx, element in enumerate(report_def.get('elements', [])):
+                if 'include' in element:
+                    report_def['elements'][idx] = (
+                        self.load_report_def(element['include'].get('plugin', plugin), element['include']['filename'])
+                    )[1]
+        return filename, report_def
+
 
     async def render(self, *args, **kwargs) -> ReportEnv:
         if 'input' in self.report_def:
@@ -66,6 +81,11 @@ class Report:
             # parse report parameters
             if name == 'title':
                 self.env.embed.title = utils.format_string(item, **self.env.params)[:256]
+            elif name == 'mention':
+                if isinstance(item, int):
+                    self.env.mention = f'<@&{item}>'
+                else:
+                    self.env.mention = ''.join([f"<@&{x}>" for x in item])
             elif name == 'description':
                 self.env.embed.description = utils.format_string(item, **self.env.params)[:4096]
             elif name == 'url':
@@ -168,6 +188,7 @@ class PaginationReport(Report):
     class PaginationReportView(View):
         def __init__(self, name, values, index, func, keep_image: bool, *args, **kwargs):
             super().__init__()
+            self.log = logging.getLogger(__name__)
             self.name = name
             self.values = values
             self.index = index
@@ -263,7 +284,7 @@ class PaginationReport(Report):
             self.stop()
 
         async def on_error(self, interaction: Interaction, error: Exception, item: Item[Any], /) -> None:
-            print(error)
+            self.log.exception(error)
             self.stop()
 
     async def render(self, *args, **kwargs) -> ReportEnv:
@@ -295,6 +316,7 @@ class PaginationReport(Report):
         try:
             try:
                 message = await self.interaction.followup.send(
+                    env.mention,
                     embed=env.embed,
                     view=view or MISSING,
                     file=discord.File(fp=env.buffer or env.filename,
@@ -340,7 +362,10 @@ class PersistentReport(Report):
                                     file=file, server=self.server)
             return env
         except Exception:
-            self.log.error(f"Exception while processing report {self.filename}!")
+            msg = f"Exception while processing report {self.filename}!"
+            if self.server:
+                msg += f' for server {self.server.name}'
+            self.log.error(msg)
             raise
         finally:
             if env and env.filename:

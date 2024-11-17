@@ -24,7 +24,7 @@ mapping:
         type: map
         mapping:
           installation: {type: str, required: true}
-          autoupdate: {type: bool}
+          autoupdate: {type: any}
           desanitize: {type: bool}
           minimized: {type: bool}
           user: {type: str}
@@ -39,10 +39,14 @@ mapping:
             mapping:
               home: {type: str}
               missions_dir: {type: str}
+              mission_rewrite: {type: bool}
               autoscan: {type: bool}
               bot_port: {type: int, range: {min: 1025, max: 65535}, required: true}
+              webgui_port: {type: int, range: {min: 1025, max: 65535}}
+              dcs_port: {type: int, range: {min: 1025, max: 65535}}
               server_user: {type: str}
               max_hung_minutes: {type: int, range: {min: 0}}
               affinity: {type: any}
+              priority: {type: str, enum: ['below_normal', 'normal', 'above_normal', 'high', 'realtime']}
               extensions:
                 include: 'instance_extensions_schema'

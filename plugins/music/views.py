@@ -4,7 +4,7 @@ import os
 from core import utils, Server, ServiceRegistry, get_translation
 from discord import SelectOption, TextStyle
 from discord.ui import View, Select, Button, Modal, TextInput
-from services import MusicService
+from services.music import MusicService
 from services.music.radios import Mode
 
 from .utils import get_tag
@@ -39,7 +39,7 @@ class MusicPlayer(View):
             self.titles = await self.get_titles(self.songs)
         self.config = self.service.get_config(self.server, self.radio_name)
         embed = discord.Embed(colour=discord.Colour.blue())
-        embed.add_field(name=_("Frequency"), value=self.config['frequency'] + " " + self.config['modulation'])
+        embed.add_field(name=_("Frequency"), value=f"{self.config['frequency']} {self.config['modulation']}")
         embed.add_field(name=_("Coalition"),
                         value=(_("Red") if self.config['coalition'] == 1 else
                                _("Blue") if self.config['coalition'] == 2 else

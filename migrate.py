@@ -7,12 +7,14 @@ import traceback
 from configparser import ConfigParser
 from contextlib import suppress
 from copy import deepcopy
-from core import utils, DEFAULT_TAG, BACKUP_FOLDER
-from extensions import TACVIEW_DEFAULT_DIR
+from core import utils
+from core.const import DEFAULT_TAG
+from core.plugin import BACKUP_FOLDER
+from core.data.node import Node
 from pathlib import Path
-from typing import Union
 from rich import print
 from rich.prompt import IntPrompt, Confirm
+from typing import Union
 
 # ruamel YAML support
 from ruamel.yaml import YAML
@@ -129,7 +131,30 @@ def post_migrate_greenieboard(node: str):
             yaml.dump(data, outfile)
 
 
-def migrate(node: str):
+def migrate(node: Node, old_version: str, new_version: str):
+    if old_version == 'v3.10' and new_version == 'v3.11':
+        migrate_3_11(node)
+
+
+def migrate_3_11(node: Node):
+    filename = os.path.join(node.config_dir, 'services', 'bot.yaml')
+    if not os.path.exists(filename):
+        return
+    with open(filename, mode='r', encoding='utf-8') as infile:
+        data = yaml.load(infile)
+    channels = {}
+    if 'audit_channel' in data:
+        channels['audit'] = data.pop('audit_channel')
+    if 'admin_channel' in data:
+        channels['admin'] = data.pop('admin_channel')
+    if channels:
+        data['channels'] = channels
+        with open(filename, mode='w', encoding='utf-8') as outfile:
+            yaml.dump(data, outfile)
+        node.log.info("  => config/services/bot.yaml auto-migrated, please check")
+
+
+def migrate_3(node: str):
     cfg = ConfigParser()
     cfg.read('config/default.ini', encoding='utf-8')
     cfg.read('config/dcsserverbot.ini', encoding='utf-8')
@@ -141,7 +166,7 @@ def migrate(node: str):
             print("[red]ATTENTION:[/]The Master Node needs to be migrated first! Aborting.")
             exit(-2)
         bot = yaml.load(Path('config/services/bot.yaml').read_text(encoding='utf-8'))
-        single_admin = ('admin_channel' in bot)
+        single_admin = bot.get('channels', {}).get('admin')
     else:
         guild_id = IntPrompt.ask(
             'Please enter your Discord Guild ID (right click on your Discord server, "Copy Server ID")')
@@ -212,6 +237,13 @@ def migrate(node: str):
         if node not in all_missionstats:
             all_missionstats[node] = {}
         missionstats = all_missionstats[node]
+        if os.path.exists('config/plugins/slotblocking.yaml'):
+            all_slotblocking = yaml.load(Path('config/plugins/slotblocking.yaml').read_text(encoding='utf-8'))
+        else:
+            all_slotblocking = {}
+        if node not in all_slotblocking:
+            all_slotblocking[node] = {}
+        slotblocking = all_slotblocking[node]
         # If we are not the first node to be migrated
         if os.path.exists('config/nodes.yaml'):
             nodes = yaml.load(Path('config/nodes.yaml').read_text(encoding='utf-8'))
@@ -225,10 +257,16 @@ def migrate(node: str):
         else:
             servers = {
                 DEFAULT_TAG: {
-                    "message_afk": cfg['DCS']['MESSAGE_AFK'],
-                    "message_ban": cfg['DCS']['MESSAGE_BAN'],
-                    'message_timeout': int(cfg['BOT']['MESSAGE_TIMEOUT']),
-                    'message_server_full': cfg['DCS']['MESSAGE_SERVER_FULL']
+                    "messages": {
+                        "greeting_message_members": cfg['DCS']['GREETING_MESSAGE_MEMBERS'].replace(
+                            '{}', '{player.name}', 1).replace('{}', '{server.name}'),
+                        "greeting_message_unmatched": cfg['DCS']['GREETING_MESSAGE_UNMATCHED'].replace(
+                            '{name}', '{player.name}'),
+                        "message_player_username": cfg['DCS']['MESSAGE_PLAYER_USERNAME'],
+                        "message_player_default_username": cfg['DCS']['MESSAGE_PLAYER_DEFAULT_USERNAME'],
+                        "message_ban": cfg['DCS']['MESSAGE_BAN']
+                    },
+                    'message_timeout': int(cfg['BOT']['MESSAGE_TIMEOUT'])
                 }
             }
 
@@ -242,10 +280,6 @@ def migrate(node: str):
                     "loglevel": cfg['LOGGING']['LOGLEVEL'],
                     "logrotate_count": int(cfg['LOGGING']['LOGROTATE_COUNT']),
                     "logrotate_size": int(cfg['LOGGING']['LOGROTATE_SIZE'])
-                },
-                "messages": {
-                    "player_username": cfg['DCS']['MESSAGE_PLAYER_USERNAME'],
-                    "player_default_username": cfg['DCS']['MESSAGE_PLAYER_DEFAULT_USERNAME']
                 },
                 "filter": {
                     "server_name": cfg['FILTER']['SERVER_FILTER'],
@@ -269,7 +303,9 @@ def migrate(node: str):
                 for server_name, instance in utils.findDCSInstances():
                     if instance in cfg and 'ADMIN_CHANNEL' in cfg[instance]:
                         print(f"[yellow]- Configured ADMIN_CHANNEL of instance {instance} as single admin channel.[/]")
-                        bot['admin_channel'] = int(cfg[instance]['ADMIN_CHANNEL'])
+                        bot['channels'] = {
+                            "admin": int(cfg[instance]['ADMIN_CHANNEL'])
+                        }
                         break
 
             if 'GREETING_DM' in cfg['BOT']:
@@ -277,7 +313,9 @@ def migrate(node: str):
             if 'DISCORD_STATUS' in cfg['BOT']:
                 bot['discord_status'] = cfg['BOT']['DISCORD_STATUS']
             if 'AUDIT_CHANNEL' in cfg['BOT']:
-                bot['audit_channel'] = int(cfg['BOT']['AUDIT_CHANNEL'])
+                if 'channels' not in bot:
+                    bot['channels'] = {}
+                bot['channels']['audit'] = int(cfg['BOT']['AUDIT_CHANNEL'])
             bot['roles'] = {}
             for role in ['Admin', 'DCS Admin', 'DCS', 'GameMaster']:
                 bot['roles'][role] = [x.strip() for x in cfg['ROLES'][role].split(',')]
@@ -287,7 +325,7 @@ def migrate(node: str):
 
         if 'PUBLIC_IP' in cfg['BOT']:
             nodes[node]['public_ip'] = cfg['BOT']['PUBLIC_IP']
-        nodes[node]['listen_address'] = '0.0.0.0' if cfg['BOT']['HOST'] == '127.0.0.1' else cfg['BOT']['HOST']
+        nodes[node]['listen_address'] = cfg['BOT']['HOST']
         nodes[node]['listen_port'] = int(cfg['BOT']['PORT'])
         nodes[node]['slow_system'] = cfg['BOT'].getboolean('SLOW_SYSTEM')
         nodes[node]['DCS'] = {
@@ -307,9 +345,6 @@ def migrate(node: str):
         if DEFAULT_TAG not in all_userstats:
             all_userstats[DEFAULT_TAG] = {}
         u = all_userstats[DEFAULT_TAG]
-        u['greeting_message_members'] = cfg['DCS']['GREETING_MESSAGE_MEMBERS'].replace(
-            '{}', '{player.name}', 1).replace('{}', '{server.name}')
-        u['greeting_message_unmatched'] = cfg['DCS']['GREETING_MESSAGE_UNMATCHED'].replace('{name}', '{player.name}')
         u['wipe_stats_on_leave'] = cfg['BOT'].getboolean('WIPE_STATS_ON_LEAVE')
 
         nodes[node]['instances'] = {}
@@ -324,30 +359,30 @@ def migrate(node: str):
                     i['missions_dir'] = cfg[instance]['MISSIONS_DIR']
                 if instance in scheduler:
                     schedule = scheduler[instance]
+                    if 'restart' in schedule:
+                        schedule['action'] = schedule.pop('restart')
+                        if 'restart_with_shutdown' in schedule['action']['method']:
+                            schedule['action']['method'] = 'restart'
+                            schedule['action']['shutdown'] = True
                     if 'affinity' in schedule:
-                        nodes[node]['instances'][instance]['affinity'] = schedule['affinity']
-                        del schedule['affinity']
+                        nodes[node]['instances'][instance]['affinity'] = schedule.pop('affinity')
                     if 'terrains' in schedule:
                         if 'extensions' not in schedule:
                             schedule['extensions'] = {}
                         schedule['extensions']['MizEdit'] = {
-                            "terrains": schedule['terrains']
+                            "terrains": schedule.pop('terrains')
                         }
-                        del schedule['terrains']
                     elif 'settings' in schedule:
                         if 'extensions' not in schedule:
                             schedule['extensions'] = {}
                         schedule['extensions']['MizEdit'] = {
-                            "settings": schedule['settings']
+                            "settings": schedule.pop('settings')
                         }
-                        del schedule['settings']
                     if 'extensions' in schedule:
-                        i['extensions'] = schedule['extensions']
-                        del schedule['extensions']
+                        i['extensions'] = schedule.pop('extensions')
                     # unusual, but people might have done it
                     if 'presets' in schedule:
-                        presets |= schedule['presets']
-                        del schedule['presets']
+                        presets |= schedule.pop('presets')
                 # fill missionstats
                 m = missionstats[instance] = {}
                 if 'EVENT_FILTER' in cfg['FILTER']:
@@ -356,15 +391,23 @@ def migrate(node: str):
                 m['display'] = cfg[instance].getboolean('DISPLAY_MISSION_STATISTICS')
                 m['persistence'] = cfg[instance].getboolean('PERSIST_MISSION_STATISTICS')
                 m['persist_ai_statistics'] = cfg[instance].getboolean('PERSIST_AI_STATISTICS')
+                # fill slotblocking
+                if instance in slotblocking:
+                    sb = slotblocking[instance]
+                    if 'VIP' in sb:
+                        sb['VIP']['message_server_full'] = cfg['DCS']['MESSAGE_SERVER_FULL']
                 # create server config
                 servers[server_name] = {
                     "server_user": cfg['DCS']['SERVER_USER'],
-                    "afk_time": int(cfg['DCS']['AFK_TIME']),
                     "ping_admin_on_crash": cfg[instance].getboolean('PING_ADMIN_ON_CRASH'),
                     "autoscan": cfg[instance].getboolean('AUTOSCAN'),
                     "channels": {
                         "status": int(cfg[instance]['STATUS_CHANNEL']),
                         "chat": int(cfg[instance]['CHAT_CHANNEL'])
+                    },
+                    "afk": {
+                        "message_afk": cfg['DCS']['MESSAGE_AFK'],
+                        "afk_time": int(cfg['DCS']['AFK_TIME'])
                     }
                 }
                 if not single_admin:
@@ -410,11 +453,10 @@ def migrate(node: str):
                         presets |= json.load(pin)
                     shutil.move(schedule['presets'], BACKUP_FOLDER.format(node))
                 del schedule['presets']
+        # check DEFAULT_TAG in slotblocking
+        if slotblocking.get(DEFAULT_TAG, {}).get('VIP'):
+            slotblocking[DEFAULT_TAG]['VIP']['message_server_full'] = cfg['DCS']['MESSAGE_SERVER_FULL']
 
-        # Now we need to figure if tacview has a delete_after configured...
-        delete_after = nodes[node].get('extensions', {}).get('Tacview', {}).get('delete_after', 0)
-        directory = nodes[node].get('extensions', {}).get('Tacview', {}).get('tacviewExportPath',
-                                                                             TACVIEW_DEFAULT_DIR)
         if os.path.exists('config/services/cleanup.yaml'):
             with open('config/services/cleanup.yaml', mode='r', encoding='utf-8') as infile:
                 cleanup = yaml.load(infile)
@@ -422,6 +464,11 @@ def migrate(node: str):
             cleanup = {}
         for name, instance in nodes[node].get('instances', {}).items():
             if 'extensions' in instance and 'Tacview' in instance['extensions']:
+                from extensions.tacview import TACVIEW_DEFAULT_DIR
+
+                delete_after = nodes[node].get('extensions', {}).get('Tacview', {}).get('delete_after', 0)
+                directory = nodes[node].get('extensions', {}).get('Tacview', {}).get('tacviewExportPath',
+                                                                                     TACVIEW_DEFAULT_DIR)
                 _delete_after = instance['extensions']['Tacview'].get('delete_after', delete_after)
                 _directory = instance['extensions']['Tacview'].get('tacviewExportPath', directory)
                 if _delete_after:
@@ -470,6 +517,10 @@ def migrate(node: str):
             with open('config/plugins/missionstats.yaml', mode='w', encoding='utf-8') as out:
                 yaml.dump(all_missionstats, out)
             print("- Created / updated config/plugins/missionstats.yaml")
+        if slotblocking:
+            with open('config/plugins/slotblocking.yaml', mode='w', encoding='utf-8') as out:
+                yaml.dump(all_slotblocking, out)
+            print("- Created / updated config/plugins/slotblocking.yaml")
         # shutil.move('config/default.ini', BACKUP_FOLDER)
         shutil.move('config/dcsserverbot.ini', BACKUP_FOLDER.format(node))
         print("\n[green]Migration to DCSServerBot 3.0 successful![/]\n\n")

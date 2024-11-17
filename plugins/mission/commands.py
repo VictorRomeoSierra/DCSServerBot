@@ -1,23 +1,28 @@
 import asyncio
 import discord
+import importlib
 import os
 import psycopg
 import random
 import re
 
+from copy import deepcopy
 from core import utils, Plugin, Report, Status, Server, Coalition, Channel, Player, PluginRequiredError, MizFile, \
-    Group, ReportEnv, UploadStatus, command, PlayerType, DataObjectFactory, Member, DEFAULT_TAG, get_translation
+    Group, ReportEnv, UploadStatus, command, PlayerType, DataObjectFactory, Member, DEFAULT_TAG, get_translation, \
+    UnsupportedMizFileException
 from datetime import datetime, timezone
 from discord import Interaction, app_commands, SelectOption
 from discord.app_commands import Range
 from discord.ext import commands, tasks
 from discord.ui import Modal, TextInput
+from io import BytesIO
 from pathlib import Path
 from psycopg.rows import dict_row
-from services import DCSServerBot
+from services.bot import DCSServerBot
 from typing import Optional, Union, Literal
 
 from .listener import MissionEventListener
+from .upload import MissionUploadHandler
 from .views import ServerView, PresetView, InfoView
 
 # ruamel YAML support
@@ -31,15 +36,17 @@ async def mizfile_autocomplete(interaction: discord.Interaction, current: str) -
     if not await interaction.command._check_can_run(interaction):
         return []
     try:
-        server: Server = await utils.ServerTransformer().transform(interaction,
-                                                                   utils.get_interaction_param(interaction, 'server'))
+        server: Server = await utils.ServerTransformer().transform(
+            interaction, utils.get_interaction_param(interaction, 'server'))
         if not server:
             return []
+        base_dir = await server.get_missions_dir()
         installed_missions = [os.path.expandvars(x) for x in await server.getMissionList()]
+        exp_base, file_list = await server.node.list_directory(base_dir, pattern="*.miz", traverse=True, ignore=['.dcssb'])
         choices: list[app_commands.Choice[int]] = [
-            app_commands.Choice(name=os.path.basename(x)[:-4], value=idx)
-            for idx, x in enumerate(await server.listAvailableMissions())
-            if x not in installed_missions and current.casefold() in os.path.basename(x).casefold()
+            app_commands.Choice(name=os.path.relpath(x, exp_base)[:-4], value=os.path.relpath(x, exp_base))
+            for x in file_list
+            if x not in installed_missions and current.casefold() in os.path.relpath(x, base_dir).casefold()
         ]
         return choices[:25]
     except Exception as ex:
@@ -54,8 +61,9 @@ async def orig_mission_autocomplete(interaction: discord.Interaction, current: s
                                                                    utils.get_interaction_param(interaction, 'server'))
         if not server:
             return []
-        orig_files = [os.path.basename(x)[:-9] for x in await server.node.list_directory(
-            await server.get_missions_dir(), '*.orig')]
+        _, file_list = await server.node.list_directory(await server.get_missions_dir(), pattern='*.orig',
+                                                        traverse=True)
+        orig_files = [os.path.basename(x)[:-9] for x in file_list]
         choices: list[app_commands.Choice[int]] = [
             app_commands.Choice(name=os.path.basename(x)[:-4], value=idx)
             for idx, x in enumerate(await server.getMissionList())
@@ -103,45 +111,11 @@ class Mission(Plugin):
         await super().cog_unload()
 
     async def migrate(self, new_version: str, conn: Optional[psycopg.AsyncConnection] = None) -> None:
-        if version == '3.6':
-            filename = os.path.join(self.node.config_dir, 'plugins', 'userstats.yaml')
-            if not os.path.exists(filename):
-                return
-            data = yaml.load(Path(filename).read_text(encoding='utf-8'))
-
-            def migrate_instance(cfg: dict) -> dict:
-                ret = {}
-                for name, instance in cfg.items():
-                    if 'greeting_message_members' in instance:
-                        if name not in ret:
-                            ret[name] = {}
-                        ret[name]['greeting_message_members'] = instance['greeting_message_members']
-                    if 'greeting_message_unmatched' in instance:
-                        if name not in ret:
-                            ret[name] = {}
-                        ret[name]['greeting_message_unmatched'] = instance['greeting_message_unmatched']
-                return ret
-
-            dirty = False
-            if self.node.name in data:
-                for node_name, node in data.items():
-                    result = migrate_instance(node)
-                    if result:
-                        dirty = True
-                        if node_name not in self.locals:
-                            self.locals[node_name] = result
-                        else:
-                            self.locals[node_name] |= result
-            else:
-                result = migrate_instance(data)
-                if result:
-                    dirty = True
-                    self.locals |= result
-            if dirty:
-                path = os.path.join(self.node.config_dir, 'plugins', f'{self.plugin_name}.yaml')
-                with open(path, mode='w', encoding='utf-8') as outfile:
-                    yaml.dump(self.locals, outfile)
-                self.log.warning(f"New file {path} written, please check for possible errors.")
+        function_name = f"migrate_{new_version.replace('.', '_')}"
+        migrate_module = importlib.import_module('.migrate', package=__package__)
+        migrate_function = getattr(migrate_module, function_name, None)
+        if callable(migrate_function):
+            await migrate_function(self)
 
     async def rename(self, conn: psycopg.AsyncConnection, old_name: str, new_name: str):
         await conn.execute('UPDATE missions SET server_name = %s WHERE server_name = %s', (new_name, old_name))
@@ -258,7 +232,7 @@ class Mission(Plugin):
     async def restart(self, interaction: discord.Interaction,
                       server: app_commands.Transform[Server, utils.ServerTransformer(
                           status=[Status.RUNNING, Status.PAUSED, Status.STOPPED])],
-                      delay: Optional[int] = 120, reason: Optional[str] = None, run_extensions: Optional[bool] = False):
+                      delay: Optional[int] = 120, reason: Optional[str] = None, run_extensions: Optional[bool] = True):
         await self._restart(interaction, server, delay, reason, run_extensions, rotate=False)
 
     @mission.command(description=_('Rotates to the next mission\n'))
@@ -267,13 +241,13 @@ class Mission(Plugin):
     async def rotate(self, interaction: discord.Interaction,
                      server: app_commands.Transform[Server, utils.ServerTransformer(
                           status=[Status.RUNNING, Status.PAUSED, Status.STOPPED])],
-                     delay: Optional[int] = 120, reason: Optional[str] = None, run_extensions: Optional[bool] = False):
+                     delay: Optional[int] = 120, reason: Optional[str] = None, run_extensions: Optional[bool] = True):
         await self._restart(interaction, server, delay, reason, run_extensions, rotate=True)
 
     async def _restart(self, interaction: discord.Interaction,
                        server: app_commands.Transform[Server, utils.ServerTransformer(
                           status=[Status.RUNNING, Status.PAUSED, Status.STOPPED])],
-                       delay: Optional[int] = 120, reason: Optional[str] = None, run_extensions: Optional[bool] = False,
+                       delay: Optional[int] = 120, reason: Optional[str] = None, run_extensions: Optional[bool] = True,
                        rotate: Optional[bool] = False):
         what = "restart" if not rotate else "rotate"
         actions = {
@@ -325,7 +299,7 @@ class Mission(Plugin):
                 _('Mission will be {what} in {when} (warning users before)...').format(what=_(actions.get(what)),
                                                                                        when=utils.format_time(delay)),
                 ephemeral=ephemeral)
-            server.sendPopupMessage(Coalition.ALL, message, sender=interaction.user.display_name)
+            await server.sendPopupMessage(Coalition.ALL, message, sender=interaction.user.display_name)
             await asyncio.sleep(delay)
             await msg.delete()
         try:
@@ -395,18 +369,21 @@ class Mission(Plugin):
                     _('Mission {} will be loaded when server is empty or on the next restart.').format(name),
                     ephemeral=ephemeral)
             else:
-                tmp = await interaction.followup.send(_('Loading mission {} ...').format(utils.escape_string(name)),
+                msg = await interaction.followup.send(_('Loading mission {} ...').format(utils.escape_string(name)),
                                                       ephemeral=ephemeral)
                 try:
-                    await server.loadMission(mission_id + 1, modify_mission=run_extensions)
-                    await self.bot.audit(f"loaded mission {utils.escape_string(name)}", server=server,
-                                         user=interaction.user)
-                    await interaction.followup.send(_('Mission {} loaded.').format(name), ephemeral=ephemeral)
+                    if not await server.loadMission(mission_id + 1, modify_mission=run_extensions):
+                        await msg.edit(content=_('Mission {} NOT loaded. '
+                                                 'Check that you have installed the pre-requisites (terrains, mods).'
+                                                 ).format(name))
+                    else:
+                        await msg.edit(content=_('Mission {} loaded.').format(name))
+                        await self.bot.audit(f"loaded mission {utils.escape_string(name)}", server=server,
+                                             user=interaction.user)
                 except (TimeoutError, asyncio.TimeoutError):
-                    await interaction.followup.send(_('Timeout while loading mission {}!').format(name),
-                                                    ephemeral=ephemeral)
-                finally:
-                    await tmp.delete()
+                    await msg.edit(content=_('Timeout while loading mission {}!').format(name))
+                except UnsupportedMizFileException as ex:
+                    await msg.edit(content=ex)
 
     @mission.command(description=_('Loads a mission\n'))
     @app_commands.guild_only()
@@ -416,29 +393,26 @@ class Mission(Plugin):
     async def load(self, interaction: discord.Interaction,
                    server: app_commands.Transform[Server, utils.ServerTransformer(
                        status=[Status.STOPPED, Status.RUNNING, Status.PAUSED])],
-                   mission_id: int, run_extensions: Optional[bool] = False):
+                   mission_id: int, run_extensions: Optional[bool] = True):
         await self._load(interaction, server, mission_id, run_extensions)
 
     @mission.command(description=_('Adds a mission to the list\n'))
     @app_commands.guild_only()
     @utils.app_has_role('DCS Admin')
-    @app_commands.rename(idx=_("path"))
-    @app_commands.autocomplete(idx=mizfile_autocomplete)
+    @app_commands.autocomplete(path=mizfile_autocomplete)
     async def add(self, interaction: discord.Interaction,
-                  server: app_commands.Transform[Server, utils.ServerTransformer], idx: int,
+                  server: app_commands.Transform[Server, utils.ServerTransformer], path: str,
                   autostart: Optional[bool] = False):
         ephemeral = utils.get_ephemeral(interaction)
         # noinspection PyUnresolvedReferences
         await interaction.response.defer(ephemeral=ephemeral)
-        all_missions = await server.listAvailableMissions()
-        if idx >= len(all_missions):
-            await interaction.followup.send(_('No mission found.'), ephemeral=True)
-            return
-        path = all_missions[idx]
+
+        path = os.path.normpath(os.path.join(await server.get_missions_dir(), path))
         await server.addMission(path, autostart=autostart)
         name = os.path.basename(path)
         await interaction.followup.send(_('Mission "{}" added.').format(utils.escape_string(name)), ephemeral=ephemeral)
-        mission_id = (await server.getMissionList()).index(path)
+        new_mission_list = await server.getMissionList()
+        mission_id = new_mission_list.index(path)
         if server.status not in [Status.RUNNING, Status.PAUSED, Status.STOPPED] or \
                 not await utils.yn_question(interaction, _('Do you want to load this mission?'),
                                             ephemeral=ephemeral):
@@ -474,14 +448,17 @@ class Mission(Plugin):
                 await server.deleteMission(mission_id + 1)
                 await interaction.followup.send(_('Mission "{}" removed from list.').format(os.path.basename(name)),
                                                 ephemeral=ephemeral)
-                if await utils.yn_question(interaction, _('Delete "{}" also from disk?').format(name),
+                if await utils.yn_question(interaction,
+                                           _('Delete "{}" also from disk?').format(os.path.basename(filename)),
                                            ephemeral=ephemeral):
                     try:
                         await server.node.remove_file(filename)
-                        await interaction.followup.send(_('Mission "{}" deleted.').format(name), ephemeral=ephemeral)
-                    except FileNotFoundError:
-                        await interaction.followup.send(_('Mission "{}" was already deleted.').format(name),
+                        await interaction.followup.send(_('Mission "{}" deleted.').format(os.path.basename(filename)),
                                                         ephemeral=ephemeral)
+                    except FileNotFoundError:
+                        await interaction.followup.send(
+                            _('Mission "{}" was already deleted.').format(os.path.basename(filename)),
+                            ephemeral=ephemeral)
                 await self.bot.audit(_("deleted mission {}").format(name), user=interaction.user)
             except (TimeoutError, asyncio.TimeoutError):
                 await interaction.followup.send(_("Timeout while deleting mission.\n"
@@ -594,7 +571,7 @@ class Mission(Plugin):
         else:
             startup = False
             msg = await interaction.followup.send(_('Changing mission ...'), ephemeral=ephemeral)
-            if not server.node.config.get('mission_rewrite', True) and server.status != Status.STOPPED:
+            if not server.locals.get('mission_rewrite', True) and server.status != Status.STOPPED:
                 await server.stop()
                 startup = True
             filename = await server.get_current_mission_file()
@@ -628,11 +605,12 @@ class Mission(Plugin):
         # noinspection PyUnresolvedReferences
         await interaction.response.defer(ephemeral=ephemeral)
         miz = await asyncio.to_thread(MizFile, server.current_mission.filename)
-        if os.path.exists('config/presets.yaml'):
-            with open('config/presets.yaml', mode='r', encoding='utf-8') as infile:
+        config_file = os.path.join(self.node.config_dir, 'presets.yaml')
+        if os.path.exists(config_file):
+            with open(config_file, mode='r', encoding='utf-8') as infile:
                 presets = yaml.load(infile)
         else:
-            presets = dict()
+            presets = {}
         if name in presets and \
                 not await utils.yn_question(interaction,
                                             _('Do you want to overwrite the existing preset "{}"?').format(name),
@@ -652,7 +630,7 @@ class Mission(Plugin):
             "fog": miz.fog if miz.enable_fog else {"thickness": 0, "visibility": 0},
             "halo": miz.halo
         }
-        with open(f'config/presets.yaml', mode='w', encoding='utf-8') as outfile:
+        with open(config_file, mode='w', encoding='utf-8') as outfile:
             yaml.dump(presets, outfile)
         # noinspection PyUnresolvedReferences
         await interaction.followup.send(_('Preset "{}" added.').format(name), ephemeral=ephemeral)
@@ -664,16 +642,17 @@ class Mission(Plugin):
     @app_commands.autocomplete(mission_id=orig_mission_autocomplete)
     async def rollback(self, interaction: discord.Interaction,
                        server: app_commands.Transform[Server, utils.ServerTransformer], mission_id: int):
+        ephemeral = utils.get_ephemeral(interaction)
+        # noinspection PyUnresolvedReferences
+        await interaction.response.defer(ephemeral=ephemeral)
         missions = await server.getMissionList()
         if mission_id >= len(missions):
-            # noinspection PyUnresolvedReferences
-            await interaction.response.send_message(_("No mission found."))
+            await interaction.followup.send(_("No mission found."), ephemeral=True)
             return
         filename = missions[mission_id]
         if server.status in [Status.RUNNING, Status.PAUSED] and filename == server.current_mission.filename:
-            # noinspection PyUnresolvedReferences
-            await interaction.response.send_message(_("Please stop your server first to rollback the running mission."),
-                                                    ephemeral=True)
+            await interaction.followup.send(_("Please stop your server first to rollback the running mission."),
+                                            ephemeral=True)
             return
         mission_folder = await server.get_missions_dir()
         miz_file = os.path.basename(filename)
@@ -683,15 +662,13 @@ class Mission(Plugin):
             await server.node.rename_file(old_file, new_file, force=True)
         except FileNotFoundError:
             # we should never be here, but just in case
-            # noinspection PyUnresolvedReferences
-            await interaction.response.send_message(_('No ".orig" file there, the mission was never changed.'),
-                                                    ephemeral=True)
+            await interaction.followup.send(_('No ".orig" file there, the mission was never changed.'),
+                                            ephemeral=True)
             return
         if new_file != filename:
             await server.replaceMission(mission_id + 1, new_file)
-        # noinspection PyUnresolvedReferences
-        await interaction.response.send_message(_("Mission {} has been rolled back.").format(miz_file[:-4]),
-                                                ephemeral=utils.get_ephemeral(interaction))
+        await interaction.followup.send(_("Mission {} has been rolled back.").format(miz_file[:-4]),
+                                        ephemeral=ephemeral)
 
     # New command group "/player"
     player = Group(name="player", description=_("Commands to manage DCS players"))
@@ -722,7 +699,7 @@ class Mission(Plugin):
             # noinspection PyUnresolvedReferences
             await interaction.response.send_message(_("Player not found."), ephemeral=True)
             return
-        server.kick(player, reason)
+        await server.kick(player, reason)
         await self.bot.audit(f'kicked player {player.display_name} with reason "{reason}"', user=interaction.user)
         # noinspection PyUnresolvedReferences
         await interaction.response.send_message(
@@ -768,10 +745,10 @@ class Mission(Plugin):
             # noinspection PyUnresolvedReferences
             await interaction.response.send_message(_("Player not found."), ephemeral=True)
             return
-        server.move_to_spectators(player)
+        await server.move_to_spectators(player)
         if reason:
-            player.sendChatMessage(_("You have been moved to spectators. Reason: {}").format(reason),
-                                   interaction.user.display_name)
+            await player.sendChatMessage(_("You have been moved to spectators. Reason: {}").format(reason),
+                                         interaction.user.display_name)
         await self.bot.audit(f'moved player {player.name} to spectators with reason "{reason}".', user=interaction.user)
         # noinspection PyUnresolvedReferences
         await interaction.response.send_message(_('Player "{}" moved to spectators.').format(player.name),
@@ -828,34 +805,44 @@ class Mission(Plugin):
     async def exempt(self, interaction: discord.Interaction,
                      user: app_commands.Transform[
                          Union[discord.Member, str], utils.UserTransformer(sel_type=PlayerType.PLAYER)
-                     ]):
+                     ],
+                     server: Optional[app_commands.Transform[Server, utils.ServerTransformer]]):
         ephemeral = utils.get_ephemeral(interaction)
         if isinstance(user, discord.Member):
             ucid = await self.bot.get_ucid_by_member(user)
         else:
             ucid = user
-        config_file = os.path.join('config', 'plugins', self.plugin_name + '.yaml')
-        if DEFAULT_TAG not in self.locals:
-            self.locals[DEFAULT_TAG] = {}
-        if 'afk_exemptions' not in self.locals[DEFAULT_TAG]:
-            self.locals[DEFAULT_TAG]['afk_exemptions'] = []
-        if ucid not in self.locals[DEFAULT_TAG]['afk_exemptions']:
+        config_file = os.path.join(self.node.config_dir, 'servers.yaml')
+        if not server:
+            section = DEFAULT_TAG
+        else:
+            section = server.name
+        data = yaml.load(Path(config_file).read_text(encoding='utf-8'))
+        if section not in data:
+            data[section] = {}
+        if 'afk' not in data[section]:
+            data[section]['afk'] = {}
+        if 'exemptions' not in data[section]['afk']:
+            data[section]['afk']['exemptions'] = {}
+        if 'ucid' not in data[section]['afk']['exemptions']:
+            data[section]['afk']['exemptions']['ucid'] = []
+        if ucid not in data[section]['afk']['exemptions']['ucid']:
             if not await utils.yn_question(interaction,
                                            _("Do you want to permanently add this user to the AFK exemption list?"),
                                            ephemeral=ephemeral):
                 await interaction.followup.send("Aborted.", ephemeral=ephemeral)
                 return
-            self.locals[DEFAULT_TAG]['afk_exemptions'].append(ucid)
+            data[section]['afk']['exemptions']['ucid'].append(ucid)
             await interaction.followup.send(_("User added to the exemption list."), ephemeral=ephemeral)
         else:
             if not await utils.yn_question(interaction,
                                            _("Player is on the list already. Do you want to remove them?")):
                 await interaction.followup.send(_("Aborted."), ephemeral=ephemeral)
                 return
-            self.locals[DEFAULT_TAG]['afk_exemptions'].remove(ucid)
+            data[section]['afk']['exemptions']['ucid'].remove(ucid)
             await interaction.followup.send(_("User removed from the exemption list."), ephemeral=ephemeral)
         with open(config_file, 'w', encoding='utf-8') as outfile:
-            yaml.dump(self.locals, outfile)
+            yaml.dump(data, outfile)
 
     @player.command(description=_('Sends a popup to a player\n'))
     @app_commands.guild_only()
@@ -868,7 +855,7 @@ class Mission(Plugin):
             # noinspection PyUnresolvedReferences
             await interaction.response.send_message(_("Player not found."), ephemeral=True)
             return
-        player.sendPopupMessage(message, time, interaction.user.display_name)
+        await player.sendPopupMessage(message, time, interaction.user.display_name)
         # noinspection PyUnresolvedReferences
         await interaction.response.send_message(_('Message sent.'), ephemeral=utils.get_ephemeral(interaction))
 
@@ -882,39 +869,142 @@ class Mission(Plugin):
             # noinspection PyUnresolvedReferences
             await interaction.response.send_message(_("Player not found."), ephemeral=True)
             return
-        player.sendChatMessage(message, interaction.user.display_name)
+        await player.sendChatMessage(message, interaction.user.display_name)
         # noinspection PyUnresolvedReferences
         await interaction.response.send_message(_('Message sent.'), ephemeral=utils.get_ephemeral(interaction))
 
-    @player.command(description=_('Adds a player to the watchlist'))
+    @player.command(description=_('Take a screenshot'))
     @app_commands.guild_only()
     @utils.app_has_role('DCS Admin')
-    async def watch(self, interaction: discord.Interaction,
-                    server: app_commands.Transform[Server, utils.ServerTransformer(status=[Status.RUNNING])],
-                    player: app_commands.Transform[Player, utils.PlayerTransformer(active=True, watchlist=False)]):
+    async def screenshot(self, interaction: discord.Interaction,
+                   server: app_commands.Transform[Server, utils.ServerTransformer(status=[Status.RUNNING])],
+                   player: app_commands.Transform[Player, utils.PlayerTransformer(active=True)]) -> None:
         if not player:
             # noinspection PyUnresolvedReferences
             await interaction.response.send_message(_("Player not found."), ephemeral=True)
             return
-        player.watchlist = True
+        if not server.settings.get('advanced', {}).get('server_can_screenshot'):
+            # noinspection PyUnresolvedReferences
+            await interaction.response.send_message(_("Server can not take screenshots."), ephemeral=True)
+            return
+        ephemeral = utils.get_ephemeral(interaction)
         # noinspection PyUnresolvedReferences
-        await interaction.response.send_message(_("Player {} is now on the watchlist.").format(player.display_name),
-                                                ephemeral=utils.get_ephemeral(interaction))
+        await interaction.response.defer(ephemeral=ephemeral)
+        msg = await interaction.followup.send(_("Requesting screenshot ..."), ephemeral=ephemeral)
+        try:
+            old_screens = await player.getScreenshots()
+            await player.makeScreenshot()
+            timeout = 30 if server.node.locals.get('slow_system', False) else 10
+            for i in range(1, timeout):
+                await asyncio.sleep(1)
+                new_screens = await player.getScreenshots()
+                if len(new_screens) > len(old_screens):
+                    break
+            else:
+                await msg.edit(content=_("Timeout while waiting for screenshot!"))
+                return
+        except (TimeoutError, asyncio.TimeoutError):
+            await msg.edit(content=_("Timeout while waiting for screenshot!"))
+            return
+        key = new_screens[-1]
+        try:
+            image_url = f"http://127.0.0.1:{server.instance.webgui_port}{key}"
+            image_data = await server.node.read_file(image_url)
+            file = discord.File(BytesIO(image_data), filename="screenshot.png")
+            await msg.delete()
+            embed = discord.Embed(color=discord.Color.blue(),
+                                  title=_("Screenshot of Player {}").format(player.display_name))
+            embed.set_image(url="attachment://screenshot.png")
+            embed.add_field(name=_("Server"), value=server.display_name, inline=False)
+            embed.add_field(name=_("Time"), value=f"<t:{int(datetime.now().timestamp())}>", inline=False)
+            embed.add_field(name=_("Taken by"), value=interaction.user.display_name, inline=False)
+            await interaction.followup.send(embed=embed, file=file, ephemeral=ephemeral)
+        finally:
+            await player.deleteScreenshot(key)
 
-    @player.command(description=_('Removes a player from the watchlist'))
+    watch = Group(name="watch", description="Commands to manage the watchlist")
+
+    @watch.command(description=_('Puts a player onto the watchlist'))
     @app_commands.guild_only()
     @utils.app_has_role('DCS Admin')
-    async def unwatch(self, interaction: discord.Interaction,
-                      server: app_commands.Transform[Server, utils.ServerTransformer(status=[Status.RUNNING])],
-                      player: app_commands.Transform[Player, utils.PlayerTransformer(active=True, watchlist=True)]):
-        if not player:
+    async def add(self, interaction: discord.Interaction,
+                  user: app_commands.Transform[Union[discord.Member, str], utils.UserTransformer(
+                      sel_type=PlayerType.PLAYER, watchlist=False)], reason: str):
+        if isinstance(user, discord.Member):
+            ucid = await self.bot.get_ucid_by_member(user)
+            if not ucid:
+                # noinspection PyUnresolvedReferences
+                await interaction.response.send_message(_("Member {} is not linked!").format(user.display_name))
+                return
+        else:
+            ucid = user
+        try:
+            async with self.apool.connection() as conn:
+                async with conn.transaction():
+                    await conn.execute("INSERT INTO watchlist (player_ucid, reason, created_by) VALUES (%s, %s, %s)",
+                                       (ucid, reason, interaction.user.display_name))
             # noinspection PyUnresolvedReferences
-            await interaction.response.send_message(_("Player not found."), ephemeral=True)
-            return
-        player.watchlist = False
+            await interaction.response.send_message(_("Player {} is now on the watchlist.").format(
+                user.display_name if isinstance(user, discord.Member) else ucid),
+                ephemeral=utils.get_ephemeral(interaction))
+        except psycopg.errors.UniqueViolation:
+            # noinspection PyUnresolvedReferences
+            await interaction.response.send_message(
+                _("Player {} was already on the watchlist.").format(
+                    user.display_name if isinstance(user, discord.Member) else ucid),
+                ephemeral=utils.get_ephemeral(interaction))
+
+    @watch.command(description=_('Removes a player from the watchlist'))
+    @app_commands.guild_only()
+    @utils.app_has_role('DCS Admin')
+    async def delete(self, interaction: discord.Interaction,
+                     user: app_commands.Transform[Union[discord.Member, str], utils.UserTransformer(
+                         sel_type=PlayerType.PLAYER, watchlist=True)]):
+        if isinstance(user, discord.Member):
+            ucid = await self.bot.get_ucid_by_member(user)
+            if not ucid:
+                # we should never be here
+                # noinspection PyUnresolvedReferences
+                await interaction.response.send_message(_("Member {} is not linked!").format(user.display_name))
+                return
+        else:
+            ucid = user
+        async with self.apool.connection() as conn:
+            async with conn.transaction():
+                await conn.execute("DELETE FROM watchlist WHERE player_ucid = %s", (ucid, ))
         # noinspection PyUnresolvedReferences
-        await interaction.response.send_message(_("Player {} removed from watchlist.").format(player.display_name),
-                                                ephemeral=utils.get_ephemeral(interaction))
+        await interaction.response.send_message(
+            _("Player {} removed from the watchlist.").format(
+                user.display_name if isinstance(user, discord.Member) else user),
+            ephemeral=utils.get_ephemeral(interaction))
+
+    @watch.command(description=_('Shows the watchlist'))
+    @app_commands.guild_only()
+    @utils.app_has_role('DCS Admin')
+    async def list(self, interaction: discord.Interaction):
+        ephemeral = utils.get_ephemeral(interaction)
+        async with self.apool.connection() as conn:
+            cursor = await conn.execute("""
+                SELECT p.ucid, p.name, w.reason, w.created_by, w.created_at 
+                FROM players p JOIN watchlist w ON (p.ucid = w.player_ucid)
+            """)
+            watches = await cursor.fetchall()
+        if not watches:
+            # noinspection PyUnresolvedReferences
+            await interaction.response.send_message(_("The watchlist is currently empty."), ephemeral=ephemeral)
+            return
+        embed = discord.Embed(colour=discord.Colour.blue())
+        embed.description = _("These players are currently on the watchlist:")
+        names = created_by = ucids = ""
+        for row in watches:
+            names += utils.escape_string(row[1]) + '\n'
+            ucids += row[0] + '\n'
+            created_by += row[3] + '\n'
+        embed.add_field(name=_("Name"), value=names)
+        embed.add_field(name=_('UCID'), value=ucids)
+        embed.add_field(name=_("Created by"), value=created_by)
+        # noinspection PyUnresolvedReferences
+        await interaction.response.send_message(embed=embed)
 
     # New command group "/group"
     group = Group(name="group", description="Commands to manage DCS groups")
@@ -926,7 +1016,7 @@ class Mission(Plugin):
     async def popup(self, interaction: discord.Interaction,
                     server: app_commands.Transform[Server, utils.ServerTransformer(status=[Status.RUNNING])],
                     group: str, message: str, time: Optional[Range[int, 1, 30]] = -1):
-        server.sendPopupMessage(group, message, time, interaction.user.display_name)
+        await server.sendPopupMessage(group, message, time, interaction.user.display_name)
         # noinspection PyUnresolvedReferences
         await interaction.response.send_message(_('Message sent.'), ephemeral=utils.get_ephemeral(interaction))
 
@@ -975,7 +1065,12 @@ class Mission(Plugin):
         autorole = self.bot.locals.get('autorole', {}).get('linked')
         if autorole:
             try:
-                await member.add_roles(self.bot.get_role(autorole))
+                _role = self.bot.get_role(autorole)
+                if not _role:
+                    self.log.error(f'Role {autorole} not found!')
+                    await interaction.followup.send(_("Role {} not found!").format(autorole), ephemeral=True)
+                    return
+                await member.add_roles(_role)
             except discord.Forbidden:
                 await self.bot.audit(_('permission "Manage Roles" missing.'), user=self.bot.member)
         # Generate the onMemberLinked event
@@ -987,7 +1082,7 @@ class Mission(Plugin):
                 break
         else:
             server = None
-        self.bot.bus.send_to_node({
+        await self.bot.bus.send_to_node({
             "command": "rpc",
             "service": "ServiceBus",
             "method": "propagate_event",
@@ -1024,7 +1119,7 @@ class Mission(Plugin):
             await self.bot.audit(
                 f'unlinked member {utils.escape_string(member.display_name)} from ucid {ucid}',
                 user=interaction.user)
-            self.bot.bus.send_to_node({
+            await self.bot.bus.send_to_node({
                 "command": "rpc",
                 "service": "ServiceBus",
                 "method": "propagate_event",
@@ -1294,7 +1389,7 @@ class Mission(Plugin):
         async def send_token(token: str):
             await interaction.followup.send(
                 _("**Your secure TOKEN is: {token}**\n"
-                  "To link your user, type in the following into the DCS chat of one of our servers:"
+                  "To link your user, type in the following into the in-game chat of one of our DCS servers:"
                   "```{prefix}linkme {token}```\n\n"
                   "**The TOKEN will expire in 2 days!**").format(token=token, prefix=self.eventlistener.prefix),
                 ephemeral=True)
@@ -1302,21 +1397,26 @@ class Mission(Plugin):
         # noinspection PyUnresolvedReferences
         await interaction.response.defer(ephemeral=True)
         member = DataObjectFactory().new(Member, name=interaction.user.name, node=self.node, member=interaction.user)
-        if (utils.is_ucid(member.ucid) and member.verified and
-                not await utils.yn_question(interaction,
-                                            _("You already have a verified DCS account!\n"
-                                              "Are you sure you want to re-link your account? "
-                                              "(Ex: Switched from Steam to Standalone)"), ephemeral=True)):
-            await interaction.followup.send(_('Aborted.'))
-            return
-        elif member.ucid and not utils.is_ucid(member.ucid):
+        if member.ucid and not utils.is_ucid(member.ucid):
             await send_token(member.ucid)
             return
+        if utils.is_ucid(member.ucid) and member.verified:
+            if not await utils.yn_question(interaction,
+                                           _("You already have a verified DCS account!\n"
+                                             "Are you sure you want to re-link your account? "
+                                             "(Ex: Switched from Steam to Standalone)"), ephemeral=True):
+                await interaction.followup.send(_('Aborted.'))
+                return
+            member.unlink()
 
         # generate the TOKEN
         async with self.apool.connection() as conn:
             async with conn.transaction():
                 async with conn.cursor() as cursor:
+                    # in the unlikely event that we had a token already and a linked user
+                    await cursor.execute("""
+                        DELETE FROM players WHERE discord_id = %s AND length(ucid) = 4
+                    """, (interaction.user.id,))
                     # in the very unlikely event that we have generated the very same random number twice
                     while True:
                         try:
@@ -1362,7 +1462,7 @@ class Mission(Plugin):
                         for server in self.bot.servers.values():
                             if server.status not in [Status.PAUSED, Status.RUNNING, Status.STOPPED]:
                                 continue
-                            server.send_to_dcs({
+                            await server.send_to_dcs({
                                 "command": "unban",
                                 "ucid": row[0]
                             })
@@ -1380,7 +1480,7 @@ class Mission(Plugin):
         # might happen during a restart
         if not self.bot.member:
             return
-        for server_name, server in self.bot.servers.copy().items():
+        for server_name, server in self.bot.servers.items():
             if server.status == Status.UNREGISTERED:
                 continue
             try:
@@ -1391,24 +1491,33 @@ class Mission(Plugin):
                 if not channel:
                     channel = await self.bot.fetch_channel(server.channels[Channel.STATUS])
                 # name changes of the status channel will only happen with the correct permission
-                if channel.permissions_for(self.bot.member).manage_channels:
-                    name = channel.name
-                    # if the server owner leaves, the server is shut down
-                    if server.status in [Status.STOPPED, Status.SHUTDOWN, Status.LOADING]:
-                        if name.find('［') == -1:
-                            name = name + '［-］'
-                        else:
-                            name = re.sub('［.*］', f'［-］', name)
+                if not channel.permissions_for(self.bot.member).manage_channels:
+                    return
+                if channel.type == discord.ChannelType.forum:
+                    continue
+# TODO: Alternative implementation, if Discord decides to no longer use system messages for a thread rename
+#                    for thread in channel.threads:
+#                        if thread.name.startswith(server_name):
+#                            channel = thread
+#                            break
+#                    else:
+#                        continue
+                name = channel.name
+                if server.status in [Status.STOPPED, Status.SHUTDOWN, Status.LOADING, Status.SHUTTING_DOWN]:
+                    if name.find('［') == -1:
+                        name = name + '［-］'
                     else:
-                        players = server.get_active_players()
-                        current = len(players) + 1
-                        max_players = server.settings.get('maxPlayers') or 0
-                        if name.find('［') == -1:
-                            name = name + f'［{current}／{max_players}］'
-                        else:
-                            name = re.sub('［.*］', f'［{current}／{max_players}］', name)
-                    if name != channel.name:
-                        await channel.edit(name=name)
+                        name = re.sub('［.*］', f'［-］', name)
+                else:
+                    players = server.get_active_players()
+                    current = len(players) + 1
+                    max_players = server.settings.get('maxPlayers') or 0
+                    if name.find('［') == -1:
+                        name = name + f'［{current}／{max_players}］'
+                    else:
+                        name = re.sub('［.*］', f'［{current}／{max_players}］', name)
+                if name != channel.name:
+                    await channel.edit(name=name)
             except Exception as ex:
                 self.log.debug(f"Exception in update_channel_name() for server {server_name}", exc_info=str(ex))
 
@@ -1419,20 +1528,23 @@ class Mission(Plugin):
     @tasks.loop(minutes=1.0)
     async def afk_check(self):
         try:
-            for server in self.bot.servers.copy().values():
-                max_time = server.locals.get('afk_time', -1)
-                if max_time == -1:
+            for server in self.bot.servers.values():
+                config = server.locals.get('afk', {})
+                max_time = config.get('afk_time', -1)
+                if not config or max_time == -1 or server.status != Status.RUNNING:
                     continue
                 for ucid, dt in server.afk.items():
                     player = server.get_player(ucid=ucid, active=True)
-                    if (not player or player.has_discord_roles(['DCS Admin', 'GameMaster']) or
-                            player.ucid in self.get_config(server).get('afk_exemptions', [])):
+                    exemptions = config.get('exemptions', {})
+                    if 'discord' in exemptions:
+                        exemptions['discord'] = list(set(exemptions['discord']) | {"DCS Admin", "GameMaster"})
+                    if not player or player.check_exemptions(exemptions):
                         continue
                     if (datetime.now(timezone.utc) - dt).total_seconds() > max_time:
-                        msg = server.locals.get(
+                        msg = server.locals.get('afk', {}).get(
                             'message_afk', '{player.name}, you have been kicked for being AFK for more than {time}.'
                         ).format(player=player, time=utils.format_time(max_time))
-                        server.kick(player, msg)
+                        await server.kick(player, msg)
         except Exception as ex:
             self.log.exception(ex)
 
@@ -1448,7 +1560,7 @@ class Mission(Plugin):
         role = self.bot.get_role(self.bot.locals.get('autorole', {}).get('online'))
         if role:
             online_members: set[discord.Member] = set()
-            for server in self.bot.servers.copy().values():
+            for server in self.bot.servers.values():
                 for player in server.get_active_players():
                     if player.member:
                         online_members.add(player.member)
@@ -1476,93 +1588,24 @@ class Mission(Plugin):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        # ignore bot messages or messages that do not contain miz attachments
-        if message.author.bot or not message.attachments or not message.attachments[0].filename.endswith('.miz'):
-            return
-        # read the default config, if there is any
+        pattern = ['.miz']
         config = self.get_config().get('uploads', {})
+        if not MissionUploadHandler.is_valid(message, pattern, config.get('discord', self.bot.roles['DCS Admin'])):
+            return
         # check, if upload is enabled
         if not config.get('enabled', True):
+            self.log.debug("Mission upload is disabled!")
             return
-        # check if the user has the correct role to upload, defaults to DCS Admin
-        if not utils.check_roles(config.get('discord', self.bot.roles['DCS Admin']), message.author):
-            return
-        # check if the upload happens in the servers admin channel (if provided)
-        server: Server = self.bot.get_server(message, admin_only=True)
-        ctx = await self.bot.get_context(message)
+
+        # check, if we are in the correct channel
+        server = await MissionUploadHandler.get_server(message)
         if not server:
-            # check if there is a central admin channel configured
-            if self.bot.locals.get('admin_channel', 0) == message.channel.id:
-                try:
-                    server = await utils.server_selection(
-                        self.bus, ctx, title=_("To which server do you want to upload this mission to?"))
-                    if not server:
-                        await ctx.send(_('Upload aborted.'))
-                        return
-                except Exception as ex:
-                    self.log.exception(ex)
-                    return
-            else:
-                return
-        att = message.attachments[0]
+            return
+
         try:
-            rc = await server.uploadMission(att.filename, att.url)
-            if rc == UploadStatus.FILE_IN_USE:
-                if not await utils.yn_question(ctx, _('A mission is currently active.\n'
-                                                      'Do you want me to stop the DCS-server to replace it?')):
-                    await message.channel.send(_('Upload aborted.'))
-                    return
-            elif rc == UploadStatus.FILE_EXISTS:
-                if not await utils.yn_question(ctx, _('File exists. Do you want to overwrite it?')):
-                    await message.channel.send(_('Upload aborted.'))
-                    return
-            if rc != UploadStatus.OK:
-                if (await server.uploadMission(att.filename, att.url, force=True)) != UploadStatus.OK:
-                    await message.channel.send(_('Error while uploading: {}').format(rc.name))
-                    return
-
-            name = utils.escape_string(os.path.basename(att.filename)[:-4])
-            try:
-                if server.locals.get('autoscan', False):
-                    await message.channel.send(
-                        _('Mission "{mission}" uploaded to server {server}.\n'
-                          'As you have "autoscan" enabled, it might take some seconds to appear in your mission list.'
-                          ).format(mission=name, server=server.display_name))
-                    return
-                # get the real filename after the upload
-                filename = next((file for file in await server.getMissionList()
-                                 if os.path.basename(file) == os.path.basename(att.filename)), None)
-                if not filename:
-                    await message.channel.send(_('Error while uploading: File not found in severSettings.lua!'))
-                    return
-                await message.channel.send(_('Mission "{mission}" uploaded to server {server} and added.').format(
-                    mission=name, server=server.display_name))
-            finally:
-                await self.bot.audit(f'uploaded mission "{name}"', server=server, user=message.author)
-
-            if (server.status != Status.SHUTDOWN and server.current_mission and
-                    server.current_mission.filename != filename and
-                    await utils.yn_question(ctx, _('Do you want to load this mission?'))):
-                extensions = [
-                    x.name for x in server.extensions.values()
-                    if getattr(x, 'beforeMissionLoad').__module__ != 'core.extension'
-                ]
-                if len(extensions):
-                    modify = await utils.yn_question(ctx, _("Do you want to apply extensions before mission start?"))
-                else:
-                    modify = False
-                tmp = await message.channel.send(_('Loading mission {} ...').format(name))
-                try:
-                    await server.loadMission(filename, modify_mission=modify)
-                except (TimeoutError, asyncio.TimeoutError):
-                    await tmp.delete()
-                    await message.channel.send(_("Timeout while trying to load the mission."))
-                    await self.bot.audit(f"Timeout while trying to load mission {name}",
-                                         server=server)
-                    return
-                await self.bot.audit(f"loaded mission {name}", server=server, user=message.author)
-                await tmp.delete()
-                await message.channel.send(_('Mission {} loaded.').format(name))
+            handler = MissionUploadHandler(plugin=self, server=server, message=message, pattern=pattern)
+            base_dir = await handler.server.get_missions_dir()
+            await handler.upload(base_dir, ignore_list=['.dcssb', 'Saves', 'Scripts'])
         except Exception as ex:
             self.log.exception(ex)
         finally:

@@ -9,6 +9,7 @@ schema;master_schema:
         discord: {type: any}
         ucid: {type: any}
         slots: {type: int, range: {min: 1}}
+        message_server_full: { type: str }
     restricted:
       type: seq
       sequence:
@@ -23,6 +24,7 @@ schema;master_schema:
             costs: {type: int}
             crew: {type: int}
             VIP: {type: bool}
+            side: {type: int}
     payback: {type: bool}
 
 type: map

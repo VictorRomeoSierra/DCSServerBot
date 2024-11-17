@@ -9,19 +9,44 @@ from typing import Optional, TYPE_CHECKING
 if TYPE_CHECKING:
     from core import Server
 
-__all__ = ["Extension"]
+__all__ = [
+    "Extension",
+    "ExtensionException",
+    "InstallException",
+    "UninstallException"
+]
+
+
+class ExtensionException(Exception):
+    ...
+
+
+class InstallException(ExtensionException):
+    ...
+
+
+class UninstallException(ExtensionException):
+    ...
 
 
 class Extension(ABC):
+    started_schedulers = set()
+    CONFIG_DICT = {}
 
     def __init__(self, server: Server, config: dict):
         self.node = server.node
         self.log = logging.getLogger(__name__)
         self.pool = self.node.pool
+        self.loop = asyncio.get_event_loop()
         self.config: dict = config
         self.server: Server = server
         self.locals: dict = self.load_config()
         self.running = False
+        if self.__class__.__name__ not in Extension.started_schedulers:
+            schedule = getattr(self, 'schedule', None)
+            if schedule:
+                schedule.start()
+            Extension.started_schedulers.add(self.__class__.__name__)
 
     def load_config(self) -> Optional[dict]:
         return dict()
@@ -36,9 +61,6 @@ class Extension(ABC):
         # avoid race conditions
         if await asyncio.to_thread(self.is_running):
             return True
-        schedule = getattr(self, 'schedule', None)
-        if schedule and not schedule.is_running():
-            schedule.start()
         self.running = True
         self.log.info(f"  => {self.name} launched for \"{self.server.name}\".")
         return True
@@ -47,9 +69,6 @@ class Extension(ABC):
         # avoid race conditions
         if not self.is_running():
             return True
-        schedule = getattr(self, 'schedule', None)
-        if schedule and schedule.is_running():
-            schedule.cancel()
         self.running = False
         self.log.info(f"  => {self.name} shut down for \"{self.server.name}\".")
         return True
@@ -69,4 +88,10 @@ class Extension(ABC):
         raise NotImplementedError()
 
     def is_installed(self) -> bool:
+        return self.config.get('enabled', True)
+
+    async def install(self):
+        ...
+
+    async def uninstall(self):
         ...

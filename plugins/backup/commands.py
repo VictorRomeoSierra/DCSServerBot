@@ -2,10 +2,11 @@ import discord
 import os
 import re
 
-from core import Plugin, ServiceRegistry, command, utils, Node, YAMLError, get_translation
+from core import Plugin, ServiceRegistry, command, utils, Node, YAMLError, get_translation, PluginInstallationError
 from discord import app_commands
 from pathlib import Path
-from services import DCSServerBot, BackupService
+from services.bot import DCSServerBot
+from services.backup import BackupService
 
 # ruamel YAML support
 from ruamel.yaml import YAML
@@ -31,7 +32,7 @@ async def backup_autocomplete(interaction: discord.Interaction, current: str) ->
 
 async def date_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
     async def get_all_dates(node: Node, target: str) -> list[str]:
-        all_directories = await node.list_directory(target, f"{node.name.lower()}_*")
+        _, all_directories = await node.list_directory(target, pattern=f"{node.name.lower()}_*")
 
         date_pattern = re.compile(rf"{node.name.lower()}_([0-9]{{8}})")
         dates = []
@@ -55,6 +56,9 @@ class Backup(Plugin):
     def __init__(self, bot: DCSServerBot):
         super().__init__(bot)
         self.service = ServiceRegistry.get(BackupService)
+        if not self.locals:
+            raise PluginInstallationError(reason=f"No config/services/{self.plugin_name}.yaml file found!",
+                                          plugin=self.plugin_name)
 
     def read_locals(self) -> dict:
         if not os.path.exists('config/services/backup.yaml'):

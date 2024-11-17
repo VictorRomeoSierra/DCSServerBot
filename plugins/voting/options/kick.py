@@ -9,7 +9,7 @@ class Kick(VotableItem):
     def __init__(self, server: Server, config: dict, params: Optional[list[str]] = None):
         super().__init__('mission', server, config, params)
         if not params or not len(params):
-            raise TypeError("Usage: .vote kick <player name>")
+            raise TypeError("You have to provide a player name to kick!")
         self.player: Player = server.get_player(name=' '.join(params))
         if not self.player:
             raise ValueError('Player "{}" not found.'.format(' '.join(params)))
@@ -24,7 +24,7 @@ class Kick(VotableItem):
         if winner.startswith("Don't"):
             message = f"Player {self.player.name} not kicked."
         else:
-            self.server.kick(self.player, reason=f"Annoying people on the server")
+            await self.server.kick(self.player, reason=f"Annoying people on the server")
             message = f"Player {self.player.name} kicked."
-        self.server.sendChatMessage(Coalition.ALL, message)
-        self.server.sendPopupMessage(Coalition.ALL, message)
+        await self.server.sendChatMessage(Coalition.ALL, message)
+        await self.server.sendPopupMessage(Coalition.ALL, message)

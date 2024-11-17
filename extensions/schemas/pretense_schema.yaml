@@ -1,4 +1,0 @@
-schema;instance_pretense_schema:
-  type: map
-  mapping:
-    randomize: {type: bool}

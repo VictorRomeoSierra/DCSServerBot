@@ -1,7 +1,7 @@
 import asyncio
 import psycopg
 
-from core import EventListener, Plugin, Status, Server, Side, Player, event, chat_command
+from core import EventListener, Plugin, Status, Server, Side, Player, event
 from psycopg import Connection
 from typing import Union
 
@@ -44,11 +44,13 @@ class UserStatisticsEventListener(EventListener):
 
     def __init__(self, plugin: Plugin):
         super().__init__(plugin)
-        self.statistics = set()
+        self.active_servers: set[str] = set()
 
     async def processEvent(self, name: str, server: Server, data: dict) -> None:
         try:
-            if name in ['registerDCSServer', 'onMemberLinked', 'onMemberUnlinked'] or server.name in self.statistics:
+            if name in [
+                'registerDCSServer', 'onMemberLinked', 'onMemberUnlinked'
+            ] or server.name in self.active_servers:
                 await super().processEvent(name, server, data)
         except Exception as ex:
             self.log.exception(ex)
@@ -97,8 +99,9 @@ class UserStatisticsEventListener(EventListener):
     @event(name="registerDCSServer")
     async def registerDCSServer(self, server: Server, data: dict) -> None:
         if self.get_config(server).get('enabled', True):
-            self.statistics.add(server.name)
+            self.active_servers.add(server.name)
         else:
+            self.active_servers.discard(server.name)
             return
         if server.status == Status.STOPPED or not data['channel'].startswith('sync-') or 'current_mission' not in data:
             return
@@ -194,7 +197,7 @@ class UserStatisticsEventListener(EventListener):
 
     @event(name="disableUserStats")
     async def disableUserStats(self, server: Server, _: dict) -> None:
-        self.statistics.discard(server.name)
+        self.active_servers.discard(server.name)
         self.close_mission_stats(server)
 
     def _handle_disconnect_event(self, conn: Connection, server: Server, data: dict) -> None:
@@ -312,7 +315,7 @@ class UserStatisticsEventListener(EventListener):
             if 'highscore' in config:
                 # noinspection PyAsyncCall
                 # noinspection PyUnresolvedReferences
-                asyncio.create_task(self.plugin.render_highscore(config['highscore'], server, True))
+                asyncio.create_task(self.plugin.render_highscore(config['highscore'], server=server, mission_end=True))
 
     @event(name="onMemberLinked")
     async def onMemberLinked(self, server: Server, data: dict) -> None:
@@ -329,6 +332,9 @@ class UserStatisticsEventListener(EventListener):
                                 INSERT INTO squadron_members VALUES (%s, %s) 
                                 ON CONFLICT (squadron_id, player_ucid) DO NOTHING
                             """, (row[0], data['ucid']))
+                        if self.get_config().get('squadrons', {}).get('persist_list', False):
+                            # noinspection PyUnresolvedReferences
+                            await self.plugin.persist_squadron_list(row[0])
         except Exception as ex:
             self.log.exception(ex)
 
@@ -337,14 +343,16 @@ class UserStatisticsEventListener(EventListener):
         try:
             async with self.apool.connection() as conn:
                 async with conn.transaction():
-                    await conn.execute("""
-                        DELETE FROM squadron_members WHERE player_ucid = %s AND squadron_id IN (
-                            SELECT id FROM squadrons WHERE role IS NOT NULL
-                        ) 
-                    """, (data['ucid'], ))
+                    async for row in await conn.execute("""
+                        SELECT DISTINCT s.id FROM squadrons s, squadron_members sm 
+                        WHERE s.id = sm.squadron_id
+                        AND sm.player_ucid = %s
+                    """, (data['ucid'], )):
+                        await conn.execute("""
+                            DELETE FROM squadron_members WHERE squadron_id = %s AND player_ucid = %s 
+                        """, (row[0], data['ucid']))
+                        if self.get_config().get('squadrons', {}).get('persist_list', False):
+                            # noinspection PyUnresolvedReferences
+                            await self.plugin.persist_squadron_list(row[0])
         except Exception as ex:
             self.log.exception(ex)
-
-    @chat_command(name="highscore", help="displays the current mission highscore")
-    async def highscore(self, server: Server, player: Player, params: list[str]):
-        ...

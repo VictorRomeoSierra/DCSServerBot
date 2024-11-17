@@ -7,7 +7,7 @@ from core.listener import EventListener
 from core.services.registry import ServiceRegistry
 from datetime import datetime, timezone
 from discord.ext import commands
-from typing import Optional, Union, TYPE_CHECKING, Any, Iterable
+from typing import Optional, Union, TYPE_CHECKING, Any, Iterable, cast
 
 if TYPE_CHECKING:
     from core import Server, NodeImpl
@@ -18,7 +18,7 @@ __all__ = ["DCSServerBot"]
 class DCSServerBot(commands.Bot):
 
     def __init__(self, *args, **kwargs):
-        from services import ServiceBus
+        from services.servicebus import ServiceBus
 
         super().__init__(*args, **kwargs)
         self.version: str = kwargs['version']
@@ -32,7 +32,6 @@ class DCSServerBot(commands.Bot):
         self.bus = ServiceRegistry.get(ServiceBus)
         self.eventListeners: list[EventListener] = self.bus.eventListeners
         self.audit_channel = None
-        self.mission_stats = None
         self.member: Optional[discord.Member] = None
         self.lock: asyncio.Lock = asyncio.Lock()
         self.synced: bool = False
@@ -80,9 +79,8 @@ class DCSServerBot(commands.Bot):
             if not await self.load_plugin(plugin.lower()):
                 self.log.info(f'  => {plugin.title()} NOT loaded.')
         # cleanup remote servers (if any)
-        for key, value in self.bus.servers.copy().items():
-            if value.is_remote:
-                del self.bus.servers[key]
+        for key in [key for key, value in self.bus.servers.items() if value.is_remote]:
+            self.bus.servers.pop(key)
 
     async def load_plugin(self, plugin: str) -> bool:
         try:
@@ -98,7 +96,8 @@ class DCSServerBot(commands.Bot):
             if ex.original and isinstance(ex.original, PluginError):
                 self.log.error(f'  - {ex.original}')
             else:
-                self.log.error(f'  - Plugin "{plugin.title()} not loaded: {ex.original if ex.original else ex}')
+                exc = ex.original if ex.original else ex
+                self.log.error(f'  - Plugin "{plugin.title()} not loaded! {ex.name}: {exc}', exc_info=exc)
         except Exception as ex:
             self.log.exception(ex)
         return False
@@ -125,7 +124,7 @@ class DCSServerBot(commands.Bot):
             if not self.get_role(role):
                 self.log.error(f"  => Role {role} not found in your Discord!")
 
-    async def check_channel(self, channel_id: int) -> bool:
+    def check_channel(self, channel_id: int) -> bool:
         channel = self.get_channel(channel_id)
         if not channel:
             self.log.error(f'No channel with ID {channel_id} found!')
@@ -179,16 +178,16 @@ class DCSServerBot(commands.Bot):
         else:
             return None
 
-    async def check_channels(self, server: "Server"):
+    def check_channels(self, server: "Server"):
         channels = ['status', 'chat']
-        if not self.locals.get('admin_channel'):
+        if not self.locals.get('channels', {}).get('admin'):
             channels.append('admin')
         if server.locals.get('coalitions'):
             channels.extend(['red', 'blue'])
         for c in channels:
             channel_id = int(server.channels[Channel(c)])
             if channel_id != -1:
-                await self.check_channel(channel_id)
+                self.check_channel(channel_id)
 
     async def on_ready(self):
         try:
@@ -203,7 +202,7 @@ class DCSServerBot(commands.Bot):
                     raise FatalException()
                 elif not self.guilds:
                     raise FatalException("You need to invite your bot to a Discord server.")
-                self.member = await self.guilds[0].fetch_member(self.user.id)
+                self.member = self.guilds[0].get_member(self.user.id)
                 if not self.member:
                     raise FatalException("Can't access the bots user. Check your Discord server settings.")
                 self.log.debug('- Checking Roles & Channels ...')
@@ -211,16 +210,17 @@ class DCSServerBot(commands.Bot):
                 for role in ['Admin', 'DCS Admin', 'Alert', 'DCS', 'GameMaster']:
                     roles |= set(self.roles[role])
                 self.check_roles(roles)
-                if self.locals.get('admin_channel'):
-                    await self.check_channel(int(self.locals['admin_channel']))
+                admin_channel = self.locals.get('channels', {}).get('admin')
+                if admin_channel:
+                    self.check_channel(int(admin_channel))
                 for server in self.servers.values():
                     if server.locals.get('coalitions'):
                         roles.clear()
-                        roles |= set([x.strip() for x in server.locals['coalitions']['blue_role'].split(',')])
-                        roles |= set([x.strip() for x in server.locals['coalitions']['red_role'].split(',')])
+                        roles.add(server.locals['coalitions']['blue_role'])
+                        roles.add(server.locals['coalitions']['red_role'])
                         self.check_roles(roles)
                     try:
-                        await self.check_channels(server)
+                        self.check_channels(server)
                     except KeyError:
                         self.log.error(f"Mandatory channel(s) missing for server {server.name} in servers.yaml!")
 
@@ -240,8 +240,6 @@ class DCSServerBot(commands.Bot):
 
                 self.synced = True
                 self.log.info('- Discord Commands registered.')
-                if 'discord_status' in self.locals:
-                    await self.change_presence(activity=discord.Game(name=self.locals['discord_status']))
                 self.log.info('DCSServerBot MASTER started, accepting commands.')
                 await self.audit(message="Discord Bot started.")
             else:
@@ -300,10 +298,11 @@ class DCSServerBot(commands.Bot):
             return rc
 
     async def audit(self, message, *, user: Optional[Union[discord.Member, str]] = None,
-                    server: Optional["Server"] = None):
+                    server: Optional["Server"] = None, **kwargs):
         if not self.audit_channel:
-            if 'audit_channel' in self.locals:
-                self.audit_channel = self.get_channel(int(self.locals['audit_channel']))
+            audit_channel = self.locals.get('channels', {}).get('audit')
+            if audit_channel:
+                self.audit_channel = self.get_channel(int(audit_channel))
         if self.audit_channel:
             if not user:
                 member = self.member
@@ -314,14 +313,23 @@ class DCSServerBot(commands.Bot):
             embed = discord.Embed(color=discord.Color.blue())
             if member:
                 embed.set_author(name=member.name, icon_url=member.avatar)
-                embed.set_thumbnail(url=member.avatar)
-                embed.description = f'<@{member.id}> ' + message
+                if 'error' in kwargs:
+                    embed.set_thumbnail(url="https://github.com/Special-K-s-Flightsim-Bots/DCSServerBot/blob/master/images/warning.png?raw=true")
+                else:
+                    embed.set_thumbnail(url=member.avatar)
+                if member != self.member:
+                    embed.description = f'<@{member.id}> ' + message
+                else:
+                    embed.description = message
             else:
                 embed.description = message
             if isinstance(user, str):
                 embed.add_field(name='UCID', value=user)
             if server:
                 embed.add_field(name='Server', value=server.display_name)
+            if kwargs:
+                for name, value in kwargs.items():
+                    embed.add_field(name=name.title(), value=value, inline=False)
             embed.set_footer(text=datetime.now(timezone.utc).strftime("%y-%m-%d %H:%M:%S"))
             await self.audit_channel.send(embed=embed, allowed_mentions=discord.AllowedMentions(replied_user=False))
         async with self.apool.connection() as conn:
@@ -334,7 +342,7 @@ class DCSServerBot(commands.Bot):
                       user if isinstance(user, str) else None))
 
     def get_admin_channel(self, server: "Server") -> discord.TextChannel:
-        admin_channel = self.locals.get('admin_channel')
+        admin_channel = self.locals.get('channels', {}).get('admin')
         if not admin_channel:
             admin_channel = int(server.channels.get(Channel.ADMIN, -1))
         return self.get_channel(admin_channel)
@@ -399,7 +407,7 @@ class DCSServerBot(commands.Bot):
     def get_server(self, ctx: Union[discord.Interaction, discord.Message, str], *,
                    admin_only: Optional[bool] = False) -> Optional["Server"]:
         if len(self.servers) == 1:
-            if admin_only and int(self.locals.get('admin_channel', 0)) == ctx.channel.id:
+            if admin_only and int(self.locals.get('channels', {}).get('admin', 0)) == ctx.channel.id:
                 return list(self.servers.values())[0]
             elif not admin_only:
                 return list(self.servers.values())[0]
@@ -422,6 +430,9 @@ class DCSServerBot(commands.Bot):
     async def setEmbed(self, *, embed_name: str, embed: discord.Embed, channel_id: Union[Channel, int] = Channel.STATUS,
                        file: Optional[discord.File] = None, server: Optional["Server"] = None):
         async with self.lock:
+            # do not update any embed, if the session is closed already
+            if self.is_closed():
+                return
             if server and isinstance(channel_id, Channel):
                 channel_id = int(server.channels.get(channel_id, -1))
                 # we should not write to this channel
@@ -431,7 +442,12 @@ class DCSServerBot(commands.Bot):
                 channel_id = int(channel_id)
             channel = self.get_channel(channel_id)
             if not channel:
-                channel = await self.fetch_channel(channel_id)
+                try:
+                    channel = await self.fetch_channel(channel_id)
+                except discord.Forbidden:
+                    self.log.error("No permission to fetch channels!")
+                except Exception as ex:
+                    self.log.exception(ex)
             if not channel:
                 self.log.error(f"Channel {channel_id} not found, can't add or change an embed in there!")
                 return
@@ -439,7 +455,7 @@ class DCSServerBot(commands.Bot):
             async with self.apool.connection() as conn:
                 # check if we have a message persisted already
                 cursor = await conn.execute("""
-                    SELECT embed FROM message_persistence 
+                    SELECT embed, thread FROM message_persistence 
                     WHERE server_name = %s AND embed_name = %s
                 """, (server.name if server else 'Master', embed_name))
                 row = await cursor.fetchone()
@@ -447,23 +463,45 @@ class DCSServerBot(commands.Bot):
             message = None
             if row:
                 try:
-                    message = await channel.fetch_message(row[0])
-                    if not file:
-                        await message.edit(embed=embed)
+                    if channel.type == discord.ChannelType.forum:
+                        thread = cast(discord.ForumChannel, channel).get_thread(row[1])
+                        if thread:
+                            message = await thread.fetch_message(row[0])
                     else:
-                        await message.edit(embed=embed, attachments=[file])
+                        message = await channel.fetch_message(row[0])
+                    if message:
+                        if not file:
+                            await message.edit(embed=embed)
+                        else:
+                            await message.edit(embed=embed, attachments=[file])
                 except discord.errors.NotFound:
                     message = None
                 except discord.errors.DiscordException as ex:
                     self.log.warning(f"Error during update of embed {embed_name}: " + str(ex))
                     return
+                except Exception as ex:
+                    self.log.exception(ex)
+                    return
             if not row or not message:
-                message = await channel.send(embed=embed, file=file)
+                if channel.type == discord.ChannelType.forum:
+                    for thread in channel.threads:
+                        if thread.name.startswith(server.name):
+                            message = await thread.send(embed=embed, file=file)
+                            break
+                    else:
+                        thread = await channel.create_thread(name=server.name, auto_archive_duration=10080,
+                                                             embed=embed, file=file)
+                        message = thread.message
+                        thread = thread.thread
+                else:
+                    message = await channel.send(embed=embed, file=file)
+                    thread = None
                 async with self.apool.connection() as conn:
                     async with conn.transaction():
                         await conn.execute("""
-                            INSERT INTO message_persistence (server_name, embed_name, embed) 
-                            VALUES (%s, %s, %s) 
+                            INSERT INTO message_persistence (server_name, embed_name, embed, thread) 
+                            VALUES (%s, %s, %s, %s) 
                             ON CONFLICT (server_name, embed_name) 
-                            DO UPDATE SET embed=excluded.embed
-                        """, (server.name if server else 'Master', embed_name, message.id))
+                            DO UPDATE SET embed=excluded.embed, thread=excluded.thread
+                        """, (server.name if server else 'Master', embed_name, message.id,
+                              thread.id if thread else None))

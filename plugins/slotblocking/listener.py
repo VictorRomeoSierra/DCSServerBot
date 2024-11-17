@@ -22,17 +22,17 @@ class SlotBlockingListener(EventListener):
         config: dict = self.plugin.get_config(server, use_cache=False)
         if config:
             self._migrate_roles(config)
-            server.send_to_dcs({
+            await server.send_to_dcs({
                 'command': 'loadParams',
                 'plugin': self.plugin_name,
                 'params': config
             })
-            guild = self.bot.guilds[0]
             roles = []
             for role in config.get('VIP', {}).get('discord', []):
                 roles.append(self.bot.get_role(role))
             if not roles:
                 return
+            guild = self.bot.guilds[0]
             # get all linked members
             async with self.apool.connection() as conn:
                 cursor = await conn.execute("""
@@ -50,12 +50,12 @@ class SlotBlockingListener(EventListener):
                             'roles': [x.id for x in member.roles]
                         })
                     if len(batch) >= 25:
-                        server.send_to_dcs({'command': 'uploadUserRoles', 'batch': batch})
+                        await server.send_to_dcs({'command': 'uploadUserRoles', 'batch': batch})
                         batch = []
 
                 # Send remaining users, if any
                 if batch:
-                    server.send_to_dcs({'command': 'uploadUserRoles', 'batch': batch})
+                    await server.send_to_dcs({'command': 'uploadUserRoles', 'batch': batch})
 
     @event(name="registerDCSServer")
     async def registerDCSServer(self, server: Server, data: dict) -> None:
@@ -76,8 +76,9 @@ class SlotBlockingListener(EventListener):
             is_unit_type = unit.get('unit_type') == player.unit_type
             is_unit_name = unit.get('unit_name') in player.unit_name
             is_group_name = unit.get('group_name') in player.group_name
+            side = unit.get('side', player.side) == player.side
 
-            if is_unit_type or is_unit_name or is_group_name:
+            if side and (is_unit_type or is_unit_name or is_group_name):
                 is_player_slot = player.sub_slot == 0 and 'points' in unit
                 is_crew_slot = player.sub_slot > 0 and 'crew' in unit
 
@@ -207,8 +208,9 @@ class SlotBlockingListener(EventListener):
             else:
                 player.deposit = 0
                 if player.points < self._get_costs(server, player):
-                    server.move_to_spectators(player,
-                                              reason="You do not have enough credits to use this slot anymore.")
+                    # noinspection PyAsyncCall
+                    asyncio.create_task(server.move_to_spectators(
+                        player, reason="You do not have enough credits to use this slot anymore."))
         elif data['eventName'] == 'landing':
             # payback on landing
             player: CreditPlayer = cast(CreditPlayer, server.get_player(id=data['arg1']))
@@ -230,4 +232,6 @@ class SlotBlockingListener(EventListener):
             player: CreditPlayer = cast(CreditPlayer, server.get_player(id=data['arg1']))
             player.deposit = 0
             if player.points < self._get_costs(server, player):
-                server.move_to_spectators(player, reason="You do not have enough credits to use this slot anymore.")
+                # noinspection PyAsyncCall
+                asyncio.create_task(server.move_to_spectators(
+                    player, reason="You do not have enough credits to use this slot anymore."))

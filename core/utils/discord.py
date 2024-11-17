@@ -1,18 +1,22 @@
 from __future__ import annotations
+
 import asyncio
 import discord
 import functools
+import logging
 import os
 import re
 
 from core import Status, utils
+from core.data.node import SortOrder, UploadStatus
+from core.services.registry import ServiceRegistry
+from core.translations import get_translation
 from datetime import datetime
 from discord import app_commands, Interaction, SelectOption
 from discord.ext import commands
-from discord.ui import Button, View, Select
+from discord.ui import Button, View, Select, Item, Modal, TextInput
 from enum import Enum, auto
 from fuzzywuzzy import fuzz
-from io import BytesIO
 from psycopg.rows import dict_row
 from typing import Optional, cast, Union, TYPE_CHECKING, Iterable, Any, Callable
 
@@ -20,10 +24,12 @@ from .helper import get_all_players, is_ucid, format_string
 
 if TYPE_CHECKING:
     from core import Server, Player, Node, Instance, Plugin, Command
-    from services import DCSServerBot, ServiceBus
+    from services.bot import DCSServerBot
+    from services.servicebus import ServiceBus
 
 
 __all__ = [
+    "DISCORD_FILE_SIZE_LIMIT",
     "PlayerType",
     "wait_for_single_reaction",
     "selection_list",
@@ -60,8 +66,19 @@ __all__ = [
     "get_squadron",
     "server_selection",
     "get_ephemeral",
-    "get_command"
+    "get_command",
+    "ConfigModal",
+    "DirectoryPicker",
+    "NodeUploadHandler",
+    "ServerUploadHandler"
 ]
+
+# Internationalisation
+_ = get_translation('core')
+# Logging
+logger = logging.getLogger(__name__)
+
+DISCORD_FILE_SIZE_LIMIT = 10 * 1024 * 1024
 
 
 class PlayerType(Enum):
@@ -266,6 +283,9 @@ class YNQuestionView(View):
         self.result = False
         self.stop()
 
+    async def on_error(self, interaction: Interaction, error: Exception, item: Item[Any], /) -> None:
+        interaction.client.log.exception(error)
+
 
 async def yn_question(ctx: Union[commands.Context, discord.Interaction], question: str,
                       message: Optional[str] = None, ephemeral: Optional[bool] = True) -> bool:
@@ -443,7 +463,11 @@ def cmd_has_roles(roles: list[str]):
     def predicate(interaction: Interaction) -> bool:
         valid_roles = []
         for role in roles:
-            valid_roles.extend(interaction.client.roles[role])
+            mappings = interaction.client.roles.get(role)
+            if mappings:
+                valid_roles.extend(mappings)
+            else:
+                valid_roles.append(role)
         return check_roles(set(valid_roles), interaction.user)
 
     @functools.wraps(predicate)
@@ -724,19 +748,15 @@ def embed_to_simpletext(embed: discord.Embed) -> str:
 
 
 def create_warning_embed(title: str, text: Optional[str] = None,
-                         fields: Optional[list[tuple[str, str]]] = None) -> tuple[discord.Embed, discord.File]:
+                         fields: Optional[list[tuple[str, str]]] = None) -> discord.Embed:
     embed = discord.Embed(title=title, color=discord.Color.yellow())
     if text:
         embed.description = text
-    with open("images/warning.png", mode="rb") as img:
-        img_bytes = img.read()
-    buffer = BytesIO(img_bytes)
-    file = discord.File(fp=buffer, filename="warning.png")
-    embed.set_thumbnail(url="attachment://warning.png")
+    embed.set_thumbnail(url="https://github.com/Special-K-s-Flightsim-Bots/DCSServerBot/blob/master/images/warning.png?raw=true")
     if fields:
         for name, value in fields:
             embed.add_field(name=name, value=value)
-    return embed, file
+    return embed
 
 
 def escape_string(msg: str) -> str:
@@ -750,7 +770,7 @@ def escape_string(msg: str) -> str:
     return re.sub(r"([\\_*~`|>#+\-={}!.\[\]()])", r"\\\1", msg)
 
 
-def print_ruler(*, ruler_length: Optional[int] = 34, header: Optional[str] = None) -> str:
+def print_ruler(*, ruler_length: Optional[int] = 34, header: Optional[str] = '') -> str:
     if header:
         header = ' ' + header + ' '
     filler = int((ruler_length - len(header) / 2.5) / 2)
@@ -903,7 +923,7 @@ class NodeTransformer(app_commands.Transformer):
     """
     async def transform(self, interaction: discord.Interaction, value: Optional[str]) -> Node:
         if value:
-            return next(x.node for x in interaction.client.servers.values() if x.node.name == value)
+            return next((x.node for x in interaction.client.servers.values() if x.node.name == value), None)
         else:
             return interaction.client.node
 
@@ -936,7 +956,7 @@ class InstanceTransformer(app_commands.Transformer):
             node: Node = await NodeTransformer().transform(interaction, get_interaction_param(interaction, 'node'))
             if not node:
                 return None
-            return next(x for x in node.instances if x.name == value)
+            return next((x for x in node.instances if x.name == value), None)
         elif len(interaction.client.node.instances) == 1:
             return interaction.client.node.instances[0]
         else:
@@ -952,7 +972,7 @@ class InstanceTransformer(app_commands.Transformer):
             if self.unused:
                 instances = [
                     instance for server_name, instance in await node.find_all_instances()
-                    if instance not in node.instances
+                    if not any(instance == x.name for x in node.instances)
                 ]
             else:
                 instances = [x.name for x in node.instances]
@@ -973,7 +993,7 @@ async def airbase_autocomplete(interaction: discord.Interaction, current: str) -
         return []
     try:
         server: Server = await ServerTransformer().transform(interaction, get_interaction_param(interaction, 'server'))
-        if not server:
+        if not server or not server.current_mission:
             return []
         choices: list[app_commands.Choice[int]] = [
             app_commands.Choice(name=x['name'], value=idx)
@@ -996,12 +1016,13 @@ async def mission_autocomplete(interaction: discord.Interaction, current: str) -
         server: Server = await ServerTransformer().transform(interaction, get_interaction_param(interaction, 'server'))
         if not server:
             return []
+        base_dir = await server.get_missions_dir()
         choices: list[app_commands.Choice[int]] = [
-            app_commands.Choice(name=os.path.basename(x)[:-4], value=idx)
-            for idx, x in enumerate(await server.getMissionList())
-            if not current or current.casefold() in x[:-4].casefold()
+            app_commands.Choice(name=os.path.relpath(x, base_dir).replace('.dcssb' + os.path.sep, '')[:-4], value=idx)
+            for idx, x in enumerate(server.settings['missionList'])
+            if not current or current.casefold() in os.path.relpath(x, base_dir)[:-4].casefold()
         ]
-        return choices[:25]
+        return sorted(choices, key=lambda choice: choice.name)[:25]
     except Exception as ex:
         interaction.client.log.exception(ex)
 
@@ -1052,10 +1073,12 @@ class UserTransformer(app_commands.Transformer):
     - sel_type: The type of user to select. Default is PlayerType.ALL.
     - linked: Optional boolean value to specify whether to select only linked users. Default is None.
     """
-    def __init__(self, *, sel_type: PlayerType = PlayerType.ALL, linked: Optional[bool] = None):
+    def __init__(self, *, sel_type: PlayerType = PlayerType.ALL, linked: Optional[bool] = None,
+                 watchlist: Optional[bool] = None):
         super().__init__()
         self.sel_type = sel_type
         self.linked = linked
+        self.watchlist = watchlist
 
     async def transform(self, interaction: discord.Interaction, value: str) -> Optional[Union[discord.Member, str]]:
         if value:
@@ -1079,7 +1102,7 @@ class UserTransformer(app_commands.Transformer):
             ret.extend([
                 app_commands.Choice(name='✈ ' + name + (' (' + ucid + ')' if show_ucid else ''),
                                     value=ucid)
-                for ucid, name in get_all_players(interaction.client, self.linked)
+                for ucid, name in get_all_players(interaction.client, self.linked, self.watchlist)
                 if not current or current.casefold() in name.casefold() or current.casefold() in ucid
             ])
         if (self.linked is None or self.linked) and self.sel_type in [PlayerType.ALL, PlayerType.MEMBER]:
@@ -1190,8 +1213,8 @@ def get_ephemeral(interaction: discord.Interaction) -> bool:
     # we will be ephemeral when we are called in public
     if not server:
         return True
-    channel = bot.get_admin_channel(server)
-    return not channel == interaction.channel
+    admin_channel = bot.get_admin_channel(server)
+    return not admin_channel == interaction.channel
 
 
 async def get_command(bot: DCSServerBot, *, name: str,
@@ -1205,3 +1228,320 @@ async def get_command(bot: DCSServerBot, *, name: str,
                     return inner
         elif cmd.name == name:
             return cmd
+
+
+class ConfigModal(Modal):
+    def __init__(self, title: str, config: dict, default: Optional[dict] = None, ephemeral: Optional[bool] = False):
+        super().__init__(title=title)
+        self.ephemeral = ephemeral
+        self.value = None
+        self.config = config
+        if not default:
+            default = {}
+        for k, v in self.config.items():
+            self.add_item(TextInput(custom_id=k,
+                                    label=v.get('label'),
+                                    style=discord.TextStyle(v.get('style', 1)),
+                                    placeholder=v.get('placeholder'),
+                                    default=str(default.get(k)) if default.get(k) is not None else "",
+                                    required=v.get('required', False),
+                                    min_length=v.get('min_length'),
+                                    max_length=v.get('max_length')))
+
+    @staticmethod
+    def unmap(value: str, t: str = None) -> Any:
+        if not t or t == str:
+            return value
+        elif t == int:
+            return int(value)
+        elif t == float:
+            return float(value)
+        elif t == bool:
+            if value.lower() == 'true':
+                return True
+            elif value.lower() == 'false':
+                return False
+            else:
+                raise ValueError(f"{value} is not a boolean!")
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        # noinspection PyUnresolvedReferences
+        await interaction.response.defer(ephemeral=self.ephemeral)
+        self.value = {
+            v.custom_id: self.unmap(v.value, self.config[v.custom_id].get('type')) if v.value else v.default
+            for v in self.children
+        }
+        self.stop()
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        # noinspection PyUnresolvedReferences
+        await interaction.response.send_message(f"An error occurred: {error}")
+        self.stop()
+
+
+class DirectoryPicker(discord.ui.View):
+
+    def __init__(self, node: Node, base_dir: str, ignore: Optional[list[str]] = None):
+        super().__init__()
+        self.node = node
+        self.base_dir = base_dir
+        self.dir = None
+        self.ignore = ignore or []
+
+    @property
+    def directory(self) -> str:
+        if self.dir:
+            return os.path.join(self.base_dir, self.dir)
+        else:
+            return self.base_dir
+
+    @property
+    def rel_path(self) -> str:
+        rel_dir = os.path.basename(self.base_dir)
+        if self.dir:
+            rel_dir = os.path.join(rel_dir, self.dir)
+        return rel_dir
+
+    async def render(self, init=False) -> Optional[discord.Embed]:
+        embed = discord.Embed(color=discord.Color.blue())
+        embed.title = f"Current Directory: {self.rel_path}"
+        if await self.create_select():
+            options = cast(Select, self.children[0]).options
+            embed.description = (
+                "Your directory contains sub-directories:\n"
+                "```"
+                f"\n{os.path.basename(self.rel_path)}"
+                "\n{}"
+                "\n```"
+            ).format(
+                '\n'.join(
+                    [
+                        f"{'├' if i < len(options) - 1 else '└'} {x.label}"
+                        for i, x in enumerate(options)
+                    ]
+                )
+            )
+            self.children[0].disabled = False
+        elif not init:
+            self.children[0].disabled = True
+        else:
+            self.children[0].disabled = True
+            embed = None
+        self.children[2].disabled = not self.dir
+        return embed
+
+    async def create_select(self) -> bool:
+        _, sub_dirs = await self.node.list_directory(self.directory, is_dir=True, ignore=self.ignore,
+                                                     order=SortOrder.NAME)
+        select = cast(Select, self.children[0])
+        if sub_dirs:
+            select.options = [
+                SelectOption(label=os.path.basename(x), value=x)
+                for x in sub_dirs if os.path.basename(x)
+            ]
+            return True
+        else:
+            select.options = [SelectOption(label="None", value="None")]
+            return False
+
+    async def refresh(self, interaction: discord.Interaction) -> None:
+        embed = await self.render()
+        if interaction.message:
+            await interaction.message.edit(view=self, embed=embed)
+        else:
+            await interaction.edit_original_response(view=self, embed=embed)
+
+    @discord.ui.select(min_values=0, max_values=1, placeholder="Pick a directory ...")
+    async def on_select(self, interaction: discord.Interaction, select: Select):
+        try:
+            # noinspection PyUnresolvedReferences
+            await interaction.response.defer()
+            self.dir = os.path.relpath(select.values[0], self.base_dir)
+            await self.refresh(interaction)
+        except Exception as ex:
+            interaction.client.log.exception(ex)
+
+    @discord.ui.button(label="Upload", style=discord.ButtonStyle.green, row=2)
+    async def on_upload(self, interaction: discord.Interaction, button: Button):
+        # noinspection PyUnresolvedReferences
+        await interaction.response.defer()
+        self.stop()
+
+    @discord.ui.button(label="Up", style=discord.ButtonStyle.secondary)
+    async def on_up(self, interaction: discord.Interaction, button: Button):
+        # noinspection PyUnresolvedReferences
+        await interaction.response.defer()
+        if self.dir:
+            self.dir = os.path.dirname(self.dir)
+            await self.refresh(interaction)
+
+    @discord.ui.button(label="Create", style=discord.ButtonStyle.primary)
+    async def on_create(self, interaction: discord.Interaction, button: Button):
+        class TextModal(Modal, title="Create Directory"):
+            name = TextInput(label="Name", max_length=80, required=True)
+
+            async def on_submit(derived, interaction: discord.Interaction) -> None:
+                # noinspection PyUnresolvedReferences
+                await interaction.response.defer()
+                derived.stop()
+
+        modal = TextModal()
+        # noinspection PyUnresolvedReferences
+        await interaction.response.send_modal(modal)
+        if not await modal.wait():
+            new_name = re.sub(r'[\\/\.]', '', modal.name.value)
+            await self.node.create_directory(os.path.join(self.directory, new_name))
+            if self.dir:
+                self.dir = os.path.join(self.dir, new_name)
+            else:
+                self.dir = modal.name.value
+            await self.refresh(interaction)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.red, row=2)
+    async def on_cancel(self, interaction: discord.Interaction, button: Button):
+        # noinspection PyUnresolvedReferences
+        await interaction.response.defer()
+        self.base_dir = self.dir = None
+        self.stop()
+
+
+class UploadView(DirectoryPicker):
+
+    def __init__(self, node: Node, base_dir: str, ignore: Optional[list[str]] = None):
+        super().__init__(node, base_dir, ignore)
+        self.overwrite = False
+
+    async def render(self, init=False) -> Optional[discord.Embed]:
+        embed = await super().render(init)
+        if 'Overwrite' not in cast(Button, self.children[-1]).label:
+            button = Button(label="❌ Overwrite")
+            button.callback = self.on_overwrite
+            self.add_item(button)
+        return embed
+
+    async def on_overwrite(self, interaction: discord.Interaction):
+        # noinspection PyUnresolvedReferences
+        await interaction.response.defer()
+        self.overwrite = not self.overwrite
+        cast(Button, self.children[-1]).label = '✔️ Overwrite' if self.overwrite else '❌ Overwrite'
+        await interaction.edit_original_response(view=self)
+
+
+class NodeUploadHandler:
+
+    def __init__(self, node: Node, message: discord.Message, pattern: list[str]):
+        from services.bot import BotService
+
+        self.node = node
+        self.message = message
+        self.channel = message.channel
+        self.log = node.log
+        self.bot = ServiceRegistry.get(BotService).bot
+        self.pattern = pattern
+        self.overwrite = False
+
+    @staticmethod
+    def is_valid(message: discord.Message, pattern: list[str], roles: list[Union[int, str]]) -> bool:
+        # ignore bot messages or messages that do not contain miz attachments
+        if (message.author.bot or not message.attachments or
+                not any(att.filename.lower().endswith(ext) for ext in pattern for att in message.attachments)):
+            return False
+        # check if the user has the correct role to upload, defaults to DCS Admin
+        if not utils.check_roles(roles, message.author):
+            return False
+        return True
+
+    async def render(self, directory: str, ignore_list: Optional[list[str]] = None) -> Optional[str]:
+        # do we have multiple sub-directories to upload to?
+        view = UploadView(self.node, directory, ignore=ignore_list)
+        embed = await view.render(init=True) or discord.utils.MISSING
+        try:
+            msg = await self.channel.send(embed=embed, view=view)
+        except Exception as ex:
+            return
+        try:
+            if await view.wait():
+                await self.channel.send(_('Upload aborted.'))
+                return None
+            directory = view.directory
+            self.overwrite = view.overwrite
+            if not directory:
+                await self.channel.send(_('Upload aborted.'))
+                return None
+        finally:
+            await msg.delete()
+        return directory
+
+    async def upload_file(self, directory: str, att: discord.Attachment) -> UploadStatus:
+        self.log.debug(f"Uploading {att.filename} to {self.node.name}:{directory} ...")
+        filename = os.path.join(directory, att.filename)
+        if not self.overwrite:
+            rc = await self.node.write_file(filename, att.url, overwrite=False)
+            if rc == UploadStatus.FILE_EXISTS:
+                self.log.debug("File exists, asking for overwrite.")
+                ctx = await self.bot.get_context(self.message)
+                if not await utils.yn_question(ctx, _('File exists. Do you want to overwrite it?')):
+                    await self.channel.send(_('Upload aborted.'))
+                    return rc
+                rc = await self.node.write_file(filename, att.url, overwrite=True)
+        else:
+            rc = await self.node.write_file(filename, att.url, overwrite=True)
+        if rc != UploadStatus.OK:
+            self.log.debug(f"Error while uploading: {rc}")
+            await self.channel.send(_('Error while uploading: {}').format(rc.name))
+        return rc
+
+    async def handle_attachment(self, directory: str, att: discord.Attachment) -> UploadStatus:
+        rc = await self.upload_file(directory, att)
+        if rc == UploadStatus.OK:
+            await self.channel.send(_("File {} uploaded.").format(utils.escape_string(att.filename)))
+            await self.bot.audit(f'uploaded file "{utils.escape_string(att.filename)}"',
+                                 node=self.node, user=self.message.author)
+        return rc
+
+    async def post_upload(self, uploaded: list[discord.Attachment]):
+        ...
+
+    async def upload(self, base_dir: str, ignore_list: Optional[list[str]] = None):
+        directory = await self.render(base_dir, ignore_list)
+        if not directory:
+            return
+
+        attachments = [
+            att for att in self.message.attachments
+            if any(att.filename.lower().endswith(ext) for ext in self.pattern)
+        ]
+        # run all uploads in parallel
+        tasks = [self.handle_attachment(directory, att) for att in attachments]
+        ret_vals = await asyncio.gather(*tasks)
+
+        uploaded = []
+        for idx, ret in enumerate(ret_vals):
+            if ret == UploadStatus.OK:
+                uploaded.append(attachments[idx])
+
+        # handle aftermath
+        await self.post_upload(uploaded)
+
+
+class ServerUploadHandler(NodeUploadHandler):
+
+    def __init__(self, server: Server, message: discord.Message, pattern: list[str]):
+        super().__init__(server.node, message, pattern)
+        self.server = server
+
+    @staticmethod
+    async def get_server(message: discord.Message) -> Optional[Server]:
+        from services.bot import BotService
+        from services.servicebus import ServiceBus
+
+        bot = ServiceRegistry.get(BotService).bot
+        server = bot.get_server(message)
+        if not server and message.channel.id == bot.locals.get('channels', {}).get('admin'):
+            bus = ServiceRegistry.get(ServiceBus)
+            ctx = await bot.get_context(message)
+            server = await utils.server_selection(bus, ctx, title=_("To which server do you want to upload?"))
+            if not server:
+                await ctx.send(_('Upload aborted.'))
+                return None
+        return server

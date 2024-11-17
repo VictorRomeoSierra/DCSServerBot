@@ -7,7 +7,7 @@ from discord import app_commands, Interaction
 from discord.ui import View, Select, Button, Modal, TextInput, Item
 from functools import cache
 from io import BytesIO
-from services import DCSServerBot
+from services.bot import DCSServerBot
 from typing import cast, Optional, Literal, Any
 
 from .listener import HelpListener
@@ -314,6 +314,8 @@ _ _
                 await interaction.response.defer()
 
         if fmt == 'xls':
+            # noinspection PyUnresolvedReferences
+            await interaction.response.defer()
             discord_commands = (await self.discord_commands_to_df(interaction)).sort_values(['Plugin', 'Command'])
             ingame_commands = (await self.ingame_commands_to_df()).sort_values(['Plugin', 'Command'])
             output = BytesIO()
@@ -339,7 +341,7 @@ _ _
 
             output.seek(0)
             # noinspection PyUnresolvedReferences
-            await interaction.response.send_message(file=discord.File(fp=output, filename='DCSSB-Commands.xlsx'))
+            await interaction.followup.send(file=discord.File(fp=output, filename='DCSSB-Commands.xlsx'))
         elif role:
             modal = DocModal(role=role)
             # noinspection PyUnresolvedReferences
@@ -364,37 +366,40 @@ _ _
             await interaction.response.send_message(_("Please provide a role for channel output."), ephemeral=True)
 
     async def server_info_to_df(self) -> pd.DataFrame:
-        df = pd.DataFrame(columns=['Node', 'Instance', 'Name', 'Password', 'Max Players', 'DCS Port', 'Bot Port'])
+        columns = ['Node', 'Instance', 'Name', 'Password', 'Max Players', 'DCS Port', 'Bot Port']
+        df = pd.DataFrame(columns=columns)
+
         for server in self.bus.servers.values():
-            data_df = pd.DataFrame(
-                [(server.node.name, server.instance.name, server.name, server.settings.get('password'),
-                  server.settings.get('maxPlayers', 16), server.instance.dcs_port, server.instance.bot_port)],
-                columns=df.columns)
-            index = data_df.columns.get_loc('DCS Port') + 1
+            server_dict = {
+                'Node': server.node.name,
+                'Instance': server.instance.name,
+                'Name': server.name,
+                'Password': server.settings.get('password'),
+                'Max Players': server.settings.get('maxPlayers', 16),
+                'DCS Port': server.instance.dcs_port,
+                'Bot Port': server.instance.bot_port
+            }
+
             for ext in server.extensions.values():
                 if ext.name == 'SRS':
-                    data_df.insert(index, 'SRS Port', ext.locals['Server Settings'].get('SERVER_PORT', 5002), True)
-                    index += 1
+                    server_dict['SRS Port'] = ext.locals['Server Settings'].get('SERVER_PORT', 5002)
                 elif ext.name == 'Tacview':
-                    data_df.insert(index, 'Tacview Port', ext.locals.get('tacviewRealTimeTelemetryPort', 42674), True)
-                    index += 1
+                    server_dict['Tacview Port'] = ext.locals.get('tacviewRealTimeTelemetryPort', 42674)
                     if ext.locals.get('tacviewRemoteControlEnabled', False):
-                        data_df.insert(index, 'Tacview Remote Control',
-                                       ext.locals.get('tacviewRemoteControlPort', 42675), True)
-                        index += 1
+                        server_dict['Tacview Remote Control'] = ext.locals.get('tacviewRemoteControlPort', 42675)
                 elif ext.name == 'LotAtc':
-                    data_df.insert(index, 'LotAtc Port', ext.locals.get('port', 10310), True)
-                    index += 1
+                    server_dict['LotAtc Port'] = ext.locals.get('port', 10310)
                 elif ext.name == 'DCS Olympus':
-                    data_df.insert(index, 'Olympus Client', ext.config.get('client', {}).get('port', 3000), True)
-                    data_df.insert(index + 1, 'Olympus Server', ext.config.get('server', {}).get('port', 3001), True)
-                    index += 2
+                    server_dict['Olympus Client'] = ext.config.get(ext.frontend_tag, {}).get('port', 3000)
+                    server_dict['Olympus Server'] = ext.config.get(ext.backend_tag, {}).get('port', 3001)
                 elif ext.name == 'Sneaker':
                     port = ext.config['bind'].split(':')[1]
-                    data_df.insert(index, 'Sneaker Port', port, True)
-                    index += 1
+                    server_dict['Sneaker Port'] = port
 
+            data_df = pd.DataFrame([server_dict])
             df = pd.concat([df, data_df], ignore_index=True)
+
+        df = df[columns + [col for col in df.columns if col not in columns]]
         return df
 
     async def generate_server_docs(self, interaction: discord.Interaction):

@@ -1,6 +1,6 @@
-local base 		= _G
+local base 	= _G
 local Terrain   = base.require('terrain')
-local UC   		= base.require("utils_common")
+local UC   	= base.require("utils_common")
 local Weather   = base.require('Weather')
 local dcsbot	= base.dcsbot
 local config	= base.require("DCSServerBotConfig")
@@ -43,27 +43,34 @@ function dcsbot.registerDCSServer(json)
         -- weather
         msg.weather = {}
         -- slots
-		num_slots_red = 0
-		dcsbot.red_slots = {}
-		for k,v in pairs(DCS.getAvailableSlots("red")) do
-			dcsbot.red_slots[v.unitId] = v
-			num_slots_red = num_slots_red + 1
-		end
+        num_slots_red = 0
+        local availableSlots = DCS.getAvailableSlots("red")
+        dcsbot.red_slots = {}
+        if availableSlots ~= nil then
+            for k,v in pairs(availableSlots) do
+                dcsbot.red_slots[v.unitId] = v
+                num_slots_red = num_slots_red + 1
+            end
+        end
 
-		num_slots_blue = 0
-		dcsbot.blue_slots = {}
-		for k,v in pairs(DCS.getAvailableSlots("blue")) do
-			dcsbot.blue_slots[v.unitId] = v
-			num_slots_blue = num_slots_blue + 1
-		end
+        num_slots_blue = 0
+        availableSlots = DCS.getAvailableSlots("blue")
+        dcsbot.blue_slots = {}
+        if availableSlots ~= nil then
+            for k,v in pairs(availableSlots) do
+                dcsbot.blue_slots[v.unitId] = v
+                num_slots_blue = num_slots_blue + 1
+            end
+        end
 
-		msg.num_slots_blue = num_slots_blue
-		msg.num_slots_red = num_slots_red
+        msg.num_slots_blue = num_slots_blue
+        msg.num_slots_red = num_slots_red
         -- players
         msg.players = {}
         plist = net.get_player_list()
         for i = 1, table.getn(plist) do
             msg.players[i] = net.get_player_info(plist[i])
+            msg.players[i].ipaddr = utils.getIP(msg.players[i].ipaddr)
             msg.players[i].unit_type, msg.players[i].slot, msg.players[i].sub_slot = utils.getMulticrewAllParameters(plist[i])
             msg.players[i].unit_name = DCS.getUnitProperty(msg.players[i].slot, DCS.UNIT_NAME)
             msg.players[i].unit_display_name = DCS.getUnitTypeAttribute(DCS.getUnitType(msg.players[i].slot), "DisplayName")
@@ -125,6 +132,7 @@ function dcsbot.getMissionUpdate(json)
 end
 
 function dcsbot.getAirbases(json)
+    log.write('DCSServerBot', log.DEBUG, 'Mission: getAirbases()')
     local msg = {
         command = 'getAirbases',
         airbases = {}
@@ -192,32 +200,37 @@ end
 function dcsbot.startMission(json)
     log.write('DCSServerBot', log.DEBUG, 'Mission: startMission()')
     if json.id ~= nil then
-        net.missionlist_run(json.id)
-        utils.saveSettings({
-            listStartIndex=json.id
-        })
+        json.result = net.missionlist_run(json.id)
+        if json.result == true then
+            utils.saveSettings({
+                listStartIndex=json.id
+            })
+        end
     else
-    	net.load_mission(json.filename)
+        json.result = net.load_mission(json.filename)
     end
+	utils.sendBotTable(json, json.channel)
 end
 
 function dcsbot.startNextMission(json)
     log.write('DCSServerBot', log.DEBUG, 'Mission: startNextMission()')
-	local result = net.load_next_mission()
-	if (result == false) then
-		result = net.missionlist_run(1)
+	json.result = net.load_next_mission()
+	if json.result == false then
+		json.result = net.missionlist_run(1)
 	end
-	if (result == true) then
+	if json.result == true then
         local mission_list = net.missionlist_get()
 		utils.saveSettings({
 			listStartIndex=mission_list["listStartIndex"]
 		})
 	end
+	utils.sendBotTable(json, json.channel)
 end
 
 function dcsbot.restartMission(json)
     log.write('DCSServerBot', log.DEBUG, 'Mission: restartMission()')
-	net.load_mission(DCS.getMissionFilename())
+	json.result = net.load_mission(DCS.getMissionFilename())
+	utils.sendBotTable(json, json.channel)
 end
 
 function dcsbot.pauseMission(json)
@@ -344,11 +357,12 @@ function dcsbot.getWeatherInfo(json)
 		setfenv(func, env)
 		func()
 		local preset = env.clouds and env.clouds.presets and env.clouds.presets[clouds.preset]
-		if preset ~= nil then
-			msg.clouds = {}
-			msg.clouds.base = clouds.base
-			msg.clouds.preset = preset
-		end
+        if preset ~= nil then
+			msg.clouds = {
+                base = clouds.base,
+                preset = preset
+            }
+        end
 	else
 		msg.clouds = clouds
 	end
@@ -455,4 +469,23 @@ end
 function dcsbot.unban(json)
     log.write('DCSServerBot', log.DEBUG, 'Admin: unban()')
 	dcsbot.banList[json.ucid] = nil
+end
+
+function dcsbot.makeScreenshot(json)
+    log.write('DCSServerBot', log.DEBUG, 'Mission: makeScreenshot()')
+    net.screenshot_request(json.id)
+end
+
+function dcsbot.getScreenshots(json)
+    log.write('DCSServerBot', log.DEBUG, 'Mission: getScreenshots()')
+    local msg = {
+        command = "getScreenshots",
+        screens = net.get_player_info(json.id, 'screens')
+    }
+    utils.sendBotTable(msg, json.channel)
+end
+
+function dcsbot.deleteScreenshot(json)
+    log.write('DCSServerBot', log.DEBUG, 'Mission: deleteScreenshot()')
+    net.screenshot_del(json.id, json.key)
 end

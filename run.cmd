@@ -13,16 +13,36 @@ if %ERRORLEVEL% EQU 9009 (
     pause > NUL
     exit /B 9009
 )
+
+SET ARGS=%*
+SET node_name=%computername%
+
+:loop1
+if "%~1"=="-n" (
+   SET node_name=%~2
+)
+SHIFT
+if NOT "%~1"=="" goto loop1
+
+DEL dcssb_%node_name%.pid 2>NUL
+
 SET VENV=%USERPROFILE%\.dcssb
 if not exist "%VENV%" (
     echo Creating the Python Virtual Environment. This may take some time...
+    python -m pip install --upgrade pip
     python -m venv "%VENV%"
-    "%VENV%\Scripts\python.exe" -m pip install --upgrade pip
-    "%VENV%\Scripts\pip" install -r requirements.txt
+    "%VENV%\Scripts\python.exe" -m pip install --no-cache-dir --prefer-binary -r requirements.txt
 )
+
+SET PROGRAM=run.py
 :loop
-"%VENV%\Scripts\python" run.py %*
+"%VENV%\Scripts\python" %PROGRAM% %ARGS%
 if %ERRORLEVEL% EQU -1 (
+    SET PROGRAM=run.py
+    goto loop
+)
+if %ERRORLEVEL% EQU -3 (
+    SET PROGRAM=update.py
     goto loop
 )
 if %ERRORLEVEL% EQU -2 (

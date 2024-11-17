@@ -6,13 +6,14 @@ import uuid
 from contextlib import suppress
 from core import utils
 from core.const import DEFAULT_TAG
+from core.utils.performance import PerformanceLog, performance_log
 from core.services.registry import ServiceRegistry
 from core.translations import get_translation
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from psutil import Process
-from typing import Optional, Union, TYPE_CHECKING
+from typing import Optional, Union, TYPE_CHECKING, Any
 
 from .dataobject import DataObject
 from .const import Status, Coalition, Channel, Side
@@ -27,7 +28,7 @@ yaml = YAML()
 
 if TYPE_CHECKING:
     from core import Extension, Instance, Mission, UploadStatus, Player
-    from services import ServiceBus
+    from services.servicebus import ServiceBus
 
 __all__ = ["Server"]
 
@@ -38,7 +39,7 @@ _ = get_translation('core')
 @dataclass
 class Server(DataObject):
     port: int
-    _instance: Instance = field(default=None)
+    _instance: Instance = field(compare=False, default=None)
     _channels: dict[Channel, int] = field(default_factory=dict, compare=False)
     _status: Status = field(default=Status.UNREGISTERED, compare=False)
     status_change: asyncio.Event = field(compare=False, init=False)
@@ -60,9 +61,10 @@ class Server(DataObject):
     bus: ServiceBus = field(compare=False, init=False)
     last_seen: datetime = field(compare=False, default=datetime.now(timezone.utc))
     restart_time: datetime = field(compare=False, default=None)
+    idle_since: datetime = field(compare=False, default=None)
 
     def __post_init__(self):
-        from services import ServiceBus
+        from services.servicebus import ServiceBus
 
         super().__post_init__()
         self.bus = ServiceRegistry.get(ServiceBus)
@@ -85,13 +87,16 @@ class Server(DataObject):
                 data = yaml.load(Path(config_file).read_text(encoding='utf-8'))
             except MarkedYAMLError as ex:
                 raise YAMLError(config_file, ex)
-            if not data.get(self.name) and self.name != 'n/a':
+            if data.get(self.name) is None and self.name != 'n/a':
                 self.log.warning(f'No configuration found for server "{self.name}" in servers.yaml!')
             _locals = data.get(DEFAULT_TAG, {}) | data.get(self.name, {})
-            if 'message_ban' not in _locals:
-                _locals['message_ban'] = _('You are banned from this server. Reason: {}')
-            if 'message_server_full' not in _locals:
-                _locals['message_server_full'] = _('The server is full, please try again later.')
+            _locals['messages'] = {
+                "greeting_message_members": "{player.name}, welcome back to {server.name}!",
+                "greeting_message_unmatched": "{player.name}, please use /linkme in our Discord, if you want to see your user stats!",
+                "message_ban": "You are banned from this server. Reason: {}",
+                "message_reserved": "This server is locked for specific users.\nPlease contact a server admin.",
+                "message_no_voice": 'You need to be in voice channel "{}" to use this server!'
+            } | _locals.get('messages', {})
             return _locals
         return {}
 
@@ -126,20 +131,20 @@ class Server(DataObject):
         else:
             new_status = status
         if new_status != self._status:
-            # self.log.info(f"{self.name}: {self._status.name} => {status.name}")
+            #self.log.info(f"{self.name}: {self._status.name} => {new_status.name}")
             self.last_seen = datetime.now(timezone.utc)
             self._status = new_status
             self.status_change.set()
             self.status_change.clear()
             if not isinstance(status, str) and not (self.node.master and not self.is_remote):
-                self.bus.send_to_node({
+                self.bus.loop.create_task(self.bus.send_to_node({
                     "command": "rpc",
                     "object": "Server",
                     "server_name": self.name,
                     "params": {
                         "status": self._status.value
                     }
-                }, node=self.node.name)
+                }, node=self.node.name))
 
     @property
     def maintenance(self) -> bool:
@@ -157,19 +162,22 @@ class Server(DataObject):
         if new_maintenance != self._maintenance:
             self._maintenance = new_maintenance
             if not isinstance(maintenance, str) and not (self.node.master and not self.is_remote):
-                self.bus.send_to_node({
+                self.bus.loop.create_task(self.bus.send_to_node({
                     "command": "rpc",
                     "object": "Server",
                     "params": {
                         "maintenance": str(maintenance)
                     },
                     "server_name": self.name
-                }, node=self.node.name)
+                }, node=self.node.name))
             else:
-                with self.pool.connection() as conn:
-                    with conn.transaction():
-                        conn.execute("UPDATE servers SET maintenance = %s WHERE server_name = %s",
-                                     (self._maintenance, self.name))
+                asyncio.create_task(self.update_maintenance())
+
+    async def update_maintenance(self):
+        async with self.apool.connection() as conn:
+            async with conn.transaction():
+                await conn.execute("UPDATE servers SET maintenance = %s WHERE server_name = %s",
+                                   (self._maintenance, self.name))
 
     @property
     def display_name(self) -> str:
@@ -177,7 +185,7 @@ class Server(DataObject):
 
     @property
     def coalitions(self) -> bool:
-        return self.locals.get('coalitions', None) is not None
+        return self.locals.get('coalitions') is not None
 
     async def get_missions_dir(self) -> str:
         raise NotImplemented()
@@ -200,6 +208,8 @@ class Server(DataObject):
             if 'unit_id' in kwargs and player.unit_id == kwargs['unit_id']:
                 return player
             if 'name' in kwargs and player.name == kwargs['name']:
+                return player
+            if 'ipaddr' in kwargs and player.ipaddr == kwargs['ipaddr']:
                 return player
         return None
 
@@ -226,8 +236,8 @@ class Server(DataObject):
         else:
             return True
 
-    def move_to_spectators(self, player: Player, reason: str = 'n/a'):
-        self.send_to_dcs({
+    async def move_to_spectators(self, player: Player, reason: str = 'n/a'):
+        await self.send_to_dcs({
             "command": "force_player_slot",
             "playerID": player.id,
             "sideID": 0,
@@ -235,8 +245,8 @@ class Server(DataObject):
             "reason": reason
         })
 
-    def kick(self, player: Player, reason: str = 'n/a'):
-        self.send_to_dcs({
+    async def kick(self, player: Player, reason: str = 'n/a'):
+        await self.send_to_dcs({
             "command": "kick",
             "id": player.id,
             "reason": reason
@@ -256,7 +266,7 @@ class Server(DataObject):
     async def get_current_mission_theatre(self) -> Optional[str]:
         raise NotImplemented()
 
-    def send_to_dcs(self, message: dict):
+    async def send_to_dcs(self, message: dict):
         raise NotImplemented()
 
     async def rename(self, new_name: str, update_settings: bool = False) -> None:
@@ -265,27 +275,22 @@ class Server(DataObject):
     async def startup(self, modify_mission: Optional[bool] = True) -> None:
         raise NotImplemented()
 
-    async def startup_extensions(self) -> None:
-        raise NotImplemented()
-
-    async def shutdown_extensions(self) -> None:
-        raise NotImplemented()
-
     async def send_to_dcs_sync(self, message: dict, timeout: Optional[int] = 5.0) -> Optional[dict]:
-        future = self.bus.loop.create_future()
-        token = 'sync-' + str(uuid.uuid4())
-        message['channel'] = token
-        self.listeners[token] = future
-        try:
-            self.send_to_dcs(message)
-            return await asyncio.wait_for(future, timeout)
-        finally:
-            del self.listeners[token]
+        with PerformanceLog(f"DCS: dcsbot.{message['command']}()"):
+            future = self.bus.loop.create_future()
+            token = 'sync-' + str(uuid.uuid4())
+            message['channel'] = token
+            self.listeners[token] = future
+            try:
+                await self.send_to_dcs(message)
+                return await asyncio.wait_for(future, timeout)
+            finally:
+                del self.listeners[token]
 
-    def sendChatMessage(self, coalition: Coalition, message: str, sender: str = None):
+    async def sendChatMessage(self, coalition: Coalition, message: str, sender: str = None):
         if coalition == Coalition.ALL:
             for msg in message.split('\n'):
-                self.send_to_dcs({
+                await self.send_to_dcs({
                     "command": "sendChatMessage",
                     "from": sender,
                     "message": msg
@@ -293,11 +298,11 @@ class Server(DataObject):
         else:
             raise NotImplemented()
 
-    def sendPopupMessage(self, recipient: Union[Coalition, str], message: str, timeout: Optional[int] = -1,
-                         sender: str = None):
+    async def sendPopupMessage(self, recipient: Union[Coalition, str], message: str, timeout: Optional[int] = -1,
+                               sender: str = None):
         if timeout == -1:
             timeout = self.locals.get('message_timeout', 10)
-        self.send_to_dcs({
+        await self.send_to_dcs({
             "command": "sendPopupMessage",
             "to": 'coalition' if isinstance(recipient, Coalition) else 'group',
             "id": recipient.value if isinstance(recipient, Coalition) else recipient,
@@ -306,31 +311,39 @@ class Server(DataObject):
             "time": timeout
         })
 
-    def playSound(self, recipient: Union[Coalition, str], sound: str):
-        self.send_to_dcs({
+    async def playSound(self, recipient: Union[Coalition, str], sound: str):
+        await self.send_to_dcs({
             "command": "playSound",
             "to": 'coalition' if isinstance(recipient, Coalition) else 'group',
             "id": recipient.value if isinstance(recipient, Coalition) else recipient,
             "sound": sound
         })
 
+    @performance_log()
     async def stop(self) -> None:
         if self.status in [Status.PAUSED, Status.RUNNING]:
             timeout = 120 if self.node.locals.get('slow_system', False) else 60
-            self.send_to_dcs({"command": "stop_server"})
+            await self.send_to_dcs({"command": "stop_server"})
             await self.wait_for_status_change([Status.STOPPED], timeout)
 
+    @performance_log()
     async def start(self) -> None:
         if self.status == Status.STOPPED:
             timeout = 300 if self.node.locals.get('slow_system', False) else 120
             self.status = Status.LOADING
-            self.send_to_dcs({"command": "start_server"})
+            await self.send_to_dcs({"command": "start_server"})
             await self.wait_for_status_change([Status.PAUSED, Status.RUNNING], timeout)
 
     async def restart(self, modify_mission: Optional[bool] = True) -> None:
         raise NotImplemented()
 
     async def setStartIndex(self, mission_id: int) -> None:
+        raise NotImplemented()
+
+    async def setPassword(self, password: str):
+        raise NotImplemented()
+
+    async def setCoalitionPassword(self, coalition: Coalition, password: str):
         raise NotImplemented()
 
     async def addMission(self, path: str, *, autostart: Optional[bool] = False) -> None:
@@ -342,10 +355,10 @@ class Server(DataObject):
     async def replaceMission(self, mission_id: int, path: str) -> None:
         raise NotImplemented()
 
-    async def loadMission(self, mission: Union[int, str], modify_mission: Optional[bool] = True) -> None:
+    async def loadMission(self, mission: Union[int, str], modify_mission: Optional[bool] = True) -> bool:
         raise NotImplemented()
 
-    async def loadNextMission(self, modify_mission: Optional[bool] = True) -> None:
+    async def loadNextMission(self, modify_mission: Optional[bool] = True) -> bool:
         raise NotImplemented()
 
     async def getMissionList(self) -> list[str]:
@@ -354,10 +367,7 @@ class Server(DataObject):
     async def modifyMission(self, filename: str, preset: Union[list, dict]) -> str:
         raise NotImplemented()
 
-    async def uploadMission(self, filename: str, url: str, force: bool = False) -> UploadStatus:
-        raise NotImplemented()
-
-    async def listAvailableMissions(self) -> list[str]:
+    async def uploadMission(self, filename: str, url: str, force: bool = False, missions_dir: str = None) -> UploadStatus:
         raise NotImplemented()
 
     async def apply_mission_changes(self, filename: Optional[str] = None) -> str:
@@ -367,10 +377,9 @@ class Server(DataObject):
     def channels(self) -> dict[Channel, int]:
         if not self._channels:
             if 'channels' not in self.locals and self.name != 'n/a':
-                self.log.error(f"No channels defined in servers.yaml for server {self.name}!")
-                return {}
+                self.log.warning(f"No channels defined in servers.yaml for server {self.name}!")
             self._channels = {}
-            for key, value in self.locals['channels'].items():
+            for key, value in self.locals.get('channels', {}).items():
                 self._channels[Channel(key)] = int(value)
             if Channel.STATUS not in self._channels:
                 self._channels[Channel.STATUS] = -1
@@ -395,14 +404,12 @@ class Server(DataObject):
             await asyncio.wait_for(wait(status), timeout)
 
     async def shutdown(self, force: bool = False) -> None:
-        slow_system = self.node.locals.get('slow_system', False)
-        timeout = 300 if slow_system else 180
-        self.send_to_dcs({"command": "shutdown"})
-        with suppress(TimeoutError, asyncio.TimeoutError):
-            await self.wait_for_status_change([Status.STOPPED, Status.SHUTDOWN], timeout)
-        self.current_mission = None
+        raise NotImplemented()
 
-    async def init_extensions(self):
+    async def init_extensions(self) -> list[str]:
+        raise NotImplemented()
+
+    async def prepare_extensions(self):
         raise NotImplemented()
 
     async def persist_settings(self):
@@ -412,4 +419,19 @@ class Server(DataObject):
         raise NotImplemented()
 
     async def is_running(self) -> bool:
+        raise NotImplemented()
+
+    async def run_on_extension(self, extension: str, method: str, **kwargs) -> Any:
+        raise NotImplemented()
+
+    async def config_extension(self, name: str, config: dict) -> None:
+        raise NotImplemented()
+
+    async def install_extension(self, name: str, config: dict) -> None:
+        raise NotImplemented()
+
+    async def uninstall_extension(self, name: str) -> None:
+        raise NotImplemented()
+
+    async def cleanup(self) -> None:
         raise NotImplemented()

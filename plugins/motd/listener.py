@@ -1,3 +1,4 @@
+import asyncio
 import random
 
 from core import EventListener, utils, Server, Report, Player, event
@@ -47,7 +48,8 @@ class MOTDListener(EventListener):
                 message = utils.format_string(config['message'], server=server, player=player)
             elif 'report' in config:
                 report = Report(self.bot, self.plugin_name, config['report'])
-                env = await report.render(server=server, player=player, guild=self.bot.guilds[0])
+                env = await report.render(server=server, player=player,
+                                          guild=self.bot.guilds[0] if self.bot.guilds else None)
                 message = utils.embed_to_simpletext(env.embed)
             return message, config
 
@@ -58,13 +60,17 @@ class MOTDListener(EventListener):
 
     @event(name="onPlayerStart")
     async def onPlayerStart(self, server: Server, data: dict) -> None:
+        async def _send_message(config: dict, server: Server, player: Player) -> None:
+            await player.sendChatMessage(await self.on_join(config['on_join'], server, player))
+
         if data['id'] == 1 or 'ucid' not in data:
             return
         config = self.plugin.get_config(server)
         if config and 'on_join' in config:
             player: Player = server.get_player(ucid=data['ucid'])
             if player:
-                player.sendChatMessage(await self.on_join(config['on_join'], server, player))
+                # noinspection PyAsyncCall
+                asyncio.create_task(_send_message(config, server, player))
 
     @event(name="onMissionEvent")
     async def onMissionEvent(self, server: Server, data: dict) -> None:
@@ -79,4 +85,5 @@ class MOTDListener(EventListener):
             message, cfg = await self.on_birth(config['on_birth'], server, player)
             if message:
                 # noinspection PyUnresolvedReferences
-                self.plugin.send_message(message, server, cfg, player)
+                # noinspection PyAsyncCall
+                asyncio.create_task(self.plugin.send_message(message, server, cfg, player))

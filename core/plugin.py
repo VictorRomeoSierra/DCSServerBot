@@ -35,7 +35,7 @@ yaml = YAML()
 
 if TYPE_CHECKING:
     from core import Server
-    from services import DCSServerBot
+    from services.bot import DCSServerBot
 
 BACKUP_FOLDER = 'config/backup/{}'
 
@@ -126,7 +126,7 @@ class Command(app_commands.Command):
         auto_locale_strings: bool = True,
         extras: Dict[Any, Any] = MISSING,
     ):
-        from services import BotService
+        from services.bot import BotService
 
         super().__init__(name=name, description=description, callback=callback, nsfw=nsfw, parent=parent,
                          guild_ids=guild_ids, auto_locale_strings=auto_locale_strings, extras=extras)
@@ -138,7 +138,8 @@ class Command(app_commands.Command):
             del self._params['node']
         # remove server parameter from slash commands if only one server is there
         num_servers = len(bot.servers)
-        if 'server' in self._params and ((num_servers == 1 and nodes == 1) or not bot.locals.get('admin_channel')):
+        if ('server' in self._params and
+                ((num_servers == 1 and nodes == 1) or not bot.locals.get('channels', {}).get('admin'))):
             del self._params['server']
 
     async def _do_call(self, interaction: Interaction, params: Dict[str, Any]) -> T:
@@ -230,7 +231,7 @@ class Group(app_commands.Group):
 class Plugin(commands.Cog):
 
     def __init__(self, bot: DCSServerBot, eventlistener: Type[TEventListener] = None):
-        from services import ServiceBus
+        from services.servicebus import ServiceBus
 
         super().__init__()
         self.plugin_name = type(self).__module__.split('.')[-2]
@@ -271,16 +272,22 @@ class Plugin(commands.Cog):
                     if isinstance(params, list):
                         for param in params:
                             self.change_commands(param, group_commands)
-                    else:
+                    elif params:
                         self.change_commands(params, group_commands)
+                    else:
+                        self.log.warning(f"{self.__cog_name__} command {name} has no params!")
                     break
                 elif cmd_name == name and isinstance(cmd, Command):
+                    if not params:
+                        self.log.warning(
+                            f"{self.__cog_name__}: Command overwrite of /{cmd.qualified_name} with no parameters!")
+                        break
                     if cmd.parent:
                         cmd.parent.remove_command(cmd.name)
                     if not params.get('enabled', True):
                         if not cmd.parent:
                             self.__cog_app_commands__.remove(cmd)
-                        continue
+                        break
                     if 'name' in params:
                         cmd.name = params['name']
                     if 'description' in params:
@@ -294,6 +301,8 @@ class Plugin(commands.Cog):
                     if cmd.parent:
                         cmd.parent.add_command(cmd)
                     break
+            else:
+                self.log.warning(f"{self.__cog_name__}: Command {name} not found!")
 
     async def install(self) -> bool:
         if await self._init_db():
@@ -414,7 +423,7 @@ class Plugin(commands.Cog):
             path = f'./plugins/{self.plugin_name}/schemas'
             if os.path.exists(path):
                 schema_files = [str(x) for x in Path(path).glob('*.yaml')]
-                schema_files.append('./schemas/commands_schema.yaml')
+                schema_files.append('schemas/commands_schema.yaml')
                 c = Core(source_file=filename, schema_files=schema_files, file_encoding='utf-8')
                 try:
                     c.validate(raise_exception=True)
