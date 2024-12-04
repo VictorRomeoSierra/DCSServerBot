@@ -17,6 +17,7 @@ from discord.ext import commands
 from discord.ui import Button, View, Select, Item, Modal, TextInput
 from enum import Enum, auto
 from fuzzywuzzy import fuzz
+from packaging.version import parse, Version
 from psycopg.rows import dict_row
 from typing import Optional, cast, Union, TYPE_CHECKING, Iterable, Any, Callable
 
@@ -43,6 +44,7 @@ __all__ = [
     "app_has_not_role",
     "app_has_roles",
     "app_has_not_roles",
+    "app_has_dcs_version",
     "cmd_has_roles",
     "get_role_ids",
     "format_embed",
@@ -553,6 +555,16 @@ def app_has_not_roles(roles: list[str]):
     return app_commands.check(predicate)
 
 
+def app_has_dcs_version(version: str):
+    def predicate(interaction: Interaction) -> bool:
+        if parse(interaction.client.node.dcs_version) < Version(version):
+            raise app_commands.AppCommandError(
+                _("You need at least DCS version {} to use this command!").format(version))
+        return True
+
+    return app_commands.check(predicate)
+
+
 def format_embed(data: dict, **kwargs) -> discord.Embed:
     """
     :param data: A dictionary containing the data for formatting the embed.
@@ -1010,6 +1022,12 @@ async def mission_autocomplete(interaction: discord.Interaction, current: str) -
     Autocompletion of mission names from the current mission list of a server that has to be provided as an earlier
     parameter to the application command. The mission list can only be obtained by people with the DCS Admin role.
     """
+    def get_name(base_dir: str, path: str):
+        try:
+            return os.path.relpath(path, base_dir).replace('.dcssb' + os.path.sep, '')[:-4]
+        except ValueError:
+            return os.path.basename(path)[:-4]
+
     if not await interaction.command._check_can_run(interaction):
         return []
     try:
@@ -1018,9 +1036,9 @@ async def mission_autocomplete(interaction: discord.Interaction, current: str) -
             return []
         base_dir = await server.get_missions_dir()
         choices: list[app_commands.Choice[int]] = [
-            app_commands.Choice(name=os.path.relpath(x, base_dir).replace('.dcssb' + os.path.sep, '')[:-4], value=idx)
+            app_commands.Choice(name=get_name(base_dir, x), value=idx)
             for idx, x in enumerate(server.settings['missionList'])
-            if not current or current.casefold() in os.path.relpath(x, base_dir)[:-4].casefold()
+            if not current or current.casefold() in get_name(base_dir, x).casefold()
         ]
         return sorted(choices, key=lambda choice: choice.name)[:25]
     except Exception as ex:

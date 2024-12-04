@@ -7,6 +7,7 @@ import sys
 
 from core import Extension, utils, ServiceRegistry, Server, get_translation, InstallException, DISCORD_FILE_SIZE_LIMIT, \
     Status
+from packaging.version import parse
 from services.bot import BotService
 from services.servicebus import ServiceBus
 from typing import Optional, Any
@@ -15,7 +16,7 @@ _ = get_translation(__name__.split('.')[1])
 
 TACVIEW_DEFAULT_DIR = os.path.normpath(os.path.expandvars(os.path.join('%USERPROFILE%', 'Documents', 'Tacview')))
 TACVIEW_EXPORT_LINE = "local Tacviewlfs=require('lfs');dofile(Tacviewlfs.writedir()..'Scripts/TacviewGameExport.lua')\n"
-TACVIEW_PATTERN_MATCH = r'Successfully saved \[(?P<filename>.*?)\]'
+TACVIEW_PATTERN_MATCH = r'Successfully saved \[(?P<filename>.*?\.acmi)\]'
 
 rtt_ports: dict[int, str] = dict()
 rcp_ports: dict[int, str] = dict()
@@ -393,7 +394,7 @@ class Tacview(Extension):
 
     async def update_instance(self, force: bool) -> bool:
         version = self.get_inst_version()
-        if version != self.version:
+        if parse(version) < parse(self.version):
             if force or self.config.get('autoupdate', False):
                 if not await self.uninstall():
                     return False
