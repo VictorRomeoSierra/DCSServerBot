@@ -1,7 +1,8 @@
 local base      = _G
 local dcsbot    = base.dcsbot
-local dcs_srs   = dcs_srs or {}
+local utils 	= base.require("DCSServerBotUtils")
 
+local dcs_srs   = dcs_srs or {}
 dcsbot.srs = dcsbot.srs or {}
 
 function dcs_srs.onPlayerTryChangeSlot(playerID, side, slotID)
@@ -18,6 +19,16 @@ function dcs_srs.onPlayerTryChangeSlot(playerID, side, slotID)
     if (side == 1 or side == 2) and srs == false then
         net.send_chat_to(dcsbot.params['srs']['message_no_srs'], playerID)
         return false
+    end
+end
+
+function dcs_srs.onPlayerChangeSlot(id)
+    local side = net.get_player_info(id, 'side')
+    local slot = net.get_player_info(id, 'slot')
+
+    -- workaround for non-working onPlayerTryChangeSlot calls on dynamic spawns
+    if utils.isDynamic(id) and dcs_srs.onPlayerTryChangeSlot(id, side, slot) == false then
+        net.force_player_slot(id, side, 1)
     end
 end
 
