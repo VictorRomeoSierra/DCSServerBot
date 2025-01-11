@@ -217,13 +217,13 @@ class ModManagerService(Service):
 
     async def _get_latest_file_version(self, package: dict):
         config = self.get_config()
-        path = os.path.expandvars(config[package['source']])
+        path = os.path.expandvars(config[package['source'].value])
         available = [self.parse_filename(x) for x in os.listdir(path) if package['name'] in x]
         max_version = None
         for _, _version in available:
             if not max_version or version.parse(_version) > version.parse(max_version):
                 max_version = _version
-        return max_version.strip('v')
+        return max_version.strip('v') if max_version else None
 
     async def get_latest_version(self, package: dict) -> str:
         if 'repo' in package:
