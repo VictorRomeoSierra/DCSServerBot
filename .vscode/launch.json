@@ -8,7 +8,7 @@
       "name": "Python: Current File",
       "type": "python",
       "request": "launch",
-      "program": "C:\\Users\\brend\\Dev\\DCSServerBot\\run.py",
+      "program": "C:\\Users\\Server\\Dev\\DCSServerBot\\run.py",
       "console": "integratedTerminal",
       "justMyCode": true
     }

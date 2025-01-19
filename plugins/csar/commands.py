@@ -1,16 +1,16 @@
 import discord
 import psycopg
-import requests
-import json
+# import requests
+# import json
 
-from contextlib import closing
+# from contextlib import closing
 from core import Plugin, utils, Server, TEventListener, Status, command, DEFAULT_TAG, Report, ReportEnv, Group
 from discord import app_commands
-from services import DCSServerBot
+from services.bot import DCSServerBot
 from typing import Type
-from discord.ext import tasks
+# from discord.ext import tasks
 from typing import Optional, Union
-from psycopg.rows import dict_row
+# from psycopg.rows import dict_row
 
 from .listener import CsarEventListener
 
