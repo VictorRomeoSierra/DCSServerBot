@@ -317,15 +317,15 @@ class ModManagerService(Service):
                         shutil.copy2(orig, dest)
                     else:
                         log_entries.append(f"w {_name}\n")
-                    if name.endswith('/'):
-                        os.makedirs(os.path.join(target, _name), exist_ok=True)
-                    else:
-                        with zfile.open(name) as infile:
-                            self.log.debug(f"Extracting file {name} to {target}/{_name}")
-                            with open(os.path.join(target, _name), mode='wb') as outfile:
-                                outfile.write(infile.read())
+                    os.makedirs(os.path.dirname(orig), exist_ok=True)
+                    if orig.endswith('/'):
+                        continue
+                    with zfile.open(name) as infile:
+                        self.log.debug(f"Extracting file {name} to {target}/{_name}")
+                        with open(orig, mode='wb') as outfile:
+                            outfile.write(infile.read())
             return log_entries
-
+            
         def copy_tree():
             def backup(p, names) -> list[str]:
                 ignore_list = []
@@ -430,7 +430,7 @@ class ModManagerService(Service):
     @proxy
     async def uninstall_package(self, server: Server, folder: Folder, package_name: str, version: str) -> bool:
         if folder == Folder.RootFolder:
-            return await self.uninstall_root_package(server.node, folder, package_name, version)
+            return await self.uninstall_root_package(server.node, package_name, version)
         self.log.info(f"Uninstalling package {package_name}_v{version} ...")
         config = self.get_config()
         path = os.path.expandvars(config[folder.value])

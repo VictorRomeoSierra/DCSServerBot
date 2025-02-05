@@ -1,5 +1,6 @@
 import aiohttp
 import asyncio
+import atexit
 import certifi
 import os
 import psutil
@@ -40,8 +41,14 @@ class SkyEye(Extension):
         if self.process:
             self.log.info(f"  => {self.name}: Running SkyEye server detected.")
 
+    def get_config(self) -> str:
+        return os.path.expandvars(utils.format_string(
+            self.config.get('config', f'{self.server.instance.home}\\Config\\SkyEye.yaml'),
+            server=self.server)
+        )
+
     def load_config(self) -> Optional[dict]:
-        path = os.path.expandvars(self.config['config'])
+        path = self.get_config()
         if not os.path.exists(path):
             base_config = os.path.join(os.path.dirname(self.get_exe_path()), "config.yaml")
             if not os.path.exists(base_config):
@@ -93,6 +100,7 @@ class SkyEye(Extension):
                 self.log.info(f"  => {self.name}: Whisper model downloaded.")
             dirty |= self._maybe_update_config('recognizer', 'openai-whisper-local')
         else:
+            dirty |= self._maybe_update_config('recognizer', 'openai-whisper-api')
             dirty |= self._maybe_update_config('openai-api-key', self.config['openai-api-key'])
 
         dirty |= self._maybe_update_config('whisper-model', self.config.get('whisper-model', 'ggml-small.en.bin'))
@@ -101,8 +109,6 @@ class SkyEye(Extension):
             dirty |= self._maybe_update_config('callsign', self.config['callsign'])
         elif 'callsigns' in self.config:
             dirty |= self._maybe_update_config('callsigns', self.config['callsigns'])
-        else:
-            dirty |= self._maybe_update_config('callsign', 'Focus')
         dirty |= self._maybe_update_config('voice', self.config.get('voice'))
         dirty |= self._maybe_update_config('voice-playback-speed', self.config.get('voice-playback-speed'))
         dirty |= self._maybe_update_config('voice-playback-pause', self.config.get('voice-playback-pause'))
@@ -137,7 +143,7 @@ class SkyEye(Extension):
         if srs:
             srs_port = srs.config.get('port', srs.locals['Server Settings']['SERVER_PORT'])
             dirty |= self._maybe_update_config('srs-server-address', f"localhost:{srs_port}")
-            if self.config['coalition'] == 'blue':
+            if self.config.get('coalition', 'blue') == 'blue':
                 dirty |= self._maybe_update_config(
                     'srs-eam-password',
                     srs.locals['External AWACS Mode Settings']['EXTERNAL_AWACS_MODE_BLUE_PASSWORD']
@@ -163,7 +169,7 @@ class SkyEye(Extension):
             # grpc-password is not supported yet
 
         if dirty:
-            with open(os.path.expandvars(self.config['config']), mode='w', encoding='utf-8') as outfile:
+            with open(self.get_config(), mode='w', encoding='utf-8') as outfile:
                 yaml.dump(self.locals, outfile)
         return await super().prepare()
 
@@ -176,9 +182,11 @@ class SkyEye(Extension):
             out = subprocess.PIPE if self.config.get('debug', False) else subprocess.DEVNULL
             args = [
                 self.get_exe_path(),
-                '--config-file', os.path.expandvars(self.config['config']),
-                '--whisper-model', 'whisper.bin'
+                '--config-file', self.get_config()
             ]
+            if self.locals.get('recognizer', 'openai-whisper-local') == 'openai-whisper-local':
+                args.extend(['--whisper-model', 'whisper.bin'])
+
             self.log.debug("Launching {}".format(' '.join(args)))
             proc = subprocess.Popen(
                 args, cwd=os.path.dirname(self.get_exe_path()), stdout=out, stderr=subprocess.STDOUT, close_fds=True
@@ -204,6 +212,7 @@ class SkyEye(Extension):
             p = await asyncio.to_thread(run_subprocess)
             try:
                 self.process = psutil.Process(p.pid)
+                atexit.register(self.terminate)
                 if self.config.get('affinity'):
                     self.set_affinity(self.config['affinity'])
                 else:
