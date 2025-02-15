@@ -107,25 +107,27 @@ class CsarEventListener(EventListener):
             i += 1
             if i >= 5:
                 concat += "]"
-                server.send_to_dcs({
+                await server.send_to_dcs({
                     'command': 'csarUpdatePersistentData',
                     'data': concat
                 })
+                self.log.debug(concat)
                 concat = ""
                 i = 0
                 time.sleep(1)
         if concat != "":
             concat += "]"
-            server.send_to_dcs({
+            await server.send_to_dcs({
                 'command': 'csarUpdatePersistentData',
                 'data': concat
             })
+            self.log.debug(concat)
         return
 
     @event(name="csarGetLives")
     async def csarGetLives(self, server: Server, data: dict):
         self.log.debug('csarGetLives called, self.lives: {}'.format(str(self.lives)))
-        server.send_to_dcs({
+        await server.send_to_dcs({
                 'command': 'csarSetLives',
                 'data': json.dumps(self.lives)  #'[{}]'.format()
             })
@@ -151,7 +153,7 @@ class CsarEventListener(EventListener):
     async def blockSlot(self, server: Server, data: dict) -> None:
         block = data['block']
         self.log.debug('CSAR: blockSlot called: playerName {}, typeName {}, block {}'.format(data['playerName'], data['typeName'], block))
-        server.send_to_dcs({
+        await server.send_to_dcs({
             'command': 'csarBlockSlot',
             'playerName': data['playerName'],
             'typeName': data['typeName'],
