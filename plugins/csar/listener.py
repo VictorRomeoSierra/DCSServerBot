@@ -113,34 +113,34 @@ class CsarEventListener(EventListener):
             i += 1
             if i >= 5:
                 concat += "]"
-                await server.send_to_dcs({
+                asyncio.create_task(server.send_to_dcs({
                     'command': 'csarUpdatePersistentData',
                     'data': concat
-                })
+                }))
                 self.log.debug(server.name + " csarGetPersistentData sent data " + concat)
                 concat = ""
                 i = 0
                 time.sleep(1)
         if concat != "":
             concat += "]"
-            await server.send_to_dcs({
+            asyncio.create_task(server.send_to_dcs({
                 'command': 'csarUpdatePersistentData',
                 'data': concat
-            })
+            }))
             self.log.debug(server.name + " csarGetPersistentData sent data " + concat)
         return
 
     @event(name="csarGetLives")
     async def csarGetLives(self, server: Server, data: dict):
         self.log.debug('csarGetLives called, self.lives: {}'.format(str(self.lives)))
-        await server.send_to_dcs({
+        asyncio.create_task(server.send_to_dcs({
                 'command': 'csarSetLives',
                 'data': json.dumps(self.lives)  #'[{}]'.format()
-            })
+            }))
 
     @chat_command(name="csar", roles=['DCS Admin'], help="A sample command")
     async def csar(self, server: Server, player: Player, params: list[str]):
-        await player.sendChatMessage("This is a csar command!")
+        asyncio.create_task(player.sendChatMessage("This is a csar command!"))
 
     @event(name="rescuedPilot")
     async def rescuedPilot(self, server: Server, data: dict):
@@ -153,18 +153,18 @@ class CsarEventListener(EventListener):
         # self.log.debug('player found? {}'.format(player))
         if player:
             self.log.debug('Message sent to {}'.format(playername))
-            await player.sendChatMessage('Your {} pilot has been rescued by {}'.format(typename, pilotname))
+            asyncio.create_task(player.sendChatMessage('Your {} pilot has been rescued by {}'.format(typename, pilotname)))
     
     @event(name="blockSlot")
     async def blockSlot(self, server: Server, data: dict) -> None:
         block = data['block']
         self.log.debug('CSAR: blockSlot called: playerName {}, typeName {}, block {}'.format(data['playerName'], data['typeName'], block))
-        await server.send_to_dcs({
+        asyncio.create_task(server.send_to_dcs({
             'command': 'csarBlockSlot',
             'playerName': data['playerName'],
             'typeName': data['typeName'],
             'block': block
-        })
+        }))
         if block:
             self.log.debug('CSAR: attempting to move to spectators')
             player: Player = server.get_player(name=data['playerName'], active=True)
