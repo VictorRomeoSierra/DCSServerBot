@@ -5,12 +5,12 @@ import asyncio
 from psycopg.rows import dict_row
 from contextlib import closing
 
-from core import EventListener, event, chat_command, Player, DEFAULT_TAG
+from core import EventListener, event, chat_command, Player, DEFAULT_TAG, Server
 
-from typing import TYPE_CHECKING
+# from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from core import Server
+# if TYPE_CHECKING:
+#     from core import Server
 
 class CsarEventListener(EventListener):
     """
