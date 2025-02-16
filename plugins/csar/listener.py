@@ -1,5 +1,6 @@
 import json
 import time
+import asyncio
 
 from psycopg.rows import dict_row
 from contextlib import closing
@@ -111,7 +112,7 @@ class CsarEventListener(EventListener):
                     'command': 'csarUpdatePersistentData',
                     'data': concat
                 })
-                self.log.debug(concat)
+                # self.log.debug(concat)
                 concat = ""
                 i = 0
                 time.sleep(1)
@@ -121,7 +122,7 @@ class CsarEventListener(EventListener):
                 'command': 'csarUpdatePersistentData',
                 'data': concat
             })
-            self.log.debug(concat)
+            # self.log.debug(concat)
         return
 
     @event(name="csarGetLives")
@@ -134,7 +135,7 @@ class CsarEventListener(EventListener):
 
     @chat_command(name="csar", roles=['DCS Admin'], help="A sample command")
     async def csar(self, server: Server, player: Player, params: list[str]):
-        player.sendChatMessage("This is a csar command!")
+        await player.sendChatMessage("This is a csar command!")
 
     @event(name="rescuedPilot")
     async def rescuedPilot(self, server: Server, data: dict):
@@ -147,7 +148,7 @@ class CsarEventListener(EventListener):
         # self.log.debug('player found? {}'.format(player))
         if player:
             self.log.debug('Message sent to {}'.format(playername))
-            player.sendChatMessage('Your {} pilot has been rescued by {}'.format(typename, pilotname))
+            await player.sendChatMessage('Your {} pilot has been rescued by {}'.format(typename, pilotname))
     
     @event(name="blockSlot")
     async def blockSlot(self, server: Server, data: dict) -> None:
@@ -163,4 +164,4 @@ class CsarEventListener(EventListener):
             self.log.debug('CSAR: attempting to move to spectators')
             player: Player = server.get_player(name=data['playerName'], active=True)
             reason = 'Unfortunatley, you have no more lives for {} airframes.'.format(data['typeName'])
-            server.move_to_spectators(player, reason)
+            asyncio.create_task(server.move_to_spectators(player, reason))
