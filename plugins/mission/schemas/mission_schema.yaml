@@ -1,24 +1,25 @@
-schema;master_schema:
+schema;default_schema:
   type: map
-  allowempty: true
+  nullable: false
   mapping:
     uploads:
       type: map
+      nullable: false
       mapping:
-        enabled: {type: bool}
+        enabled: {type: bool, nullable: false}
         discord:
           type: seq
           sequence:
             - type: text
+              nullable: false
 
 type: map
+func: check_main_structure
+nullable: false
 mapping:
   DEFAULT:
-    include: 'master_schema'
+    include: 'default_schema'
   commands:
     include: 'commands_schema'
-  regex;(.+):
-    include: 'master_schema'
-    regex;(.+):
-      include: 'master_schema'
-
+  chat_commands:
+    include: 'chat_commands_schema'

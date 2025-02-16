@@ -32,7 +32,7 @@ __all__ = [
 last_wait_time = 0
 
 
-@ServiceRegistry.register()
+@ServiceRegistry.register(depends_on=[ServiceBus])
 class MonitoringService(Service):
     def __init__(self, node):
         super().__init__(node, name="Monitoring")
@@ -192,9 +192,11 @@ class MonitoringService(Service):
                     return
                 # only escalate, if the server was not stopped (maybe the process was manually shut down)
                 if server.status != Status.STOPPED:
-                    now = datetime.now(timezone.utc)
-                    shutil.copy2(os.path.join(server.instance.home, 'Logs', 'dcs.log'),
-                                 os.path.join(server.instance.home, 'Logs', f"dcs-{now.strftime('%Y%m%d-%H%M%S')}.log"))
+                    logfile = os.path.join(server.instance.home, 'Logs', 'dcs.log')
+                    if os.path.exists(logfile):
+                        now = datetime.now(timezone.utc)
+                        shutil.copy2(logfile, os.path.join(server.instance.home,
+                                                           'Logs', f"dcs-{now.strftime('%Y%m%d-%H%M%S')}.log"))
                     title = f'Server "{server.name}" died!'
                     message = 'Setting state to SHUTDOWN.'
                     self.log.warning(title + ' ' + message)
@@ -216,7 +218,10 @@ class MonitoringService(Service):
                     continue
                 if server.status in [Status.RUNNING, Status.PAUSED]:
                     # check extension states
-                    for ext in [x for x in server.extensions.values() if not await asyncio.to_thread(x.is_running)]:
+                    for ext in [
+                        x for x in server.extensions.values()
+                        if x.enabled and not await asyncio.to_thread(x.is_running)
+                    ]:
                         try:
                             self.log.warning(f"{ext.name} died - restarting ...")
                             await ext.startup()
