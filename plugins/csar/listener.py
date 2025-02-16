@@ -5,7 +5,12 @@ import asyncio
 from psycopg.rows import dict_row
 from contextlib import closing
 
-from core import EventListener, Server, event, chat_command, Player, DEFAULT_TAG
+from core import EventListener, event, chat_command, Player, DEFAULT_TAG
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from core import Server
 
 class CsarEventListener(EventListener):
     """
@@ -89,8 +94,8 @@ class CsarEventListener(EventListener):
 
     @event(name="csarGetPersistentData")
     async def getPersistentData(self, server: Server, data: dict):
+        self.log.debug(server.name + " csarGetPersistentData start")
         command = "DELETE FROM csar_wounded WHERE datestamp < NOW() - INTERVAL '{}'".format(self.expire_after)
-        # self.log.debug(command)
         with self.pool.connection() as conn:
             with conn.transaction():
                 conn.execute(command)
@@ -112,7 +117,7 @@ class CsarEventListener(EventListener):
                     'command': 'csarUpdatePersistentData',
                     'data': concat
                 })
-                # self.log.debug(concat)
+                self.log.debug(server.name + " csarGetPersistentData sent data " + concat)
                 concat = ""
                 i = 0
                 time.sleep(1)
@@ -122,7 +127,7 @@ class CsarEventListener(EventListener):
                 'command': 'csarUpdatePersistentData',
                 'data': concat
             })
-            # self.log.debug(concat)
+            self.log.debug(server.name + " csarGetPersistentData sent data " + concat)
         return
 
     @event(name="csarGetLives")
