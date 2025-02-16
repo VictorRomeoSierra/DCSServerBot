@@ -27,4 +27,4 @@ function dcsbot.csarBlockSlot(playerName, typeName, block)
     net.dostring_in('mission', 'a_do_script(' .. utils.basicSerialize(script) .. ')')
 end
 
-env.info("DCSServerBot - CSAR: commands.lua loaded.")
+log.write('DCSServerBot', log.DEBUG, "DCSServerBot - CSAR: commands.lua loaded.")
