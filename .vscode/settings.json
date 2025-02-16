@@ -1,12 +1,13 @@
 {
     "logViewer.watch": [
+
         {
             "title": "DCS Log",
-            "pattern": "C:\\Users\\brend\\Saved Games\\DCS.openbeta_server\\Logs\\dcs.log"
+            "pattern": "C:\\Users\\Server\\Saved Games\\DCS.openbeta_server\\Logs\\dcs.log"
         },
         {
             "title": "Bot Log",
-            "pattern": "C:\\Users\\brend\\Dev\\DCSServerBot\\logs\\dcssb-SurfBookDeux.log"
+            "pattern": "C:\\Users\\Server\\Dev\\DCSServerBot\\logs\\dcssb-SurfBookDeux.log"
         }
     ]
 }
