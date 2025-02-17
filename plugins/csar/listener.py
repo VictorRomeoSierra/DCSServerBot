@@ -5,7 +5,7 @@ import asyncio
 from psycopg.rows import dict_row
 from contextlib import closing
 
-from core import EventListener, event, chat_command, Player, DEFAULT_TAG, Server
+from core import EventListener, event, chat_command, Player, DEFAULT_TAG, Server, Player
 
 # from typing import TYPE_CHECKING
 
@@ -170,3 +170,19 @@ class CsarEventListener(EventListener):
             player: Player = server.get_player(name=data['playerName'], active=True)
             reason = 'Unfortunatley, you have no more lives for {} airframes.'.format(data['typeName'])
             asyncio.create_task(server.move_to_spectators(player, reason))
+
+    @event(name="onPlayerStart")
+    async def onPlayerStart(self, server: Server, data: dict) -> None:
+        if data['id'] == 1 or 'ucid' not in data:
+            return
+        player: Player = server.get_player(ucid=data['ucid'])
+        if not player or not player.member:
+            self.log.debug('CSAR: onPlayerStart - player or member not found')
+            return
+        else:
+            # noinspection PyAsyncCall
+            asyncio.create_task(server.send_to_dcs({
+                'command': '_setUserDiscord',
+                'ucid': player.ucid,
+                'discord': player.member.id
+            }))
