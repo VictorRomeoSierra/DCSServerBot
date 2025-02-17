@@ -15,6 +15,8 @@ dcsbot     = base.dcsbot
 -- 	utils.sendBotTable(msg, config.CHAT_CHANNEL)
 -- end
 
+local _players = {}
+
 function dcsbot.csarStatData(data)
 	-- log.write('DCSServerBot', log.INFO, 'CSAR: csarStatData() (mission.lua)')
 	local msg = {}
@@ -88,6 +90,15 @@ end
 function dcsbot._blockSlot(playerName, typeName, block)
 	log.write('DCSServerBot', log.DEBUG, 'CSAR: _blockSlot() (mission.lua)')
 	slotblock.blockSlot(playerName, typeName, block) -- this better work
+end
+
+-- Don't call this function, it's for internal use only!
+function dcsbot._setUserDiscord(user, discord)
+    _players[user] = discord
+end
+
+function dcsbot.getUserDiscord(user)
+    return _players[user]
 end
 
 env.info("DCSServerBot - CSAR: mission.lua loaded.")
