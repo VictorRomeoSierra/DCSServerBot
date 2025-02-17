@@ -31,12 +31,13 @@ class CsarEventListener(EventListener):
         self.lives = self.locals.get(DEFAULT_TAG, {}).get('lives')
 
 
-    def get_csar_wounded(self) -> list[dict]:
+    def get_csar_wounded(self, server: Server) -> list[dict]:
         with self.pool.connection() as conn:
             with closing(conn.cursor(row_factory=dict_row)) as cursor:
                 return list(cursor.execute("""
                     SELECT id, coalition, country, pos, coordinates, typename, unitname, playername, freq FROM csar_wounded
-                """).fetchall())
+                    WHERE server_name = %s
+                """, (server.name, )).fetchall())
 
     @event(name="csarStatData")
     async def csarStatData(self, server: Server, data: dict):
@@ -73,33 +74,33 @@ class CsarEventListener(EventListener):
                     else:
                         playername = w['unitname']
                     row = conn.execute("""
-                        SELECT id FROM csar_wounded WHERE id = %s
-                        """,(w['id'], )).fetchone()
+                        SELECT id FROM csar_wounded WHERE id = %s AND server_name = '%s'
+                        """,(w['id'], server.name, )).fetchone()
                     if row:
                         conn.execute("""
-                            UPDATE csar_wounded SET (coalition, country, pos, coordinates, typename, unitname, playername, freq) = (%s, %s, %s, %s, %s, %s, %s, %s)
-                            WHERE id = %s
-                            """, (w['coalition'], w['country'], json.dumps(w['pos']), w['coordinates'], w['typename'], w['unitname'], playername, w['freq'], w['id']))
+                            UPDATE csar_wounded SET (coalition, country, pos, coordinates, typename, unitname, playername, freq, server_name) = (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            WHERE id = %s AND server_name = %s
+                            """, (w['coalition'], w['country'], json.dumps(w['pos']), w['coordinates'], w['typename'], w['unitname'], playername, w['freq'], server.name, w['id'], server.name))
                     else:
                         conn.execute("""
-                            INSERT INTO csar_wounded (id, coalition, country, pos, coordinates, typename, unitname, playername, freq) 
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        """, (w['id'], w['coalition'], w['country'], json.dumps(w['pos']), w['coordinates'], w['typename'], w['unitname'], playername, w['freq']))
+                            INSERT INTO csar_wounded (id, coalition, country, pos, coordinates, typename, unitname, playername, freq, server_name) 
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """, (w['id'], w['coalition'], w['country'], json.dumps(w['pos']), w['coordinates'], w['typename'], w['unitname'], playername, w['freq'], server.name))
                 if currentids:
-                    delete = "DELETE FROM csar_wounded WHERE id NOT IN (" + currentids.strip(', ') + ")"
+                    delete = "DELETE FROM csar_wounded WHERE id NOT IN (" + currentids.strip(', ') + ") AND server_name = '" + server.name + "'"
                 else:
-                     delete = "DELETE FROM csar_wounded"
+                     delete = "DELETE FROM csar_wounded WHERE server_name = '" + server.name + "'"
                 conn.execute(delete)
         return data
 
     @event(name="csarGetPersistentData")
     async def getPersistentData(self, server: Server, data: dict):
         self.log.debug(server.name + " csarGetPersistentData start")
-        command = "DELETE FROM csar_wounded WHERE datestamp < NOW() - INTERVAL '{}'".format(self.expire_after)
+        command = "DELETE FROM csar_wounded WHERE datestamp < NOW() - INTERVAL '" + self.expire_after + "' AND server_name = '" + server.name + "'"
         with self.pool.connection() as conn:
             with conn.transaction():
                 conn.execute(command)
-        data = self.get_csar_wounded()
+        data = self.get_csar_wounded(server=server)
         if not data:
             self.log.debug(f"CSAR: No wounded pilots in database")
             return

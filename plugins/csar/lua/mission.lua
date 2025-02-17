@@ -42,11 +42,11 @@ function dcsbot.csarGetPersistentData(data)
 	dcsbot.sendBotTable(msg)
 end
 
--- function dcsbot._csarUpdatePersistentData(json)
--- 	log.write('DCSServerBot', log.DEBUG, 'CSAR: _csarUpdatePersistentData() (mission.lua)')
--- 	local lua = net.json2lua(json)
--- 	csar.spawnCsar(lua)
--- end
+function dcsbot._csarUpdatePersistentData(json)
+	log.write('DCSServerBot', log.DEBUG, 'CSAR: _csarUpdatePersistentData() (mission.lua)')
+	local lua = net.json2lua(json)
+	csar.spawnCsar(lua)
+end
 
 function dcsbot.rescuedPilot(playername, typename, pilotname)
 	log.write('DCSServerBot', log.DEBUG, 'CSAR: rescuedPilot (mission.lua)')
@@ -67,11 +67,11 @@ function dcsbot.csarGetLives(data)
 	dcsbot.sendBotTable(msg)
 end
 
--- function dcsbot._csarSetLives(json)
--- 	log.write('DCSServerBot', log.DEBUG, 'CSAR: _csarSetLives() (mission.lua)')
--- 	local lua = net.json2lua(json)
--- 	csar.setLives(lua)
--- end
+function dcsbot._csarSetLives(json)
+	log.write('DCSServerBot', log.DEBUG, 'CSAR: _csarSetLives() (mission.lua)')
+	local lua = net.json2lua(json)
+	csar.setLives(lua)
+end
 
 function dcsbot.blockSlot(playerName, typeName, block)
 	log.write('DCSServerBot', log.DEBUG, 'CSAR: blockSlot() (mission.lua)')
