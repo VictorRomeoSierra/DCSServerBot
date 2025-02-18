@@ -94,10 +94,12 @@ end
 
 -- Don't call this function, it's for internal use only!
 function dcsbot._setUserDiscord(user, discord)
+	log.write('DCSServerBot', log.DEBUG, 'CSAR: _setUserDiscord() (mission.lua)')
     _players[user] = discord
 end
 
 function dcsbot.getUserDiscord(user)
+	log.write('DCSServerBot', log.DEBUG, 'CSAR: getUserDiscord() (mission.lua)')
     return _players[user]
 end
 

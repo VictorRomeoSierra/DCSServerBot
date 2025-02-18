@@ -9,8 +9,7 @@ local utils 	= base.require("DCSServerBotUtils")
 
 function dcsbot.csarUpdatePersistentData(json)
     log.write('DCSServerBot', log.DEBUG, 'CSAR: csarUpdatePersistentData() (commands.lua)')
-    local lua = net.lua2json(json.data)
-    local script = 'csar.spawnCsar(' .. utils.basicSerialize(lua) .. ')'
+    local script = 'dcsbot._csarUpdatePersistentData(' .. utils.basicSerialize(json.data) .. ')'
     net.dostring_in('mission', 'a_do_script(' .. utils.basicSerialize(script) .. ')')
 end
 
