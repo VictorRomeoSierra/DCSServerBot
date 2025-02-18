@@ -19,15 +19,15 @@ function dcsbot.csarSetLives(json)
     net.dostring_in('mission', 'a_do_script(' .. utils.basicSerialize(script) .. ')')
 end
 
-function dcsbot.csarBlockSlot(playerName, typeName, block)
+function dcsbot.csarBlockSlot(json)
     log.write('DCSServerBot', log.DEBUG, 'CSAR: csarBlockSlot() (commands.lua)')
-    local script = 'dcsbot._blockSlot(' .. utils.basicSerialize(playerName) .. ',' ..  utils.basicSerialize(typeName) .. ',' .. utils.basicSerialize(block) .. ')'
+    local script = 'dcsbot._blockSlot(' .. utils.basicSerialize(json.playerName) .. ',' ..  utils.basicSerialize(json.typeName) .. ',' .. utils.basicSerialize(json.block) .. ')'
     net.dostring_in('mission', 'a_do_script(' .. utils.basicSerialize(script) .. ')')
 end
 
-function dcsbot.csarSetUserDiscord(name, discord)
+function dcsbot.csarSetUserDiscord(json)
     log.write('DCSServerBot', log.DEBUG, 'CSAR: csarSetUserDiscord() (commands.lua)')
-    local script = 'dcsbot._setUserDiscord(' .. utils.basicSerialize(name) .. ',' ..  utils.basicSerialize(discord) .. ')'
+    local script = 'dcsbot._setUserDiscord(' .. utils.basicSerialize(json.name) .. ',' ..  utils.basicSerialize(json.discord) .. ')'
     net.dostring_in('mission', 'a_do_script(' .. utils.basicSerialize(script) .. ')')
 end
 
