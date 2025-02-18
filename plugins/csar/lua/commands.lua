@@ -25,4 +25,10 @@ function dcsbot.csarBlockSlot(playerName, typeName, block)
     net.dostring_in('mission', 'a_do_script(' .. utils.basicSerialize(script) .. ')')
 end
 
+function dcsbot.csarSetUserDiscord(name, discord)
+    log.write('DCSServerBot', log.DEBUG, 'CSAR: csarSetUserDiscord() (commands.lua)')
+    local script = 'dcsbot._setUserDiscord(' .. utils.basicSerialize(name) .. ',' ..  utils.basicSerialize(discord) .. ')'
+    net.dostring_in('mission', 'a_do_script(' .. utils.basicSerialize(script) .. ')')
+end
+
 log.write('DCSServerBot', log.DEBUG, "DCSServerBot - CSAR: commands.lua loaded.")

@@ -185,7 +185,7 @@ class CsarEventListener(EventListener):
             # noinspection PyAsyncCall
             self.log.debug('CSAR: onPlayerStart - player ' + player.display_name + ' added with discord ID ' + str(player.member.id))
             asyncio.create_task(server.send_to_dcs({
-                'command': '_setUserDiscord',
+                'command': 'csarSetUserDiscord',
                 'name': player.display_name,
                 'discord': player.member.id
             }))
