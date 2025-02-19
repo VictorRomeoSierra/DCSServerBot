@@ -35,7 +35,7 @@ class CsarEventListener(EventListener):
         with self.pool.connection() as conn:
             with closing(conn.cursor(row_factory=dict_row)) as cursor:
                 return list(cursor.execute("""
-                    SELECT id, coalition, country, pos, coordinates, typename, unitname, playername, freq FROM csar_wounded
+                    SELECT DATE_PART('EPOCH', datestamp) AS time, id, coalition, country, pos, coordinates, typename, unitname, playername, freq FROM csar_wounded
                     WHERE server_name = %s
                 """, (server.name, )).fetchall())
 
