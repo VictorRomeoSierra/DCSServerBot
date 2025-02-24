@@ -74,7 +74,7 @@ class CsarEventListener(EventListener):
                     else:
                         playername = w['unitname']
                     row = conn.execute("""
-                        SELECT id FROM csar_wounded WHERE id = %s AND server_name = '%s'
+                        SELECT id FROM csar_wounded WHERE id = %s AND server_name = %s
                         """,(w['id'], server.name, )).fetchone()
                     if row:
                         conn.execute("""
