@@ -89,7 +89,7 @@ end
 
 function dcsbot._blockSlot(playerName, typeName, block)
 	log.write('DCSServerBot', log.DEBUG, 'CSAR: _blockSlot() (mission.lua)')
-	slotblock.blockSlot(playerName, typeName, block) -- this better work
+	csar.blockSlot(playerName, typeName, block) -- this better work
 end
 
 -- Don't call this function, it's for internal use only!
