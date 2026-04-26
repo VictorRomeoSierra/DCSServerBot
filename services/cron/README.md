@@ -6,6 +6,7 @@ More to come.
 As per usual, the service is configured with a yaml file, in this case config/services/cron.yaml:
 ```yaml
 DEFAULT:
+  timezone: UTC                         # Set the timezone the schedule should run on
   actions:
     - cron: '0 * * * *'                 # run every full hour
       action:
@@ -30,8 +31,8 @@ DEFAULT:
             - 112233445566778899
             - 998877665544332211
           older_than: 7                 # delete all messages that are older than 7 days
-          ignore: 119922883377446655    # ignore this user id (probably the bots)
-DCS.release_server:
+          ignore: 119922883377446655    # ignore this user id AND message id (either the bot's or persistent messages in the channel); can be either an ID or a list of IDs
+DCS.dcs_serverrelease:
   actions:
     - cron: '0 0,4,8,12,16,20 * * *'  # run every 4 hrs
       action:
@@ -77,6 +78,7 @@ DEFAULT:
           rotate: true                  # Optional: rotate to the next mission
           shutdown: true                # Optional: shutdown the DCS server
           reboot: true                  # Optional: reboot the PC (shutdown /r)
+          maintenance: false            # Optional: reset any maintenance flag to false
 ```
 
 c) halt
@@ -87,6 +89,8 @@ DEFAULT:
     - cron: '0 4 * * 1'                 # shut the server down once a week on Monday
       action:
         type: halt                      # reboot the server each monday night at 03:00
+        params:
+          maintenance: false            # Optional: reset any maintenance flag to false
 ```
 
 d) cmd
@@ -102,9 +106,9 @@ DEFAULT:
 ```
 
 e) popup
-Send a popup
+Send a popup to a running server.
 ```yaml
-DEFAULT:
+DCS.server_release:
   actions:
     - cron: '55 3 * * 1'                # Send a message to everyone at Mo, 03:55h
       action:
@@ -114,7 +118,20 @@ DEFAULT:
           timeout: 20
 ```
 
-f) purge_channel
+f) broadcast
+Send a popup to all running servers.
+```yaml
+DEFAULT:
+  actions:
+    - cron: '55 3 * * 1'                # Send a message to everyone at Mo, 03:55h
+      action:
+        type: broadcast                     
+        params:
+          message: Server will shut down in 5 mins!
+          timeout: 20
+```
+
+g) purge_channel
 Delete messages from a Discord channel.
 ```yaml
 DEFAULT:
@@ -127,10 +144,10 @@ DEFAULT:
             - 112233445566778899
             - 998877665544332211
           older_than: 7                 # delete all messages that are older than 7 days
-          ignore: 119922883377446655    # ignore this user id (probably the bots)
+          ignore: 119922883377446655    # ignore this user id AND message id (either the bot's or persistent messages in the channel); can be either an ID or a list of IDs
 ```
 
-g) dcs_update
+h) dcs_update
 Run a DCS update at a specific time.
 ```yaml
 DEFAULT:
@@ -142,4 +159,32 @@ DEFAULT:
           warn_times:     # Optional: warn users before the update
             - 120
             - 60
+```
+
+i) dcs_repair
+Run a DCS repair at a specific time.
+```yaml
+DEFAULT:
+  actions:
+    - cron: '0 1 1 * *'   # run every month on the 1st at 01:00
+      action:
+        type: dcs_repair  # Repair DCS
+        params:
+          slow: true                # optional: do a slow repair (default: false)
+          check_extra_files: true   # optional: check extra files (default: false)
+          warn_times:               # Optional: warn users before the update
+            - 120
+            - 60
+```
+
+j) node_shutdown
+Shutdown / restart the bot.
+```yaml
+DEFAULT:
+  actions:
+    - cron: '0 3 * * *'     # run every night at 03:00
+      action:
+        type: node_shutdown  # restart the bot
+        params:
+          restart: true
 ```

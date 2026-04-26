@@ -2,18 +2,34 @@ import os
 import re
 import shutil
 
-from core import Extension
-from typing import Optional, Union
+from core import Server, InstallableExtension
+from typing_extensions import override
 
 __all__ = [
     "DSMC"
 ]
 
 
-class DSMC(Extension):
+class DSMC(InstallableExtension):
 
+    CONFIG_DICT = {
+        "autoupdate": {
+            "type": bool,
+            "label": "Autoupdate",
+            "default": True,
+            "required": False
+        }
+    }
+
+    def __init__(self, server: Server, config: dict):
+        super().__init__(server, config, repo="https://github.com/Chromium18/DSMC1", package_name="DSMC")
+        if config.get('enabled', True):
+            server.locals['mission_rewrite'] = False
+            server.locals['validate_missions'] = False
+
+    @override
     @property
-    def version(self) -> Optional[str]:
+    def version(self) -> str | None:
         hook = os.path.join(self.server.instance.home, 'Scripts', 'Hooks', 'DSMC_hooks.lua')
         try:
             version = []
@@ -28,8 +44,9 @@ class DSMC(Extension):
         except Exception:
             return None
 
-    def load_config(self) -> Optional[dict]:
-        def parse(_value: str) -> Union[int, str, bool]:
+    @override
+    def load_config(self) -> dict:
+        def parse(_value: str) -> int | str | bool:
             if _value.startswith('"'):
                 return _value[1:-1]
             elif _value == 'true':
@@ -56,12 +73,16 @@ class DSMC(Extension):
                     cfg[key] = value
         return cfg
 
+    @override
     async def prepare(self) -> bool:
+        if not await super().prepare():
+            return False
+
         if 'DSMC_updateMissionList' not in self.locals:
             self.log.error('  => DSMC_updateMissionList missing in DSMC_Dedicated_Server_options.lua! '
                            'Check your config and / or update DSMC!')
             return False
-        if self.locals.get('DSMC_updateMissionList', True) or self.locals.get('DSMC_AutosaveExit_time', 0):
+        if not self.locals.get('DSMC_updateMissionList', True) or self.locals.get('DSMC_AutosaveExit_time', 0):
             dcs_home = self.server.instance.home
             shutil.copy2(os.path.join(dcs_home, 'DSMC_Dedicated_Server_options.lua'),
                          os.path.join(dcs_home, 'DSMC_Dedicated_Server_options.lua.bak'))
@@ -70,9 +91,12 @@ class DSMC(Extension):
                 with open(os.path.join(dcs_home, 'DSMC_Dedicated_Server_options.lua'), mode='w',
                           encoding='utf-8') as outfile:
                     for line in infile.readlines():
-                        if line.strip().startswith('DSMC_updateMissionList'):
-                            line = line.replace('true', 'false', 1)
-                            self.locals['DSMC_updateMissionList'] = False
+                        if line.strip().startswith('DSMC_24_7_serverStandardSetup'):
+                            line = "DSMC_24_7_serverStandardSetup   = false     -- multiple valid values. This option is a simplified setup for the specific server autosave layout. You can input:"
+                            self.locals['DSMC_24_7_serverStandardSetup'] = False
+                        elif line.strip().startswith('DSMC_updateMissionList'):
+                            line = line.replace('false', 'true', 1)
+                            self.locals['DSMC_updateMissionList'] = True
                         elif line.strip().startswith('DSMC_AutosaveExit_time'):
                             line = line.replace(str(self.locals['DSMC_AutosaveExit_time']), '0', 1)
                             self.locals['DSMC_AutosaveExit_time'] = 0
@@ -80,6 +104,7 @@ class DSMC(Extension):
             self.log.info('  => DSMC configuration changed to be compatible with DCSServerBot.')
         return True
 
+    @override
     async def beforeMissionLoad(self, filename: str) -> tuple[str, bool]:
         if not os.path.basename(filename).startswith('DSMC'):
             return filename, False
@@ -94,16 +119,16 @@ class DSMC(Extension):
         else:
             return orig, False
 
-    async def render(self, param: Optional[dict] = None) -> dict:
+    @override
+    async def render(self, param: dict | None = None) -> dict:
         return {
-            "name": "DSMC",
+            "name": self.name,
             "version": self.version,
             "value": "enabled"
         }
 
+    @override
     def is_installed(self) -> bool:
-        if not super().is_installed():
-            return False
         dcs_home = self.server.instance.home
         if not os.path.exists(os.path.join(dcs_home, 'DSMC')) or \
                 not os.path.exists(os.path.join(dcs_home, 'Scripts', 'Hooks', 'DSMC_hooks.lua')):
@@ -111,8 +136,10 @@ class DSMC(Extension):
             return False
         return True
 
-    def shutdown(self) -> bool:
-        return True
+    @override
+    async def startup(self, *, quiet: bool = False) -> bool:
+        return await super().startup(quiet=True)
 
-    def is_running(self) -> bool:
-        return True
+    @override
+    def shutdown(self, *, quiet: bool = False) -> bool:
+        return super().shutdown(quiet=True)

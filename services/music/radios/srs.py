@@ -1,61 +1,51 @@
 import asyncio
+import contextlib
 import os
-import subprocess
+import psutil
 
 from core import Server, Status, Coalition, utils
-from typing import Optional
-
-from services.music.radios.base import RadioInitError, Radio
+from extensions.srs import SRS
+from services.music.radios.base import Radio
 from plugins.music.utils import get_tag
+from typing import cast
 
 
 class SRSRadio(Radio):
 
     def __init__(self, name: str, server: Server):
         super().__init__(name, server)
-        self.process: Optional[subprocess.Popen] = None
+        self.process: psutil.Process | None = None
 
     async def play(self, file: str) -> None:
-        if self.current and self.process:
-            await self.skip()
+        extension = cast(SRS, self.server.extensions.get('SRS'))
+        if not extension:
+            self.log.error("SRS extension not found, can't play music.")
+            return
+
         if self.server.status != Status.RUNNING:
             await self.stop()
             return
+
+        # skip any song (if running)
+        await self.skip()
+
         self.log.debug(f"Playing {file} ...")
 
         try:
-            try:
-                srs_inst = os.path.expandvars(
-                    self.server.extensions['SRS'].config.get('installation',
-                                                             '%ProgramFiles%\\DCS-SimpleRadio-Standalone'))
-                srs_port = self.server.extensions['SRS'].locals['Server Settings']['SERVER_PORT']
-            except KeyError:
-                raise RadioInitError("You need to set the SRS path in your nodes.yaml!")
-            self.current = file
-
-            def run_subprocess():
-                return subprocess.Popen([
-                    os.path.join(srs_inst, "DCS-SR-ExternalAudio.exe"),
-                    "-f", str(self.config['frequency']),
-                    "-m", self.config['modulation'],
-                    "-c", str(self.config['coalition']),
-                    "-v", str(self.config.get('volume', 1.0)),
-                    "-p", str(srs_port),
-                    "-n", self.config.get('display_name', 'DCSSB MusicBox'),
-                    "-i", file
-                ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-            self.process = await asyncio.to_thread(run_subprocess)
+            proc = await extension.play_external_audio(self.config, file=file)
+            self.process = proc
+            self.current = get_tag(file).title or os.path.basename(file)
             coalition = Coalition.BLUE if int(self.config['coalition']) == 2 else Coalition.RED
-            if 'popup' in self.config:
+            server_config = self.service.get_config(self.server)
+            if 'popup' in server_config:
                 kwargs = self.config.copy()
-                kwargs['song'] = get_tag(file).title or os.path.basename(file)
-                await self.server.sendPopupMessage(coalition, utils.format_string(self.config['popup'], **kwargs))
-            if 'chat' in self.config:
+                kwargs['song'] = self.current
+                await self.server.sendPopupMessage(coalition, utils.format_string(server_config['popup'], **kwargs))
+            if 'chat' in server_config:
                 kwargs = self.config.copy()
-                kwargs['song'] = get_tag(file).title or os.path.basename(file)
-                await self.server.sendChatMessage(coalition, utils.format_string(self.config['chat'], **kwargs))
-            await asyncio.to_thread(self.process.wait)
+                kwargs['song'] = self.current
+                await self.server.sendChatMessage(Coalition.ALL, utils.format_string(server_config['chat'], **kwargs))
+            await asyncio.to_thread(proc.wait)
         except Exception as ex:
             self.log.exception(ex)
         finally:
@@ -63,10 +53,16 @@ class SRSRadio(Radio):
             self.process = None
 
     async def skip(self) -> None:
-        if self.process and self.process.poll() is None:
-            self.process.terminate()
-            self.current = None
-            self.process = None
+        if self.process and self.process.is_running():
+            try:
+                self.process.terminate()
+                await asyncio.to_thread(self.process.wait, 5)
+            except (psutil.TimeoutExpired, psutil.NoSuchProcess):
+                with contextlib.suppress(psutil.NoSuchProcess):
+                    self.process.kill()
+            finally:
+                self.current = None
+                self.process = None
 
     async def stop(self) -> None:
         if self.queue_worker.is_running():

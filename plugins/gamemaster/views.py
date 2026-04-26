@@ -1,23 +1,39 @@
 import discord
 
-from core import TEventListener, Server, get_translation, utils
+from core import Server, get_translation, utils
 from datetime import datetime, timezone
+from discord import TextStyle, ButtonStyle
 from discord.ui import Modal, TextInput, View
-from typing import Type, Union, Optional
 
 _ = get_translation(__name__.split('.')[1])
 
 
 class CampaignModal(Modal):
-    name = TextInput(label=_("Name"), required=True, style=discord.TextStyle.short, min_length=3, max_length=80)
+    # noinspection PyTypeChecker
+    name = TextInput(label=_("Name"), required=True, style=TextStyle.short, min_length=3, max_length=80)
+    # noinspection PyTypeChecker
     start = TextInput(label=_("Start (UTC)"), placeholder="yyyy-mm-dd hh24:mi", required=True)
+    # noinspection PyTypeChecker
     end = TextInput(label=_("End (UTC)"), placeholder="yyyy-mm-dd hh24:mi", required=False)
-    description = TextInput(label=_("Description"), required=False, style=discord.TextStyle.long)
+    # noinspection PyTypeChecker
+    description = TextInput(label=_("Description"), required=False, style=TextStyle.long)
+    # noinspection PyTypeChecker
+    image_url = TextInput(label=_("Image URL"), required=False, style=TextStyle.short)
 
-    def __init__(self, eventlistener: Type[TEventListener]):
+    def __init__(self, name: str | None = None, start: datetime | None = None, end: datetime | None = None,
+                 description: str | None = None, image_url: str | None = None):
         super().__init__(title=_("Campaign Info"))
-        self.eventlistener = eventlistener
-        self.start.default = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+        if name:
+            self.remove_item(self.name)
+            self.title = _("Edit Campaign {}".format(name))
+        if start:
+            self.start.default = start.strftime("%Y-%m-%d %H:%M")
+        else:
+            self.start.default = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+        if end:
+            self.end.default = end.strftime("%Y-%m-%d %H:%M")
+        self.description.default = description
+        self.image_url.default = image_url
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         try:
@@ -25,21 +41,22 @@ class CampaignModal(Modal):
         except ValueError:
             # noinspection PyUnresolvedReferences
             await interaction.response.send_message(
-                _("Format for {} needs to be yyyy-mm-dd hh24:mi!").format(self.start.label), ephemeral=True)
+                _("Format for {} needs to be yyyy-mm-dd hh24:mi!").format(self.start.value), ephemeral=True)
             raise
         try:
             self.end = datetime.strptime(self.end.value, '%Y-%m-%d %H:%M') if self.end.value else None
         except ValueError:
             # noinspection PyUnresolvedReferences
             await interaction.response.send_message(
-                _("Format for {} needs to be yyyy-mm-dd hh24:mi!").format(self.end.label), ephemeral=True)
+                _("Format for {} needs to be yyyy-mm-dd hh24:mi!").format(self.end.value), ephemeral=True)
             raise
         # noinspection PyUnresolvedReferences
         await interaction.response.defer()
 
 
 class ScriptModal(Modal):
-    script = TextInput(label=_("Enter your script here:"), style=discord.TextStyle.long, required=True)
+    # noinspection PyTypeChecker
+    script = TextInput(label=_("Enter your script here:"), style=TextStyle.long, required=True)
 
     def __init__(self, server: Server, ephemeral: bool):
         super().__init__(title=_("Lua Script"))
@@ -53,12 +70,15 @@ class ScriptModal(Modal):
         })
         # noinspection PyUnresolvedReferences
         await interaction.response.send_message(_('Script sent.'), ephemeral=self.ephemeral)
+        await interaction.client.audit(f"sent LUA script:\n```lua\n{self.script.value}```",
+                                       user=interaction.user, server=self.server)
 
 
 class MessageModal(Modal):
-    message = TextInput(label="Message", style=discord.TextStyle.long, required=True)
+    # noinspection PyTypeChecker
+    message = TextInput(label="Message", style=TextStyle.long, required=True)
 
-    def __init__(self, message: Optional[str] = None):
+    def __init__(self, message: str | None = None):
         super().__init__(title="User Message")
         if message:
             self.message.default = message
@@ -71,7 +91,7 @@ class MessageModal(Modal):
 
 class MessageView(View):
 
-    def __init__(self, messages: list[dict], user: Union[str, discord.Member]):
+    def __init__(self, messages: list[dict], user: str | discord.Member):
         super().__init__()
         self.index = 0
         self.messages = messages
@@ -88,7 +108,8 @@ class MessageView(View):
                         value=self.messages[self.index]['message'], inline=False)
         return embed
 
-    @discord.ui.button(emoji='◀️', style=discord.ButtonStyle.primary)
+    # noinspection PyTypeChecker
+    @discord.ui.button(emoji='◀️', style=ButtonStyle.primary)
     async def on_left(self, interaction: discord.Interaction, _: discord.ui.Button):
         # noinspection PyUnresolvedReferences
         await interaction.response.defer()
@@ -96,37 +117,38 @@ class MessageView(View):
             self.index -= 1
             await interaction.edit_original_response(embed=await self.render(), view=self)
 
-    @discord.ui.button(emoji='🗒️', style=discord.ButtonStyle.primary)
+    # noinspection PyTypeChecker
+    @discord.ui.button(emoji='🗒️', style=ButtonStyle.primary)
     async def on_edit(self, interaction: discord.Interaction, _: discord.ui.Button):
         modal = MessageModal(self.messages[self.index]['message'])
         # noinspection PyUnresolvedReferences
         await interaction.response.send_modal(modal)
         if not await modal.wait():
             async with interaction.client.apool.connection() as conn:
-                async with conn.transaction():
-                    await conn.execute("""
-                        UPDATE messages SET message = %s WHERE id = %s
-                    """, (modal.message.value, self.messages[self.index]['id']))
+                await conn.execute("""
+                    UPDATE messages SET message = %s WHERE id = %s
+                """, (modal.message.value, self.messages[self.index]['id']))
             self.messages[self.index]['message'] = modal.message.value
             await interaction.edit_original_response(embed=await self.render(), view=self)
 
-    @discord.ui.button(emoji='🚮', style=discord.ButtonStyle.primary)
-    async def on_delete(self, interaction: discord.Interaction, button: discord.ui.Button):
+    # noinspection PyTypeChecker
+    @discord.ui.button(emoji='🚮', style=ButtonStyle.primary)
+    async def on_delete(self, interaction: discord.Interaction, _button: discord.ui.Button):
         # noinspection PyUnresolvedReferences
         await interaction.response.defer()
         async with interaction.client.apool.connection() as conn:
-            async with conn.transaction():
-                await conn.execute("DELETE FROM messages WHERE id = %s", (self.messages[self.index]['id'],))
+            await conn.execute("DELETE FROM messages WHERE id = %s", (self.messages[self.index]['id'],))
         self.messages.pop(self.index)
         if not self.messages:
-            await interaction.followup.send(_("No messages left."))
+            await interaction.followup.send(_("No messages left."), ephemeral=True)
             self.stop()
             return
         if self.index > len(self.messages) - 1:
             self.index -= 1
         await interaction.edit_original_response(embed=await self.render(), view=self)
 
-    @discord.ui.button(emoji='▶️', style=discord.ButtonStyle.primary)
+    # noinspection PyTypeChecker
+    @discord.ui.button(emoji='▶️', style=ButtonStyle.primary)
     async def on_right(self, interaction: discord.Interaction, _: discord.ui.Button):
         # noinspection PyUnresolvedReferences
         await interaction.response.defer()
@@ -134,7 +156,8 @@ class MessageView(View):
             self.index += 1
             await interaction.edit_original_response(embed=await self.render(), view=self)
 
-    @discord.ui.button(label="Quit", style=discord.ButtonStyle.red)
+    # noinspection PyTypeChecker
+    @discord.ui.button(label="Quit", style=ButtonStyle.red)
     async def on_cancel(self, interaction: discord.Interaction, _: discord.ui.Button):
         # noinspection PyUnresolvedReferences
         await interaction.response.defer()

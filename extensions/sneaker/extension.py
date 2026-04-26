@@ -7,16 +7,12 @@ import os
 import psutil
 import subprocess
 
-from core import Extension, Status, ServiceRegistry, Server, utils, get_translation
+from core import Extension, Status, ServiceRegistry, Server, utils, get_translation, PortType, Port, ProcessManager
 from services.servicebus import ServiceBus
 from threading import Thread
-from typing import Optional
+from typing_extensions import override
 
 _ = get_translation(__name__.split('.')[1])
-
-process: Optional[psutil.Process] = None
-servers: set[str] = set()
-lock = asyncio.Lock()
 
 __all__ = [
     "Sneaker"
@@ -24,6 +20,9 @@ __all__ = [
 
 
 class Sneaker(Extension):
+    _process: psutil.Process | None = None
+    _servers: set[str] = set()
+    _lock = asyncio.Lock()
 
     CONFIG_DICT = {
         "bind": {
@@ -39,16 +38,21 @@ class Sneaker(Extension):
     }
 
     def __init__(self, server: Server, config: dict):
-        global process
-
         super().__init__(server, config)
         self.bus = ServiceRegistry.get(ServiceBus)
-        if self.enabled and (not process or not process.is_running()):
-            cmd = self.config.get('cmd')
+        if self.enabled and (not type(self)._process or not type(self)._process.is_running()):
+            cmd = self.get_exe_path()
             if not cmd:
                 return
-            process = utils.find_process(os.path.basename(cmd))
-            if process:
+            type(self)._process = next(utils.find_process(os.path.basename(cmd), self.config['bind']), None)
+            if type(self)._process:
+                ProcessManager().assign_process(
+                    type(self)._process,
+                    min_cores=self.config.get('auto_affinity', {}).get('min_cores', 1),
+                    max_cores=self.config.get('auto_affinity', {}).get('max_cores', 1),
+                    quality=self.config.get('auto_affinity', {}).get('quality', 1),
+                    instance=server.instance.name
+                )
                 self.log.debug("- Running Sneaker process found.")
 
     def create_config(self):
@@ -74,119 +78,124 @@ class Sneaker(Extension):
         cfg['servers'] = [
             x for x in cfg['servers'] if x['name'] in [
                 y.name for y in self.bus.servers.values()
-                if y.status not in [Status.UNREGISTERED, Status.SHUTDOWN]
+                if y.name == self.server.name or y.status not in [Status.UNREGISTERED, Status.SHUTDOWN]
             ]
         ]
         with open(filename, mode='w', encoding='utf-8') as file:
             json.dump(cfg, file, indent=2)
+        self.log.debug(f"Created / updated Sneaker config file: {filename}")
 
-    def _log_output(self, p: subprocess.Popen):
+    def get_exe_path(self) -> str | None:
+        return os.path.expandvars(self.config['cmd']) if 'cmd' in self.config else None
+
+    def _log_output(self, p: psutil.Popen):
         for line in iter(p.stdout.readline, b''):
             self.log.debug(line.decode('utf-8').rstrip())
 
-    def _run_subprocess(self, config: str):
-        cmd = os.path.basename(self.config['cmd'])
+    def _run_subprocess(self, config: str) -> psutil.Process:
+        cmd = os.path.basename(self.get_exe_path())
         out = subprocess.PIPE if self.config.get('debug', False) else subprocess.DEVNULL
         self.log.debug(f"Launching Sneaker server with {cmd} --bind {self.config['bind']} "
                        f"--config {config}")
-        p = subprocess.Popen([cmd, "--bind", self.config['bind'], "--config", config],
-                             executable=os.path.expandvars(self.config['cmd']),
-                             stdout=out, stderr=subprocess.STDOUT)
+        p = ProcessManager().launch_process(
+            [cmd, "--bind", self.config['bind'], "--config", config],
+            executable=os.path.expandvars(self.config['cmd']),
+            min_cores=self.config.get('auto_affinity', {}).get('min_cores', 1),
+            max_cores=self.config.get('auto_affinity', {}).get('max_cores', 1),
+            quality=self.config.get('auto_affinity', {}).get('quality', 1),
+            stdout=out,
+            stderr=subprocess.STDOUT
+        )
         if self.config.get('debug', False):
             Thread(target=self._log_output, args=(p,), daemon=True).start()
         return p
 
-    async def startup(self) -> bool:
-        global process, servers, lock
-
+    @override
+    async def startup(self, *, quiet: bool = False) -> bool:
         if 'Tacview' not in self.server.options['plugins']:
             self.log.warning('Sneaker needs Tacview to be enabled in your server!')
             return False
         try:
-            async with lock:
+            async with type(self)._lock:
                 if 'config' not in self.config:
-                    # we need to lock here, to avoid race conditions on parallel server startups
-                    await asyncio.to_thread(utils.terminate_process, process)
+                    # we need to lock here to avoid race conditions on parallel server startups
+                    await asyncio.to_thread(utils.terminate_process, type(self)._process)
                     self.create_config()
-                    p = await asyncio.to_thread(self._run_subprocess,
-                                                os.path.join(self.node.config_dir, 'sneaker.json'))
-                    process = psutil.Process(p.pid)
-                elif not process or not process.is_running():
-                    p = await asyncio.to_thread(self._run_subprocess, os.path.expandvars(self.config['config']))
-                    process = psutil.Process(p.pid)
+                    type(self)._process = await asyncio.to_thread(
+                        self._run_subprocess,
+                        os.path.join(self.node.config_dir, 'sneaker.json')
+                    )
+                elif not type(self)._process or not type(self)._process.is_running():
+                    type(self)._process = await asyncio.to_thread(
+                        self._run_subprocess, os.path.expandvars(self.config['config'])
+                    )
                     atexit.register(self.terminate)
-            servers.add(self.server.name)
+            type(self)._servers.add(self.server.name)
             return await super().startup()
         except Exception as ex:
-            self.log.error(f"Error during launch of {self.config['cmd']}: {str(ex)}")
+            self.log.error(f"Error during launch of {self.get_exe_path()}: {str(ex)}")
             return False
 
     def terminate(self) -> bool:
-        global process
-
         try:
-            if process:
-                utils.terminate_process(process)
-                process = None
+            if type(self)._process:
+                utils.terminate_process(type(self)._process)
+                type(self)._process = None
             return True
         except Exception as ex:
-            self.log.error(f"Error during shutdown of {self.config['cmd']}: {str(ex)}")
+            self.log.error(f"Error during shutdown of {self.get_exe_path()}: {str(ex)}")
             return False
 
-    def shutdown(self) -> bool:
-        global process, servers
-
+    @override
+    def shutdown(self, *, quiet: bool = False) -> bool:
         try:
-            servers.remove(self.server.name)
-            if not servers:
+            type(self)._servers.remove(self.server.name)
+            if not type(self)._servers:
                 super().shutdown()
                 return self.terminate()
             elif 'config' not in self.config:
                 if self.terminate():
                     self.create_config()
                     try:
-                        p = self._run_subprocess(os.path.join(self.node.config_dir, 'sneaker.json'))
-                        process = psutil.Process(p.pid)
+                        type(self)._process = self._run_subprocess(os.path.join(self.node.config_dir, 'sneaker.json'))
                     except Exception as ex:
-                        self.log.error(f"Error during launch of {self.config['cmd']}: {str(ex)}")
+                        self.log.error(f"Error during launch of {self.get_exe_path()}: {str(ex)}")
                         return False
                 else:
                     return False
+            super().shutdown(quiet=True)
             return True
         except Exception as ex:
             self.log.exception(ex)
             return False
 
+    @override
     def is_running(self) -> bool:
-        global process, servers
+        return type(self)._process and type(self)._process.is_running() and self.server.name in type(self)._servers
 
-        return process is not None and process.is_running() and self.server.name in servers
-
+    @override
     @property
-    def version(self) -> Optional[str]:
-        return utils.get_windows_version(self.config['cmd'])
+    def version(self) -> str | None:
+        return utils.get_windows_version(self.get_exe_path())
 
-    def is_installed(self) -> bool:
-        if not super().is_installed():
-            return False
-        # check if Sneaker is installed
-        if 'cmd' not in self.config or not os.path.exists(os.path.expandvars(self.config['cmd'])):
-            self.log.warning("  => Sneaker: can't run extension, executable not found!")
-            return False
-        return True
-
-    async def render(self, param: Optional[dict] = None) -> dict:
+    @override
+    async def render(self, param: dict | None = None) -> dict:
         if 'url' in self.config:
             value = self.config['url']
         else:
             value = 'enabled'
         return {
-            "name": "Sneaker",
+            "name": self.name,
             "version": self.version or 'n/a',
             "value": value
         }
 
-    def get_ports(self) -> dict:
+    @override
+    def get_ports(self) -> dict[str, Port]:
         return {
-            "Sneaker": self.config['bind'].split(':')[1]
-        }
+            "Sneaker": Port(self.config['bind'].split(':')[1], PortType.TCP, public=True)
+        } if self.enabled else {}
+
+    @override
+    def is_available(self) -> bool:
+        return os.path.exists(self.get_exe_path())

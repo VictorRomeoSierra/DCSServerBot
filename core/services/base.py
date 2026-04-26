@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 
 from abc import ABC
-from core import utils
+from core import utils, Port
 from enum import Enum
 from functools import wraps
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional, Callable, Any
+from typing import Callable, Any, TYPE_CHECKING
 
-from ..const import DEFAULT_TAG
-from ..data.dataobject import DataObject
+from core.const import DEFAULT_TAG
+from core.data.dataobject import DataObject
+
+if TYPE_CHECKING:
+    from core import Server, NodeImpl
 
 # ruamel YAML support
 from pykwalify.errors import PyKwalifyException
@@ -20,17 +24,16 @@ from ruamel.yaml import YAML
 from ruamel.yaml.error import MarkedYAMLError
 yaml = YAML()
 
-if TYPE_CHECKING:
-    from core import Server, NodeImpl
-
 __all__ = [
     "proxy",
     "Service",
     "ServiceInstallationError"
 ]
 
+logger = logging.getLogger(__name__)
 
-def proxy(original_function: Callable[..., Any]):
+
+def proxy(_func: Callable[..., Any] | None = None, *, timeout: float = 60):
     """
     Can be used as a decorator to any service method, that should act as a remote call, if the server provided
     is not on the same node.
@@ -39,45 +42,72 @@ def proxy(original_function: Callable[..., Any]):
     async def my_fancy_method(self, server: Server, *args, **kwargs) -> Any:
         ...
 
-    This will call my_fancy_method on the remote node, if the server is remote, and on the local node, if it is not.
+    This will call my_fancy_method on the remote node if the server is remote, and on the local node, if it is not.
     """
-    @wraps(original_function)
-    async def wrapper(self, server: Server, *args, **kwargs):
-        # Get argument names from the original function
-        arg_names = list(original_function.__annotations__.keys()) if hasattr(original_function,
-                                                                              "__annotations__") else []
+    def decorator(original_function: Callable[..., Any]):
+        @wraps(original_function)
+        async def wrapper(self, *args, **kwargs):
+            signature = inspect.signature(original_function)
+            bound_args = signature.bind(self, *args, **kwargs)
+            bound_args.apply_defaults()
+            arg_dict = {k: v for k, v in bound_args.arguments.items() if k != "self"}
 
-        # Prepare params by dereferencing DataObject instances to their names,
-        # while matching argument names with values.
-        params = {
-            k: v.name if isinstance(v, DataObject)
-            else v.value if isinstance(v, Enum)
-            else v
-            for k, v in zip(arg_names[1:], args)
-            if v is not None
-        }
+            # Dereference DataObject and Enum values in parameters
+            params = {
+                k: v.name if isinstance(v, DataObject)
+                else v.value if isinstance(v, Enum)
+                else v
+                for k, v in arg_dict.items()
+                if v is not None  # Ignore None values
+            }
 
-        if server.is_remote:
-            data = await self.bus.send_to_node_sync({
+            call = {
                 "command": "rpc",
                 "service": self.__class__.__name__,
                 "method": original_function.__name__,
-                "params": {"server": server.name} | params
-            }, node=server.node.name, timeout=60)
-            return data.get('return')
-        return await original_function(self, server, *args, **kwargs)
+                "params": params
+            }
 
-    return wrapper
+            # Try to pick the node from the functions arguments
+            node = None
+            if arg_dict.get("server"):
+                node = arg_dict["server"].node
+            elif arg_dict.get("instance"):
+                node = arg_dict["instance"].node
+            elif arg_dict.get("node"):
+                node = arg_dict["node"]
+
+            # Log an error if no valid object is found
+            if node is None:
+                raise ValueError(
+                    f"Cannot proxy function {original_function.__name__}: no valid reference object found in arguments. "
+                    f"Expected 'server', 'instance', or 'node' parameter with valid node reference.")
+
+            # If the node is remote, send the call synchronously
+            if node.is_remote:
+                data = await self.bus.send_to_node_sync(call, node=node.name, timeout=timeout)
+                return data
+
+            # Otherwise, call the original function directly
+            return await original_function(self, *args, **kwargs)
+        return wrapper
+
+    # If used as @proxy(timeout=nn)
+    if _func is None:
+        return decorator
+
+    # If used as @proxy without parentheses
+    return decorator(_func)
 
 
 class Service(ABC):
     dependencies: list[type[Service]] = None
 
-    def __init__(self, node: NodeImpl, name: Optional[str] = None):
+    def __init__(self, node: NodeImpl, name: str | None = None):
         self.name = name or self.__class__.__name__
         self.running: bool = False
-        self.node: NodeImpl = node
-        self.log = logging.getLogger(__name__)
+        self.node = node
+        self.log = logging.getLogger(f"{self.__class__.__module__}.{self.__class__.__name__}")
         self.pool = node.pool
         self.apool = node.apool
         self.config = node.config
@@ -105,7 +135,7 @@ class Service(ABC):
         self.running = False
         self.log.info(f'  => Service {self.name} stopped.')
 
-    async def switch(self):
+    async def switch(self, master: bool):
         ...
 
     def is_running(self) -> bool:
@@ -121,28 +151,37 @@ class Service(ABC):
             validation = self.node.config.get('validation', 'lazy')
             if os.path.exists(path) and validation in ['strict', 'lazy']:
                 schema_files = [str(x) for x in Path(path).glob('*.yaml')]
-                utils.validate(filename, schema_files, raise_exception=(validation == 'strict'))
+                if schema_files:
+                    utils.validate(filename, schema_files, raise_exception=(validation == 'strict'))
+                else:
+                    self.log.warning(f'No schema file for service "{self.name}" found.')
 
             return yaml.load(Path(filename).read_text(encoding='utf-8'))
         except (MarkedYAMLError, PyKwalifyException) as ex:
             raise ServiceInstallationError(self.name, ex.__str__())
 
     def save_config(self):
-        with open(os.path.join(self.node.config_dir, 'services', self.name + '.yaml'),
+        with open(os.path.join(self.node.config_dir, 'services', f'{self.name.lower()}.yaml'),
                   mode='w', encoding='utf-8') as outfile:
             yaml.dump(self.locals, outfile)
 
-    def get_config(self, server: Optional[Server] = None) -> dict:
+    def get_config(self, server: Server | None = None, **kwargs) -> dict:
         if not server:
             return self.locals.get(DEFAULT_TAG, {})
         if server.node.name not in self._config:
             self._config[server.node.name] = {}
         if server.instance.name not in self._config[server.node.name]:
-            self._config[server.node.name][server.instance.name] = (
-                    self.locals.get(DEFAULT_TAG, {}) |
+            self._config[server.node.name][server.instance.name] = utils.deep_merge(
+                    self.locals.get(DEFAULT_TAG, {}),
                     self.locals.get(server.node.name, self.locals).get(server.instance.name, {})
             )
         return self._config.get(server.node.name, {}).get(server.instance.name, {})
+
+    def reload(self):
+        self.locals = self.read_locals()
+
+    def get_ports(self) -> dict[str, Port]:
+        return {}
 
 
 class ServiceInstallationError(Exception):

@@ -3,11 +3,39 @@ import git
 import os
 import subprocess
 
-from core import Extension, utils, Server
+from core import Extension, utils, Server, get_translation
+from typing_extensions import override
 from urllib.parse import urlparse
+
+_ = get_translation(__name__.split('.')[1])
 
 
 class GitHub(Extension):
+
+    CONFIG_DICT = {
+        "repo": {
+            "type": str,
+            "label": _("Repository"),
+            "required": True
+        },
+        "branch": {
+            "type": str,
+            "label": _("Branch"),
+            "default": "main",
+            "required": True
+        },
+        "target": {
+            "type": str,
+            "label": _("Target"),
+            "default": "{server.instance.home}\\Missions",
+            "required": True
+        },
+        "filter": {
+            "type": str,
+            "label": _("Filter"),
+            "required": False
+        }
+    }
 
     def __init__(self, server: Server, config: dict):
         super().__init__(server, config)
@@ -71,9 +99,18 @@ class GitHub(Extension):
         else:
             git.Repo.clone_from(self.repo, self.target)
 
+    @override
     async def beforeMissionLoad(self, filename: str) -> tuple[str, bool]:
         try:
             await self.update()
         except (git.NoSuchPathError, git.InvalidGitRepositoryError):
             await self.clone()
         return filename, False
+
+    @override
+    async def startup(self, *, quiet: bool = False) -> bool:
+        return await super().startup(quiet=True)
+
+    @override
+    def shutdown(self, *, quiet: bool = False) -> bool:
+        return super().shutdown(quiet=True)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import aiofiles
 import asyncio
 import discord.errors
 import inspect
@@ -11,6 +12,7 @@ import shutil
 import sqlparse
 import sys
 
+from abc import ABC, ABCMeta
 from copy import deepcopy
 from core import utils
 from core.services.registry import ServiceRegistry
@@ -21,7 +23,7 @@ from discord.ext import commands, tasks
 from discord.utils import MISSING, _shorten
 from packaging.version import parse
 from pathlib import Path
-from typing import Type, Optional, TYPE_CHECKING, Union, Any, Dict, Callable, List, Generic
+from typing import Type, TYPE_CHECKING, Any, Callable, Generic
 
 from .const import DEFAULT_TAG
 from .listener import TEventListener
@@ -54,11 +56,11 @@ __all__ = [
 
 def command(
     *,
-    name: Union[str, locale_str] = MISSING,
-    description: Union[str, locale_str] = MISSING,
+    name: str | locale_str = MISSING,
+    description: str | locale_str = MISSING,
     nsfw: bool = False,
     auto_locale_strings: bool = True,
-    extras: Dict[Any, Any] = MISSING,
+    extras: dict[Any, Any] = MISSING,
 ) -> Callable[[CommandCallback[GroupT, P, T]], Command[GroupT, P, T]]:
     """Creates an application command from a regular function.
 
@@ -111,19 +113,19 @@ def command(
     return decorator
 
 
-class Command(app_commands.Command):
+class Command(app_commands.Command[GroupT, P, T]):
 
     def __init__(
         self,
         *,
-        name: Union[str, locale_str],
-        description: Union[str, locale_str],
+        name: str | locale_str,
+        description: str | locale_str,
         callback: CommandCallback[GroupT, P, T],
         nsfw: bool = False,
-        parent: Optional[Group] = None,
-        guild_ids: Optional[List[int]] = None,
+        parent: Group | None = None,
+        guild_ids: list[int] | None = None,
         auto_locale_strings: bool = True,
-        extras: Dict[Any, Any] = MISSING,
+        extras: dict[Any, Any] = MISSING,
     ):
         from services.bot import BotService
 
@@ -138,10 +140,10 @@ class Command(app_commands.Command):
         # remove server parameter from slash commands if only one server is there
         num_servers = len(bot.servers)
         if ('server' in self._params and
-                ((num_servers == 1 and nodes == 1) or not bot.locals.get('channels', {}).get('admin'))):
+                ((num_servers <= 1 and nodes == 1) or not bot.locals.get('channels', {}).get('admin'))):
             del self._params['server']
 
-    async def _do_call(self, interaction: Interaction, params: Dict[str, Any]) -> T:
+    async def _do_call(self, interaction: Interaction, params: dict[str, Any]) -> T:
         if 'node' in inspect.signature(self._callback).parameters and 'node' not in params:
             params['node'] = interaction.client.node
         if 'server' in inspect.signature(self._callback).parameters and 'server' not in params:
@@ -154,13 +156,13 @@ class Command(app_commands.Command):
                             'No server registered for this channel. '
                             'If the channel is correct, please try again in a bit, when the server has registered.',
                             ephemeral=True)
-                        return
+                        return None
                     except discord.errors.NotFound:
                         pass
                 else:
                     # noinspection PyUnresolvedReferences
                     await interaction.response.send_message('No servers registered yet.', ephemeral=True)
-                    return
+                    return None
             params['server'] = server
         return await super()._do_call(interaction=interaction, params=params)
 
@@ -170,20 +172,20 @@ class Group(app_commands.Group):
     def command(
         self,
         *,
-        name: Union[str, locale_str] = MISSING,
-        description: Union[str, locale_str] = MISSING,
+        name: str | locale_str = MISSING,
+        description: str | locale_str = MISSING,
         nsfw: bool = False,
         auto_locale_strings: bool = True,
-        extras: Dict[Any, Any] = MISSING,
+        extras: dict[Any, Any] = MISSING,
     ) -> Callable[[CommandCallback[GroupT, P, T]], Command[GroupT, P, T]]:
         """A decorator that creates an application command from a regular function under this group.
 
         Parameters
         ------------
-        name: Union[:class:`str`, :class:`locale_str`]
+        name: str | :class:`locale_str`
             The name of the application command. If not given, it defaults to a lower-case
             version of the callback name.
-        description: Union[:class:`str`, :class:`locale_str`]
+        description: str | :class:`locale_str`
             The description of the application command. This shows up in the UI to describe
             the application command. If not given, it defaults to the first line of the docstring
             of the callback shortened to 100 characters.
@@ -227,18 +229,23 @@ class Group(app_commands.Group):
         return decorator
 
 
-class Plugin(commands.Cog, Generic[TEventListener]):
+class PluginMeta(type(commands.Cog), ABCMeta):
+    """Metaclass that satisfies both CogMeta and ABCMeta."""
+    pass
 
-    def __init__(self, bot: DCSServerBot, eventlistener: Type[TEventListener] = None):
+
+class Plugin(commands.Cog, Generic[TEventListener], metaclass=PluginMeta):
+
+    def __init__(self, bot: DCSServerBot, eventlistener: Type[TEventListener] = None, name: str | None = None):
         from services.servicebus import ServiceBus
 
         super().__init__()
-        self.plugin_name = type(self).__module__.split('.')[-2]
+        self.plugin_name = name or type(self).__module__.split('.')[-2]
         self.plugin_version = getattr(sys.modules['plugins.' + self.plugin_name], '__version__')
         self.bot: DCSServerBot = bot
         self.node = bot.node
         self.bus = ServiceRegistry.get(ServiceBus)
-        self.log = logging.getLogger(__name__)
+        self.log = logging.getLogger(f"{self.__class__.__module__}.{self.__class__.__name__}")
         self.pool = self.bot.pool
         self.apool = self.bot.apool
         self.loop = self.bot.loop
@@ -246,7 +253,7 @@ class Plugin(commands.Cog, Generic[TEventListener]):
         if self.plugin_name != 'commands' and 'commands' in self.locals:
             self.change_commands(self.locals['commands'], {x.name: x for x in self.get_app_commands()})
         self._config = dict[str, dict]()
-        self.eventlistener: Type[TEventListener] = eventlistener(self) if eventlistener else None
+        self.eventlistener: TEventListener = eventlistener(self) if eventlistener else None
         self.wait_for_on_ready.start()
 
     async def cog_load(self) -> None:
@@ -271,7 +278,7 @@ class Plugin(commands.Cog, Generic[TEventListener]):
                     if isinstance(params, list):
                         for param in params:
                             self.change_commands(param, group_commands)
-                    elif params:
+                    elif isinstance(params, dict):
                         self.change_commands(params, group_commands)
                     else:
                         self.log.warning(f"{self.__cog_name__} command {name} has no params!")
@@ -296,12 +303,14 @@ class Plugin(commands.Cog, Generic[TEventListener]):
                             if 'has_role' in check.__qualname__:
                                 cmd.remove_check(check)
                         if len(params['roles']):
+                            # noinspection PyUnresolvedReferences
                             cmd.add_check(utils.cmd_has_roles(params['roles'].copy()).predicate)
                     if cmd.parent:
                         cmd.parent.add_command(cmd)
                     break
             else:
-                self.log.warning(f"{self.__cog_name__}: Command {name} not found!")
+                self.log.warning(
+                    f"Command/group \"/{name}\" not found in plugin \"{self.__cog_name__}\", can't overwrite it!")
 
     async def install(self) -> bool:
         if await self._init_db():
@@ -314,66 +323,68 @@ class Plugin(commands.Cog, Generic[TEventListener]):
             return True
         return False
 
-    async def migrate(self, new_version: str, conn: Optional[psycopg.AsyncConnection] = None) -> None:
-        ...
+    async def migrate(self, new_version: str, conn: psycopg.AsyncConnection | None = None) -> None:
+        pass
 
     async def before_dcs_update(self) -> None:
-        ...
+        pass
 
     async def after_dcs_update(self) -> None:
-        ...
+        pass
 
-    async def prune(self, conn: psycopg.AsyncConnection, *, days: int = -1, ucids: list[str] = None,
-                    server: Optional[str] = None) -> None:
-        ...
+    async def prune(self, conn: psycopg.AsyncConnection, days: int) -> None:
+        pass
 
     async def _init_db(self) -> bool:
         async with self.apool.connection() as conn:
-            async with conn.transaction():
-                async with conn.cursor() as cursor:
-                    await cursor.execute('SELECT version FROM plugins WHERE plugin = %s', (self.plugin_name,))
-                    # first installation
-                    if cursor.rowcount == 0:
-                        tables_file = f'./plugins/{self.plugin_name}/db/tables.sql'
-                        if os.path.exists(tables_file):
-                            with open(tables_file, mode='r') as tables_sql:
+            async with conn.cursor() as cursor:
+                await cursor.execute('SELECT version FROM plugins WHERE plugin = %s', (self.plugin_name,))
+                # first installation
+                if cursor.rowcount == 0:
+                    tables_file = f'./plugins/{self.plugin_name}/db/tables.sql'
+                    if os.path.exists(tables_file):
+                        async with aiofiles.open(tables_file, mode='r') as tables_sql:
+                            for query in [
+                                stmt.strip()
+                                for stmt in sqlparse.split(await tables_sql.read(), encoding='utf-8')
+                                if stmt.strip()
+                            ]:
+                                self.log.debug(query.rstrip())
+                                await cursor.execute(query.rstrip())
+                    await cursor.execute("""
+                        INSERT INTO plugins (plugin, version) VALUES (%s, %s) 
+                        ON CONFLICT (plugin) DO NOTHING
+                    """, (self.plugin_name, self.plugin_version))
+                    self.log.info(f'  => {self.__cog_name__} installed.')
+                    return True
+                else:
+                    installed = (await cursor.fetchone())[0]
+                    # old variant, to be migrated
+                    if installed.startswith('v'):
+                        installed = installed[1:]
+                    while parse(installed) < parse(self.plugin_version):
+                        updates_file = f'./plugins/{self.plugin_name}/db/update_v{installed}.sql'
+                        if os.path.exists(updates_file):
+                            async with aiofiles.open(updates_file, mode='r') as updates_sql:
                                 for query in [
                                     stmt.strip()
-                                    for stmt in sqlparse.split(tables_sql.read(), encoding='utf-8')
+                                    for stmt in sqlparse.split(await updates_sql.read(), encoding='utf-8')
                                     if stmt.strip()
                                 ]:
                                     self.log.debug(query.rstrip())
-                                    await cursor.execute(query.rstrip())
-                        await cursor.execute("""
-                            INSERT INTO plugins (plugin, version) VALUES (%s, %s) 
-                            ON CONFLICT (plugin) DO NOTHING
-                        """, (self.plugin_name, self.plugin_version))
-                        self.log.info(f'  => {self.plugin_name.title()} installed.')
-                        return True
-                    else:
-                        installed = (await cursor.fetchone())[0]
-                        # old variant, to be migrated
-                        if installed.startswith('v'):
-                            installed = installed[1:]
-                        while parse(installed) < parse(self.plugin_version):
-                            updates_file = f'./plugins/{self.plugin_name}/db/update_v{installed}.sql'
-                            if os.path.exists(updates_file):
-                                with open(updates_file, mode='r') as updates_sql:
-                                    for query in updates_sql.readlines():
-                                        self.log.debug(query.rstrip())
-                                        await cursor.execute(query.rstrip())
-                                ver, rev = installed.split('.')
-                                installed = ver + '.' + str(int(rev) + 1)
-                            elif int(self.plugin_version[0]) == 3 and int(installed[0]) < 3:
-                                installed = '3.0'
-                            else:
-                                ver, rev = installed.split('.')
-                                installed = ver + '.' + str(int(rev) + 1)
-                            await self.migrate(installed, conn)
-                            self.log.info(f'  => {self.plugin_name.title()} migrated to version {installed}.')
+                                    await conn.execute(query.rstrip())
+                            ver, rev = installed.split('.')
+                            installed = ver + '.' + str(int(rev) + 1)
+                        elif int(self.plugin_version[0]) == 3 and int(installed[0]) < 3:
+                            installed = '3.0'
+                        else:
+                            ver, rev = installed.split('.')
+                            installed = ver + '.' + str(int(rev) + 1)
+                        await self.migrate(installed, conn)
+                        self.log.info(f'  => {self.__cog_name__} migrated to version {installed}.')
                         await cursor.execute('UPDATE plugins SET version = %s WHERE plugin = %s',
                                              (self.plugin_version, self.plugin_name))
-                        return False
+                    return False
 
     @staticmethod
     def migrate_to_3(node: str, plugin_name: str):
@@ -427,22 +438,25 @@ class Plugin(commands.Cog, Generic[TEventListener]):
             path = f'./plugins/{self.plugin_name}/schemas'
             if os.path.exists(path) and validation in ['strict', 'lazy']:
                 schema_files = [str(x) for x in Path(path).glob('*.yaml')]
-                schema_files.append('schemas/commands_schema.yaml')
-                utils.validate(filename, schema_files, raise_exception=(validation == 'strict'))
+                if schema_files:
+                    schema_files.append('schemas/commands_schema.yaml')
+                    utils.validate(filename, schema_files, raise_exception=(validation == 'strict'))
+                else:
+                    self.log.warning(f'  - No schema files found for plugin {self.plugin_name}.')
 
             return yaml.load(Path(filename).read_text(encoding='utf-8'))
         except MarkedYAMLError as ex:
             raise YAMLError(filename, ex)
 
     # get default and specific configs to be merged in derived implementations
-    def get_base_config(self, server: Server) -> tuple[Optional[dict], Optional[dict]]:
-        def get_theatre() -> Optional[str]:
+    def get_base_config(self, server: Server) -> tuple[dict | None, dict | None]:
+        def get_theatre() -> str | None:
             if server.current_mission:
                 return server.current_mission.map
             else:
                 return asyncio.run(server.get_current_mission_theatre())
 
-        def get_mission() -> Optional[str]:
+        def get_mission() -> str | None:
             if server.current_mission:
                 return server.current_mission.name
             else:
@@ -471,36 +485,34 @@ class Plugin(commands.Cog, Generic[TEventListener]):
             else:
                 return element
 
-        default = deepcopy(filter_element(self.locals.get(DEFAULT_TAG, {})))
-        specific = deepcopy(filter_element(self.locals.get(server.node.name, self.locals).get(server.instance.name, {})))
+        default = deepcopy(filter_element(self.locals.get(DEFAULT_TAG) or {}))
+        specific = deepcopy(filter_element(self.locals.get(server.node.name, self.locals).get(server.instance.name) or {}))
         return default, specific
 
-    def get_config(self, server: Optional[Server] = None, *, plugin_name: Optional[str] = None,
-                   use_cache: Optional[bool] = True) -> dict:
+    def get_config(self, server: Server | None = None, *, plugin_name: str | None = None,
+                   use_cache: bool | None = True) -> dict:
         # retrieve the config from another plugin
         if plugin_name:
             for plugin in self.bot.cogs.values():  # type: Plugin
                 if plugin.plugin_name == plugin_name:
                     return plugin.get_config(server, use_cache=use_cache)
+            else:
+                raise ValueError(f'Plugin "{plugin_name}" not found!')
         if not server:
             return self.locals.get(DEFAULT_TAG, {})
         if server.node.name not in self._config:
             self._config[server.node.name] = {}
         if server.instance.name not in self._config[server.node.name] or not use_cache:
             default, specific = self.get_base_config(server)
-            self._config[server.node.name][server.instance.name] = default | specific
+            self._config[server.node.name][server.instance.name] = utils.deep_merge(default, specific)
         return self._config[server.node.name][server.instance.name]
 
-    async def rename(self, conn: psycopg.AsyncConnection, old_name: str, new_name: str) -> None:
-        # this function has to be implemented in your own plugins, if a server rename takes place
-        ...
-
     async def update_ucid(self, conn: psycopg.AsyncConnection, old_ucid: str, new_ucid: str) -> None:
-        # this function has to be implemented in your own plugins, if the ucid of a user changed (steam <=> standalone)
-        ...
+        # this function has to be implemented in your own plugin if the ucid of a user changed (steam <=> standalone)
+        pass
 
     async def on_ready(self) -> None:
-        ...
+        pass
 
     @tasks.loop(count=1)
     async def wait_for_on_ready(self):
@@ -511,7 +523,7 @@ class Plugin(commands.Cog, Generic[TEventListener]):
         await self.bot.wait_until_ready()
 
 
-class PluginError(Exception):
+class PluginError(Exception, ABC):
     ...
 
 

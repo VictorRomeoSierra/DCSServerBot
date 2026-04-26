@@ -1,26 +1,23 @@
 import asyncio
 
 from core import EventListener, chat_command, Server, Player, utils, Coalition, event, ChatCommand, get_translation
-from functools import partial
 from itertools import islice
-from typing import Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 from plugins.creditsystem.player import CreditPlayer
 from plugins.voting.base import VotableItem
-
-if TYPE_CHECKING:
-    from .commands import Voting
 
 # ruamel YAML support
 from ruamel.yaml import YAML
 yaml = YAML()
 
+if TYPE_CHECKING:
+    from .commands import Voting
+
 _ = get_translation(__name__.split('.')[1])
 
-all_votes: dict[str, 'VotingHandler'] = dict()
-
-
 class VotingHandler:
+
     def __init__(self, listener: 'VotingListener', item: VotableItem, server: Server, config: dict):
         self.loop = asyncio.get_event_loop()
         self.listener = listener
@@ -44,13 +41,13 @@ class VotingHandler:
                 return "\n" + _('Current leading vote: "{}"').format(winner)
         return ""
 
-    async def print(self, player: Optional[Player] = None):
+    async def print(self, player: Player | None = None):
         message = (await self.item.print()) + '\n'
         for idx, element in enumerate(await self.item.get_choices()):
             message += f'{idx + 1}. {element}\n'
         message += await self.get_leading_vote()
         message += "\n" + _("Use {prefix}{command} <number> to vote for the change.").format(
-            prefix=self.config['prefix'], command=self.listener.vote.name) + "\n"
+            prefix=self.listener.prefix, command=self.listener.vote.name) + "\n"
         if player:
             await player.sendUserMessage(message)
         else:
@@ -66,8 +63,9 @@ class VotingHandler:
         for reminder in sorted(self.config.get('reminder', []), reverse=True):
             if reminder >= voting_time:
                 continue
-            self.tasks.append(self.loop.call_later(voting_time - reminder,
-                                                   partial(asyncio.create_task, self.remind(reminder))))
+            self.tasks.append(
+                self.loop.call_later(voting_time - reminder, lambda r=reminder: asyncio.create_task(self.remind(r)))
+            )
         self.tasks.append(self.loop.call_later(voting_time, lambda: asyncio.create_task(self.end_vote())))
 
     async def vote(self, player: Player, num: int):
@@ -97,8 +95,8 @@ class VotingHandler:
     async def check_vote(self) -> int:
         message = _("Voting finished")
         voting_rule = self.config.get('voting_rule', 'majority')
-        possible_voters = self._get_possible_voters()
-        if not self.votes or not possible_voters:
+        possible_voters = self._get_possible_voters() or 1
+        if not self.votes: # or not possible_voters:
             message += _(" without any (active) participant.")
         elif (self.config.get('voting_threshold') and
               (sum(self.votes.values()) / possible_voters) < self.config.get('voting_threshold')):
@@ -126,8 +124,6 @@ class VotingHandler:
         return -1
 
     async def end_vote(self):
-        global all_votes
-
         win_id = await self.check_vote()
         if win_id > -1:
             winner = next(islice(await self.item.get_choices(), win_id, None))
@@ -135,10 +131,15 @@ class VotingHandler:
             await self.server.sendChatMessage(Coalition.ALL, message)
             await self.server.sendPopupMessage(Coalition.ALL, message)
             await self.item.execute(winner)
-        all_votes.pop(self.server.name, None)
+        self.listener._all_votes.pop(self.server.name, None)
 
 
 class VotingListener(EventListener["Voting"]):
+    _all_votes: dict[str, 'VotingHandler'] = dict()
+
+    async def shutdown(self) -> None:
+        for handler in type(self)._all_votes.values():
+            handler.cancel()
 
     async def can_run(self, command: ChatCommand, server: Server, player: Player) -> bool:
         config = self.get_config(server=server)
@@ -146,7 +147,7 @@ class VotingListener(EventListener["Voting"]):
             return False
         return await super().can_run(command, server, player)
 
-    def check_role(self, player: Player, roles: Optional[list[str]] = None) -> bool:
+    def check_role(self, player: Player, roles: list[str] | None = None) -> bool:
         if not roles:
             return True
         elif isinstance(roles, str):
@@ -157,9 +158,7 @@ class VotingListener(EventListener["Voting"]):
         return True
 
     async def do_vote(self, server: Server, player: Player, params: list[str]):
-        global all_votes
-
-        vote = all_votes.get(server.name)
+        vote = type(self)._all_votes.get(server.name)
         if len(params) != 1:
             await vote.print(player)
             return
@@ -169,8 +168,6 @@ class VotingListener(EventListener["Voting"]):
         await vote.vote(player, int(params[0]))
 
     async def create_vote(self, server: Server, player: Player, config: dict, params: list[str]):
-        global all_votes
-
         points = config.get("credits")
         # if credits are specified, check that the player has enough
         if points and isinstance(player, CreditPlayer) and player.points < points:
@@ -193,7 +190,6 @@ class VotingListener(EventListener["Voting"]):
             await player.sendChatMessage('Usage: {prefix}{command} <{params}>'.format(
                 prefix=self.prefix, command=self.vote.name, params='|'.join(choices)))
             return
-        config['prefix'] = self.prefix
         try:
             class_name = f"plugins.voting.options.{what}.{what.title()}"
             item: VotableItem = utils.str_to_class(class_name)(
@@ -207,14 +203,16 @@ class VotingListener(EventListener["Voting"]):
                 await player.sendChatMessage("This voting option is not available at the moment.")
                 return
             if points and isinstance(player, CreditPlayer):
+                old_points = player.points
                 player.points -= points
+                player.audit('vote', old_points, _("Paid for a vote"))
                 await player.sendChatMessage(f"Your voting has been created for the cost of {points} credit points.")
         except (TypeError, ValueError) as ex:
             await player.sendChatMessage(str(ex))
             return
-        all_votes[server.name] = VotingHandler(listener=self, item=item, server=server, config=config)
-        await self.bot.audit(f"{player.display_name} created a voting", user=player.member or player.ucid,
-                             server=server)
+        type(self)._all_votes[server.name] = VotingHandler(listener=self, item=item, server=server, config=config)
+        await self.bot.audit(f"{player.display_name} called a vote for {what}",
+                             user=player.member or player.ucid, server=server)
 
     @event(name="onPlayerStart")
     async def onPlayerStart(self, server: Server, data: dict) -> None:
@@ -225,19 +223,16 @@ class VotingListener(EventListener["Voting"]):
             return
         player: Player = server.get_player(ucid=data['ucid'])
         if player:
-            # noinspection PyAsyncCall
             asyncio.create_task(player.sendChatMessage(
                 utils.format_string(config['welcome_message'], server=server, player=player, prefix=self.prefix)))
 
     @chat_command(name="vote", help="start a voting or vote for a change")
     async def vote(self, server: Server, player: Player, params: list[str]):
-        global all_votes
-
         config = self.get_config(server=server)
-        if server.name in all_votes:
+        if server.name in type(self)._all_votes:
             if len(params) == 1 and params[0] == 'cancel':
                 if utils.check_roles(self.bot.roles['DCS Admin'], player.member):
-                    all_votes.pop(server.name).cancel()
+                    type(self)._all_votes.pop(server.name).cancel()
                     message = "The voting has been cancelled by an Admin."
                     await server.sendChatMessage(Coalition.ALL, message)
                     await server.sendPopupMessage(Coalition.ALL, message)

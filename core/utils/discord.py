@@ -7,26 +7,27 @@ import logging
 import os
 import re
 
+from contextlib import suppress
 from core import Status, utils
 from core.data.node import SortOrder, UploadStatus
 from core.services.registry import ServiceRegistry
 from core.translations import get_translation
-from datetime import datetime
-from discord import app_commands, Interaction, SelectOption
+from datetime import datetime, timedelta
+from discord import app_commands, Interaction, SelectOption, ButtonStyle
 from discord.ext import commands
 from discord.ui import Button, View, Select, Item, Modal, TextInput
 from enum import Enum, auto
 from fuzzywuzzy import fuzz
 from packaging.version import parse, Version
 from psycopg.rows import dict_row
-from typing import Optional, cast, Union, TYPE_CHECKING, Iterable, Any, Callable
+from typing import cast, TYPE_CHECKING, Iterable, Any, Callable
+from typing_extensions import deprecated
 
-from .helper import get_all_players, is_ucid, format_string
+from .helper import get_all_players, is_ucid, format_string, cache_with_expiration
 
 if TYPE_CHECKING:
-    from core import Server, Player, Node, Instance, Plugin, Command
+    from core import Server, Player, Node, Instance, Plugin
     from services.bot import DCSServerBot
-    from services.servicebus import ServiceBus
 
 
 __all__ = [
@@ -46,6 +47,8 @@ __all__ = [
     "app_has_not_roles",
     "app_has_dcs_version",
     "cmd_has_roles",
+    "is_restricted",
+    "restricted_check",
     "get_role_ids",
     "format_embed",
     "embed_to_text",
@@ -54,7 +57,7 @@ __all__ = [
     "escape_string",
     "print_ruler",
     "match",
-    "get_interaction_param",
+    "find_similar_names",
     "get_all_linked_members",
     "NodeTransformer",
     "InstanceTransformer",
@@ -62,17 +65,18 @@ __all__ = [
     "UserTransformer",
     "PlayerTransformer",
     "airbase_autocomplete",
+    "get_cached_mission_list",
     "mission_autocomplete",
     "group_autocomplete",
-    "squadron_autocomplete",
-    "get_squadron",
+    "date_autocomplete",
     "server_selection",
     "get_ephemeral",
     "get_command",
     "ConfigModal",
     "DirectoryPicker",
     "NodeUploadHandler",
-    "ServerUploadHandler"
+    "ServerUploadHandler",
+    "DatabaseModal"
 ]
 
 # Internationalisation
@@ -108,21 +112,24 @@ async def wait_for_single_reaction(interaction: discord.Interaction, message: di
     def check_press(react: discord.Reaction, user: discord.Member):
         return (react.message.channel == interaction.channel) & (user == member) & (react.message.id == message.id)
 
-    tasks = [
+    member = interaction.user
+    pending_tasks = [
         asyncio.create_task(interaction.client.wait_for('reaction_add', check=check_press)),
         asyncio.create_task(interaction.client.wait_for('reaction_remove', check=check_press))
     ]
-    try:
-        member = interaction.user
-        done, tasks = await asyncio.wait(tasks, timeout=120, return_when=asyncio.FIRST_COMPLETED)
-        if len(done) > 0:
-            react, _ = done.pop().result()
-            return react
-        else:
-            raise TimeoutError
-    finally:
-        for task in tasks:
-            task.cancel()
+
+    done, pending = await asyncio.wait(pending_tasks, timeout=120, return_when=asyncio.FIRST_COMPLETED)
+
+    # cancel pending tasks
+    for task in pending:
+        task.cancel()
+        await task
+
+    if not done:
+        raise TimeoutError
+
+    react, _ = done.pop().result()
+    return react
 
 
 async def selection_list(interaction: discord.Interaction, data: list, embed_formatter, num: int = 5,
@@ -187,7 +194,14 @@ async def selection_list(interaction: discord.Interaction, data: list, embed_for
 
 
 class SelectView(View):
-    def __init__(self, *, placeholder: str, options: list[SelectOption], min_values: int, max_values: int):
+    def __init__(
+            self,
+            *,
+            placeholder: str | None,
+            options: list[SelectOption],
+            min_values: int | None,
+            max_values: int | None
+    ):
         super().__init__()
         self.result = None
         select: Select = cast(Select, self.children[0])
@@ -209,13 +223,15 @@ class SelectView(View):
             self.result = select.values[0]
         self.stop()
 
-    @discord.ui.button(label='OK', style=discord.ButtonStyle.green, custom_id='sl_ok')
+    # noinspection PyTypeChecker
+    @discord.ui.button(label='OK', style=ButtonStyle.green, custom_id='sl_ok')
     async def on_ok(self, interaction: Interaction, _: Button):
         # noinspection PyUnresolvedReferences
         await interaction.response.defer()
         self.stop()
 
-    @discord.ui.button(label='Cancel', style=discord.ButtonStyle.red, custom_id='sl_cancel')
+    # noinspection PyTypeChecker
+    @discord.ui.button(label='Cancel', style=ButtonStyle.red, custom_id='sl_cancel')
     async def on_cancel(self, interaction: Interaction, _: Button):
         # noinspection PyUnresolvedReferences
         await interaction.response.defer()
@@ -223,10 +239,10 @@ class SelectView(View):
         self.stop()
 
 
-async def selection(interaction: Union[discord.Interaction, commands.Context], *, title: Optional[str] = None,
-                    placeholder: Optional[str] = None, embed: discord.Embed = None,
-                    options: list[SelectOption], min_values: Optional[int] = 1,
-                    max_values: Optional[int] = 1, ephemeral: bool = False) -> Optional[Union[list, str, int]]:
+async def selection(interaction: discord.Interaction | commands.Context, *, title: str | None = None,
+                    placeholder: str | None = None, embed: discord.Embed = None,
+                    options: list[SelectOption], min_values: int | None = 1,
+                    max_values: int | None = 1, ephemeral: bool | None = False) -> list | str |  int | None:
     """
     This function generates a selection menu on Discord with provided options.
     If only one option is present, it immediately returns that option's value.
@@ -253,30 +269,29 @@ async def selection(interaction: Union[discord.Interaction, commands.Context], *
                 msg = await interaction.original_response()
         else:
             msg = await interaction.send(embed=embed, view=view)
-        if await view.wait():
-            return None
-        return view.result
+        if not await view.wait():
+            return view.result
     finally:
-        try:
-            if msg:
+        if msg:
+            with suppress(discord.NotFound):
                 await msg.delete()
-        except discord.NotFound:
-            pass
 
 
 class YNQuestionView(View):
     def __init__(self):
         super().__init__(timeout=120)
-        self.result = False
+        self.result = None
 
-    @discord.ui.button(label='Yes', style=discord.ButtonStyle.green, custom_id='yn_yes')
+    # noinspection PyTypeChecker
+    @discord.ui.button(label='Yes', style=ButtonStyle.green, custom_id='yn_yes')
     async def on_yes(self, interaction: Interaction, _: Button):
         # noinspection PyUnresolvedReferences
         await interaction.response.defer()
         self.result = True
         self.stop()
 
-    @discord.ui.button(label='No', style=discord.ButtonStyle.red, custom_id='yn_no')
+    # noinspection PyTypeChecker
+    @discord.ui.button(label='No', style=ButtonStyle.red, custom_id='yn_no')
     async def on_no(self, interaction: Interaction, _: Button):
         # noinspection PyUnresolvedReferences
         await interaction.response.defer()
@@ -287,12 +302,14 @@ class YNQuestionView(View):
         interaction.client.log.exception(error)
 
 
-async def yn_question(ctx: Union[commands.Context, discord.Interaction], question: str,
-                      message: Optional[str] = None, ephemeral: Optional[bool] = True) -> bool:
+async def yn_question(ctx: commands.Context | discord.Interaction, question: str, *,
+                      message: str | None = None, embed: discord.Embed | None = None,
+                      ephemeral: bool | None = True) -> bool | None:
     """
     :param ctx: The context in which the yn_question method is being called. It can be either a discord.py commands.Context object or a discord.Interaction object.
     :param question: The question to be displayed in the embedded message.
     :param message: An optional additional message to be displayed in the embedded message.
+    :param embed: An optional embed to be used. If None, then a default embed will be used. Replaces question and message.
     :param ephemeral: An optional boolean value indicating whether the message should be ephemeral (only visible to the user who triggered it). Default is True.
     :return: A boolean value indicating the result of the yn_question. True if the user answered "Yes", False if the user answered "No".
 
@@ -301,22 +318,22 @@ async def yn_question(ctx: Union[commands.Context, discord.Interaction], questio
     The yn_question method uses a custom view called YNQuestionView to handle the interaction. An embedded message is sent with the specified question and optional message, along with two
     * buttons for "Yes" and "No". The view listens for the user's button clicks and returns the corresponding boolean value.
     """
-    embed = discord.Embed(description=question, color=discord.Color.red())
-    if message is not None:
-        embed.add_field(name=message, value='_ _')
+    if not embed:
+        embed = discord.Embed(color=discord.Color.red())
+        if message is not None:
+            embed.description = message
+    embed.title = question
     if isinstance(ctx, discord.Interaction):
         ctx = await ctx.client.get_context(ctx)
     view = YNQuestionView()
     msg = await ctx.send(embed=embed, view=view, ephemeral=ephemeral)
     try:
-        if await view.wait():
-            return False
-        return view.result
+        if not await view.wait():
+            return view.result
     finally:
-        try:
-            await msg.delete()
-        except discord.NotFound:
-            pass
+        if msg:
+            with suppress(discord.NotFound):
+                await msg.delete()
 
 
 class PopulatedQuestionView(View):
@@ -324,31 +341,34 @@ class PopulatedQuestionView(View):
         super().__init__(timeout=120)
         self.result = None
 
-    @discord.ui.button(label='Yes', style=discord.ButtonStyle.green, custom_id='pl_yes')
+    # noinspection PyTypeChecker
+    @discord.ui.button(label='Yes', style=ButtonStyle.green, custom_id='pl_yes')
     async def on_yes(self, interaction: Interaction, _: Button):
         # noinspection PyUnresolvedReferences
         await interaction.response.defer()
         self.result = 'yes'
         self.stop()
 
-    @discord.ui.button(label='Later', style=discord.ButtonStyle.primary, custom_id='pl_later', emoji='⏱')
+    # noinspection PyTypeChecker
+    @discord.ui.button(label='Later', style=ButtonStyle.primary, custom_id='pl_later', emoji='⏱')
     async def on_later(self, interaction: Interaction, _: Button):
         # noinspection PyUnresolvedReferences
         await interaction.response.defer()
         self.result = 'later'
         self.stop()
 
-    @discord.ui.button(label='Cancel', style=discord.ButtonStyle.red, custom_id='pl_cancel')
+    # noinspection PyTypeChecker
+    @discord.ui.button(label='Cancel', style=ButtonStyle.red, custom_id='pl_cancel')
     async def on_cancel(self, interaction: Interaction, _: Button):
         # noinspection PyUnresolvedReferences
         await interaction.response.defer()
         self.stop()
 
 
-async def populated_question(ctx: Union[commands.Context, discord.Interaction], question: str, message: Optional[str] = None,
-                             ephemeral: Optional[bool] = True) -> Optional[str]:
+async def populated_question(ctx: commands.Context | discord.Interaction, question: str, message: str | None = None,
+                             ephemeral: bool | None = True) -> str | None:
     """
-    Same as yn_question, but adds an option "Later". The usual use-case of this function would be
+    Same as yn_question, but adds an option "Later". The usual use-case of this function is
     if people are flying atm, and you want to ask to trigger an action that would affect their experience (aka stop
     the server).
 
@@ -366,17 +386,15 @@ async def populated_question(ctx: Union[commands.Context, discord.Interaction], 
     view = PopulatedQuestionView()
     msg = await ctx.send(embed=embed, view=view, ephemeral=ephemeral)
     try:
-        if await view.wait():
-            return None
-        return view.result
+        if not await view.wait():
+            return view.result
     finally:
-        try:
-            await msg.delete()
-        except discord.NotFound:
-            pass
+        if msg:
+            with suppress(discord.NotFound):
+                await msg.delete()
 
 
-def check_roles(roles: Iterable[Union[str, int]], member: Optional[discord.Member] = None) -> bool:
+def check_roles(roles: Iterable[str | int], member: discord.Member | None = None) -> bool:
     """
     Check if a member has any of the specified roles.
 
@@ -384,7 +402,7 @@ def check_roles(roles: Iterable[Union[str, int]], member: Optional[discord.Membe
     :param member: The discord.Member object to check roles for. Defaults to None.
     :return: A boolean value indicating whether the member has any of the specified roles. Returns False if member is None.
     """
-    if not member:
+    if not member or not isinstance(member, discord.Member):
         return False
     for role in member.roles:
         for valid_role in roles:
@@ -395,6 +413,7 @@ def check_roles(roles: Iterable[Union[str, int]], member: Optional[discord.Membe
     return False
 
 
+@deprecated("Use app_has_role instead")
 def has_role(role: str):
     """
     Decorator for non-application commands to check if the user has a specific role.
@@ -423,12 +442,18 @@ def app_has_role(role: str):
     :return: True if the user has the role, False otherwise.
     """
     def predicate(interaction: Interaction) -> bool:
+        # The owner can run any command, independently of the role
+        if (not interaction.client.node.locals.get('restrict_owner', False) and
+                interaction.user.id == interaction.client.owner_id):
+            return True
+
         return check_roles(interaction.client.roles[role], interaction.user)
 
     predicate.role = role
     return app_commands.check(predicate)
 
 
+@deprecated("Use app_has_roles instead")
 def has_roles(roles: list[str]):
     """
     Decorator for non-application commands to check if the user has one of the provided roles.
@@ -475,6 +500,18 @@ def cmd_has_roles(roles: list[str]):
     return cmd_has_roles
 
 
+def is_restricted(interaction: discord.Interaction) -> bool:
+    if interaction.client.node.locals.get('restrict_commands', False):
+        if not interaction.client.node.locals.get('restrict_owner', False) and interaction.user.id == interaction.client.owner_id:
+            return False
+        return True
+    return False
+
+
+def restricted_check(interaction: discord.Interaction) -> bool:
+    return not is_restricted(interaction)
+
+
 def get_role_ids(plugin: Plugin, role_names) -> list[int]:
     role_ids = []
     if not isinstance(role_names, list):
@@ -503,6 +540,11 @@ def app_has_roles(roles: list[str]):
     :return: A decorated function that can be used as a check for membership of the specified roles.
     """
     def predicate(interaction: Interaction) -> bool:
+        # The owner can run any command, independently of the role
+        if (not interaction.client.node.locals.get('restrict_owner', False) and
+                interaction.user.id == interaction.client.owner_id):
+            return True
+
         valid_roles = set()
         for role in roles:
             valid_roles |= set(interaction.client.roles[role])
@@ -753,8 +795,8 @@ def embed_to_simpletext(embed: discord.Embed) -> str:
     return message
 
 
-def create_warning_embed(title: str, text: Optional[str] = None,
-                         fields: Optional[list[tuple[str, str]]] = None) -> discord.Embed:
+def create_warning_embed(title: str, text: str | None = None,
+                         fields: list[tuple[str, str]] | None = None) -> discord.Embed:
     embed = discord.Embed(title=title, color=discord.Color.yellow())
     if text:
         embed.description = text
@@ -776,7 +818,7 @@ def escape_string(msg: str) -> str:
     return re.sub(r"([\\_*~`|>#+\-={}!.\[\]()])", r"\\\1", msg)
 
 
-def print_ruler(*, ruler_length: Optional[int] = 34, header: Optional[str] = '') -> str:
+def print_ruler(*, ruler_length: int = 34, header: str = '') -> str:
     if header:
         header = ' ' + header + ' '
     filler = int((ruler_length - len(header) / 2.5) / 2)
@@ -785,7 +827,7 @@ def print_ruler(*, ruler_length: Optional[int] = 34, header: Optional[str] = '')
     return '▬' * filler + header + '▬' * filler
 
 
-def normalize_name(name: Optional[str] = None) -> Optional[str]:
+def normalize_name(name: str | None = None) -> str | None:
     if not name:
         return None
     # removes content surrounded by non-word characters at the beginning or end of string
@@ -793,7 +835,7 @@ def normalize_name(name: Optional[str] = None) -> Optional[str]:
     return name.strip().lower()
 
 
-def match(name: str, member_list: list[discord.Member], min_score: Optional[int] = 70) -> Optional[discord.Member]:
+def match(name: str, member_list: list[discord.Member], min_score: int = 70) -> discord.Member | None:
     """
     Match the given name with members in the member_list based on fuzzy string matching.
 
@@ -815,7 +857,7 @@ def match(name: str, member_list: list[discord.Member], min_score: Optional[int]
     ]:
         return None
 
-    name = normalize_name(name)
+    name: str | None = normalize_name(name)
     weights = [3, 2, 1]
     user_lists = [
         [normalize_name(getattr(member, attr)) for member in member_list]
@@ -834,92 +876,174 @@ def match(name: str, member_list: list[discord.Member], min_score: Optional[int]
     return member_list[best_match_index] if best_match_index else None
 
 
-def get_interaction_param(interaction: discord.Interaction, name: str) -> Optional[Any]:
+def find_similar_names(list1: list[str], list2: list[str], threshold: int = 90) -> list[tuple[str, str, int]]:
     """
-    Returns the value of a specific parameter in a Discord interaction.
+    Compare two lists of usernames and find similar matches using fuzzy string matching.
 
-    :param interaction: The Discord interaction object.
-    :param name: The name of the parameter to retrieve.
-    :return: The value of the parameter, or None if not found.
+    Args:
+        list1: First list of usernames
+        list2: Second list of usernames
+        threshold: Minimum similarity score (0-100) to consider names as similar
+                  Default is 90 for high confidence matches
+
+    Returns:
+        List of tuples containing (name1, name2, similarity_score)
     """
-    def inner(root: Union[dict, list]) -> Optional[Any]:
-        if isinstance(root, dict):
-            if root.get('name') == name:
-                return root.get('value')
-        elif isinstance(root, list):
-            for param in root:
-                if 'options' in param:
-                    return inner(param['options'])
-                if param['name'] == name:
-                    return param['value']
-        return None
+    similar_names = []
 
-    return inner(interaction.data['options'])
+    for name1 in list1:
+        for name2 in list2:
+            # Calculate similarity ratio
+            similarity = fuzz.ratio(name1.lower(), name2.lower())
+
+            # If similarity is above threshold, add to results
+            if similarity >= threshold:
+                similar_names.append((name1, name2, similarity))
+
+    # Sort results by similarity score in descending order
+    similar_names.sort(key=lambda x: x[2], reverse=True)
+    return similar_names
 
 
-def get_all_linked_members(interaction: discord.Interaction) -> list[discord.Member]:
+async def get_all_linked_members(
+    interaction: discord.Interaction,
+    search: str | None = None,
+) -> list[discord.Member]:
+    """Return up to 25 members that are linked in the `players` table
+    and (optionally) whose display name contains *search*.
+
+    The function streams rows from the DB, looks up each member in the
+    guild cache and stops as soon as 25 matches have been found.
     """
-    :param interaction: the discord Interaction
-    :return: A list of discord.Member objects representing all the members linked to DCS accounts in the bot's guild.
-    """
-    members: list[discord.Member] = []
-    with interaction.client.pool.connection() as conn:
-        for row in conn.execute("SELECT DISTINCT discord_id FROM players WHERE discord_id <> -1"):
-            member = interaction.guild.get_member(row[0])
-            if member:
-                members.append(member)
-    return members
+    guild = interaction.guild
+    search_lc = search.lower() if search else None
+
+    results: list[discord.Member] = []
+
+    async with interaction.client.apool.connection() as conn:
+        sql = "SELECT DISTINCT discord_id, ucid FROM players WHERE discord_id <> -1"
+        if is_ucid(search_lc):
+            sql += ' AND ucid = %(ucid)s'
+
+        async for row in await conn.execute(sql, {"ucid": search_lc}):
+            mid = row[0]
+            ucid = row[1]
+
+            member = guild.get_member(mid)
+            if not member:
+                continue  # member not cached – skip
+
+            if search_lc and not (search_lc in member.display_name.lower() or search_lc in ucid):
+                continue
+
+            results.append(member)
+            if len(results) == 25:
+                break
+
+    return results
 
 
 class ServerTransformer(app_commands.Transformer):
     """
+    A transformer for Discord application commands that handles server selection.
 
-    :class:`ServerTransformer` is a class that is used for transforming and autocompleting servers as a selection for application commands.
+    This class converts string inputs into Server objects and provides autocomplete
+    functionality for server selection in slash commands.
 
-    .. attribute:: status
+    Attributes:
+        status (list[Status]): Optional list of status values to filter servers by.
+        maintenance (bool): Optional filter for servers in maintenance mode.
 
-        An optional attribute that specifies the list of status values to filter the servers by.
-
-        :type: list of :class:`Status`
-        :default: None
-
-    :param status: An optional parameter that specifies the list of status values to filter the servers by.
-    :type status: list of :class:`Status`
-
+    Example:
+        ```python
+        @app_commands.command(name="restart")
+        async def restart_server(
+            interaction: discord.Interaction,
+            server: app_commands.Transform[Server, ServerTransformer(status=[Status.RUNNING])]
+        ):
+            # Command will only show running servers in autocomplete
+            await server.restart()
+        ```
     """
-    def __init__(self, *, status: list[Status] = None, maintenance: Optional[bool] = None):
+
+    def __init__(self, *, status: list[Status] = None, maintenance: bool = None):
         super().__init__()
-        self.status: list[Status] = status
+        self.status: list[Status] | None = status
         self.maintenance = maintenance
 
-    async def transform(self, interaction: discord.Interaction, value: Optional[str]) -> Server:
+    @staticmethod
+    def is_admin(interaction: discord.Interaction) -> bool:
+        with (suppress(Exception)):
+            if getattr(interaction.command.checks[0], 'role', False) and interaction.command.checks[0].role == 'DCS Admin':
+                return True
+            elif getattr(interaction.command.checks[0], 'roles', False) and 'DCS Admin' in interaction.command.checks[0].roles:
+                return True
+        return False
+
+    async def transform(self, interaction: discord.Interaction, value: str | None) -> Server:
+        """
+        Converts a server name into a Server object.
+
+        Args:
+            interaction: The interaction context
+            value: The server name to convert
+
+        Returns:
+            The corresponding Server object
+
+        Raises:
+            app_commands.TransformerError: If server not found
+        """
         if value:
             server = interaction.client.servers.get(value)
-            if not server:
+            is_admin = self.is_admin(interaction)
+
+            if not server or (
+                is_admin and
+                server.locals.get('managed_by') and
+                not utils.check_roles(server.locals.get('managed_by'), interaction.user)
+            ):
                 raise app_commands.TransformerError(value, self.type, self)
         else:
             server = interaction.client.get_server(interaction)
         return server
 
     async def autocomplete(self, interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+        """
+        Provides server name suggestions for autocomplete.
+
+        Filters servers based on status, maintenance mode, and user input.
+        Only shows servers the user has permission to access.
+
+        Args:
+            interaction: The interaction context
+            current: Current text input by user
+
+        Returns:
+            List of server name suggestions (max 25)
+        """
         if not await interaction.command._check_can_run(interaction):
             return []
         try:
-            server: Optional[Server] = interaction.client.get_server(interaction)
+            server: Server | None = interaction.client.get_server(interaction)
+            is_admin = self.is_admin(interaction)
+
             if (not current and server and server.status != Status.UNREGISTERED and
                     (not self.status or server.status in self.status)):
-                return [app_commands.Choice(name=server.name, value=server.name)]
-            choices: list[app_commands.Choice[str]] = [
-                app_commands.Choice(name=name, value=name)
+                return [app_commands.Choice[str](name=server.name, value=server.name)]
+            return [
+                app_commands.Choice[str](name=name, value=name)
                 for name, value in interaction.client.servers.items()
                 if (value.status != Status.UNREGISTERED and
                     (not self.status or value.status in self.status) and
                     (not self.maintenance or value.maintenance == self.maintenance) and
-                    (not current or current.casefold() in name.casefold()))
-            ]
-            return choices[:25]
+                    (not is_admin or not value.locals.get('managed_by') or utils.check_roles(value.locals.get('managed_by'), interaction.user)) and
+                    (not current or current.casefold() in name.casefold())
+                )
+            ][:25]
         except Exception as ex:
             interaction.client.log.exception(ex)
+            return []
 
 
 class NodeTransformer(app_commands.Transformer):
@@ -927,7 +1051,7 @@ class NodeTransformer(app_commands.Transformer):
     A class for transforming interaction values to Node objects and providing autocomplete choices for Nodes.
 
     """
-    async def transform(self, interaction: discord.Interaction, value: Optional[str]) -> Node:
+    async def transform(self, interaction: discord.Interaction, value: str | None) -> Node:
         if value:
             return interaction.client.node.all_nodes.get(value)
         else:
@@ -940,12 +1064,13 @@ class NodeTransformer(app_commands.Transformer):
             all_nodes = [interaction.client.node.name]
             all_nodes.extend(await interaction.client.node.get_active_nodes())
             return [
-                app_commands.Choice(name=x, value=x)
+                app_commands.Choice[str](name=x, value=x)
                 for x in all_nodes
                 if not current or current.casefold() in x.casefold()
-            ]
+            ][:25]
         except Exception as ex:
             interaction.client.log.exception(ex)
+            return []
 
 
 class InstanceTransformer(app_commands.Transformer):
@@ -957,14 +1082,14 @@ class InstanceTransformer(app_commands.Transformer):
         super().__init__()
         self.unused = unused
 
-    async def transform(self, interaction: discord.Interaction, value: Optional[str]) -> Optional[Instance]:
+    async def transform(self, interaction: discord.Interaction, value: str | None) -> Instance | None:
         if value:
-            node: Node = await NodeTransformer().transform(interaction, get_interaction_param(interaction, 'node'))
+            node: Node = await NodeTransformer().transform(interaction, interaction.namespace.node)
             if not node:
                 return None
-            return next((x for x in node.instances if x.name == value), None)
+            return node.instances.get(value)
         elif len(interaction.client.node.instances) == 1:
-            return interaction.client.node.instances[0]
+            return next(iter(interaction.client.node.instances.values()))
         else:
             return None
 
@@ -972,23 +1097,24 @@ class InstanceTransformer(app_commands.Transformer):
         if not await interaction.command._check_can_run(interaction):
             return []
         try:
-            node: Node = await NodeTransformer().transform(interaction, get_interaction_param(interaction, 'node'))
+            node: Node = await NodeTransformer().transform(interaction, interaction.namespace.node)
             if not node:
                 return []
             if self.unused:
                 instances = [
                     instance for server_name, instance in await node.find_all_instances()
-                    if not any(instance == x.name for x in node.instances)
+                    if instance not in node.instances
                 ]
             else:
-                instances = [x.name for x in node.instances]
+                instances = list(node.instances.keys())
             return [
-                app_commands.Choice(name=x, value=x)
+                app_commands.Choice[str](name=x, value=x)
                 for x in instances
                 if not current or current.casefold() in x.casefold()
-            ]
+            ][:25]
         except Exception as ex:
             interaction.client.log.exception(ex)
+            return []
 
 
 async def airbase_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[int]]:
@@ -998,17 +1124,24 @@ async def airbase_autocomplete(interaction: discord.Interaction, current: str) -
     if not await interaction.command._check_can_run(interaction):
         return []
     try:
-        server: Server = await ServerTransformer().transform(interaction, get_interaction_param(interaction, 'server'))
+        server: Server = await ServerTransformer().transform(interaction, interaction.namespace.server)
         if not server or not server.current_mission:
             return []
-        choices: list[app_commands.Choice[int]] = [
-            app_commands.Choice(name=x['name'], value=idx)
+        return [
+            app_commands.Choice[int](name="{}".format(x['name'] if x.get('type', '') != 'FARP' else f"FARP {x['name']}"),
+                                value=idx)
             for idx, x in enumerate(server.current_mission.airbases)
-            if not current or current.casefold() in x['name'].casefold() or current.casefold() in x['code'].casefold()
-        ]
-        return choices[:25]
+            if not current or current.casefold() in x['name'].casefold() or
+               current.casefold() in x.get('code', x.get('type')).casefold()
+        ][:25]
     except Exception as ex:
         interaction.client.log.exception(ex)
+        return []
+
+
+@cache_with_expiration(expiration=10)
+async def get_cached_mission_list(server: Server) -> list[str]:
+    return await server.getMissionList()
 
 
 async def mission_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[int]]:
@@ -1018,63 +1151,55 @@ async def mission_autocomplete(interaction: discord.Interaction, current: str) -
     """
     def get_name(base_dir: str, path: str):
         try:
-            return os.path.relpath(path, base_dir).replace('.dcssb' + os.path.sep, '')[:-4]
+            name = os.path.relpath(path, base_dir).replace('.dcssb' + os.path.sep, '')[:-4]
+            if len(name) > 100:
+                raise ValueError("Mission name exceeds maximum length")
+            return name
         except ValueError:
-            return os.path.basename(path)[:-4]
+            return (os.path.basename(path)[:-4])[:100]
 
     if not await interaction.command._check_can_run(interaction):
         return []
     try:
-        server: Server = await ServerTransformer().transform(interaction, get_interaction_param(interaction, 'server'))
+        server: Server = await ServerTransformer().transform(interaction, interaction.namespace.server)
         if not server:
             return []
         base_dir = await server.get_missions_dir()
-        choices: list[app_commands.Choice[int]] = [
-            app_commands.Choice(name=get_name(base_dir, x), value=idx)
-            for idx, x in enumerate(await server.getMissionList())
+        return sorted([
+            app_commands.Choice[int](name=get_name(base_dir, x), value=idx)
+            for idx, x in enumerate(await get_cached_mission_list(server))
             if not current or current.casefold() in get_name(base_dir, x).casefold()
-        ]
-        return sorted(choices, key=lambda choice: choice.name)[:25]
+        ], key=lambda choice: choice.name)[:25]
     except Exception as ex:
         interaction.client.log.exception(ex)
+        return []
 
 
 async def group_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
     # is a user is not allowed to run the interaction, they are not allowed to see the autocompletions also
     if not await interaction.command._check_can_run(interaction):
         return []
-    server: Server = await ServerTransformer().transform(interaction,
-                                                         get_interaction_param(interaction, 'server'))
+    server: Server = await ServerTransformer().transform(interaction, interaction.namespace.server)
     return [
-        app_commands.Choice(name=group_name, value=group_name)
+        app_commands.Choice[str](name=group_name, value=group_name)
         for group_name in set(player.group_name for player in server.get_active_players() if player.group_id != 0)
         if not current or current.casefold() in group_name
     ][:25]
 
 
-async def squadron_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[int]]:
-    if not await interaction.command._check_can_run(interaction):
-        return []
-    async with interaction.client.apool.connection() as conn:
-        cursor = await conn.execute("SELECT id, name FROM squadrons WHERE name ILIKE %s", ('%' + current + '%', ))
-        choices: list[app_commands.Choice[int]] = [
-            app_commands.Choice(name=row[1], value=row[0])
-            async for row in cursor
-        ]
-        return choices[:25]
+async def date_autocomplete(_interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    def get_date_range(date: str):
+        try:
+            end_date = datetime.strptime(date, '%Y-%m-%d')
+        except ValueError:
+            end_date = datetime.now()
+        for days_back in range(25):
+            yield end_date - timedelta(days=days_back)
 
-
-async def get_squadron(bot: DCSServerBot, *, name: Optional[str] = None,
-                       squadron_id: Optional[int] = None) -> Optional[dict]:
-    sql = "SELECT * FROM squadrons"
-    if name:
-        sql += " WHERE name = %(name)s"
-    elif squadron_id:
-        sql += " WHERE id = %(squadron_id)s"
-    async with bot.apool.connection() as conn:
-        async with conn.cursor(row_factory=dict_row) as cursor:
-            await cursor.execute(sql, {"name": name, "squadron_id": squadron_id})
-            return await cursor.fetchone()
+    return [
+        app_commands.Choice[str](name=x.strftime('%Y-%m-%d'), value=x.strftime('%Y-%m-%d'))
+        for x in get_date_range(current)
+    ][:25]
 
 
 class UserTransformer(app_commands.Transformer):
@@ -1085,14 +1210,14 @@ class UserTransformer(app_commands.Transformer):
     - sel_type: The type of user to select. Default is PlayerType.ALL.
     - linked: Optional boolean value to specify whether to select only linked users. Default is None.
     """
-    def __init__(self, *, sel_type: PlayerType = PlayerType.ALL, linked: Optional[bool] = None,
-                 watchlist: Optional[bool] = None):
+    def __init__(self, *, sel_type: PlayerType = PlayerType.ALL, linked: bool | None = None,
+                 watchlist: bool | None = None):
         super().__init__()
         self.sel_type = sel_type
         self.linked = linked
         self.watchlist = watchlist
 
-    async def transform(self, interaction: discord.Interaction, value: str) -> Optional[Union[discord.Member, str]]:
+    async def transform(self, interaction: discord.Interaction, value: str) -> discord.Member | str | None:
         if value:
             if is_ucid(value):
                 return interaction.client.get_member_by_ucid(value) or value
@@ -1112,17 +1237,21 @@ class UserTransformer(app_commands.Transformer):
         ret = []
         if self.sel_type in [PlayerType.ALL, PlayerType.PLAYER]:
             ret.extend([
-                app_commands.Choice(name='✈ ' + name + (' (' + ucid + ')' if show_ucid else ''),
-                                    value=ucid)
-                for ucid, name in get_all_players(interaction.client, self.linked, self.watchlist)
-                if not current or current.casefold() in name.casefold() or current.casefold() in ucid
-            ])
-        if (self.linked is None or self.linked) and self.sel_type in [PlayerType.ALL, PlayerType.MEMBER]:
+                app_commands.Choice[str](
+                    name='✈ ' + name + (' (' + ucid + ')' if show_ucid else ''),
+                    value=ucid
+                )
+                for ucid, name in get_all_players(interaction.client, self.linked, self.watchlist, search=current)
+            ][:25])
+        # we do not add linked accounts, if the result above fills the return list already
+        if len(ret) < 25 and self.sel_type in [PlayerType.ALL, PlayerType.MEMBER] and (self.linked is None or self.linked):
             ret.extend([
-                app_commands.Choice(name='@' + member.display_name, value=str(member.id))
-                for member in get_all_linked_members(interaction)
-                if not current or current.casefold() in member.display_name.casefold()
-            ])
+                app_commands.Choice[str](
+                    name='@' + member.display_name,
+                    value=str(member.id)
+                )
+                for member in await get_all_linked_members(interaction, search=current)
+            ][:25])
         return ret[:25]
 
 
@@ -1130,80 +1259,87 @@ class PlayerTransformer(app_commands.Transformer):
     """
 
     """
-    def __init__(self, *, active: bool = False, watchlist: Optional[bool] = None, vip: Optional[bool] = None):
+    def __init__(self, *, active: bool | None = None, watchlist: bool | None = None, vip: bool | None = None):
         super().__init__()
         self.active = active
         self.watchlist = watchlist
         self.vip = vip
 
-    async def transform(self, interaction: discord.Interaction, value: str) -> Player:
-        server: Server = await ServerTransformer().transform(interaction, get_interaction_param(interaction, 'server'))
+    async def transform(self, interaction: discord.Interaction, value: str) -> Player | None:
+        server: Server = await ServerTransformer().transform(interaction, interaction.namespace.server)
         return server.get_player(ucid=value, active=self.active)
 
     async def autocomplete(self, interaction: Interaction, current: str) -> list[app_commands.Choice[str]]:
         if not await interaction.command._check_can_run(interaction):
             return []
         try:
+            current_lc = current.casefold() if current else None
             if self.active:
-                server: Server = await ServerTransformer().transform(interaction,
-                                                                     get_interaction_param(interaction, 'server'))
+                server: Server = await ServerTransformer().transform(interaction, interaction.namespace.server)
                 if not server:
                     return []
-                choices: list[app_commands.Choice[str]] = [
-                    app_commands.Choice(name=x.name, value=x.ucid)
+                return [
+                    app_commands.Choice[str](name=x.name, value=x.ucid)
                     for x in server.get_active_players()
                     if ((not self.watchlist or x.watchlist == self.watchlist) and (not self.vip or x.vip == self.vip)
-                        and (not current or current.casefold() in x.name.casefold() or current.casefold() in x.ucid))
-                ]
+                        and (not current_lc or current_lc in x.name.casefold() or current_lc in x.ucid))
+                ][:25]
             else:
-                choices = [
-                    app_commands.Choice(name=f"{ucid} ({name})", value=ucid)
-                    for ucid, name in get_all_players(interaction.client, self.watchlist, self.vip)
-                    if not current or current.casefold() in name.casefold() or current.casefold() in ucid
-                ]
-            return choices[:25]
+                return [
+                    app_commands.Choice[str](name=f"{ucid} ({name})", value=ucid)
+                    for ucid, name in get_all_players(interaction.client, self.watchlist, self.vip, search=current_lc)
+                ][:25]
         except Exception as ex:
             interaction.client.log.exception(ex)
+            return []
 
 
-def _server_filter(server: Server) -> bool:
+def _server_filter(_server: Server) -> bool:
     return True
 
 
-async def server_selection(bus: ServiceBus,
-                           interaction: Union[discord.Interaction, commands.Context], *, title: str,
-                           multi_select: Optional[bool] = False,
-                           ephemeral: Optional[bool] = True,
-                           filter_func: Callable[[Server], bool] = _server_filter
-                           ) -> Optional[Union[Server, list[Server]]]:
-    """
+async def server_selection(
+        bot: DCSServerBot,
+        interaction: discord.Interaction | commands.Context,
+        *,
+        title: str,
+        multi_select: bool | None = False,
+        ephemeral: bool | None = True,
+        filter_func: Callable[[Server], bool] | None = _server_filter
+) -> Server | list[Server] | None:
+    if not filter_func:
+        filter_func = _server_filter
 
-    """
-    all_servers = list(bus.servers.values())
-    if len(all_servers) == 0:
+    all_servers = bot.get_servers(
+        manager=interaction.user if isinstance(interaction, discord.Interaction) else interaction.author
+    )
+    if not all_servers:
         return []
     elif len(all_servers) == 1:
-        return [all_servers[0]]
+        try:
+            return [next(x for x in all_servers.values() if filter_func(x))]
+        except StopIteration:
+            return []
     if multi_select:
         max_values = len(all_servers)
     else:
         max_values = 1
-    server: Optional[Server] = None
+    server: Server | None = None
     if isinstance(interaction, discord.Interaction):
-        server = interaction.client.get_server(interaction)
+        server = bot.get_server(interaction)
     s = await selection(interaction, title=title,
                         options=[
-                            SelectOption(label=x.name, value=str(idx), default=(
+                            SelectOption(label=x.name, value=x.name, default=(
                                 True if server and server == x else
                                 True if not server and idx == 0 else
                                 False
-                            )) for idx, x in enumerate(all_servers) if filter_func(x)
+                            )) for idx, x in enumerate(all_servers.values()) if filter_func(x)
                         ],
                         max_values=max_values, ephemeral=ephemeral)
     if isinstance(s, list):
-        return [all_servers[int(x)] for x in s]
+        return [all_servers[x] for x in s]
     elif s:
-        return all_servers[int(s)]
+        return all_servers[s]
     return None
 
 
@@ -1230,72 +1366,115 @@ def get_ephemeral(interaction: discord.Interaction) -> bool:
 
 
 async def get_command(bot: DCSServerBot, *, name: str,
-                      group: Optional[str] = None) -> Union[app_commands.AppCommand, app_commands.AppCommandGroup]:
+                      group: str | None = None) -> app_commands.AppCommand | app_commands.AppCommandGroup:
     for cmd in await bot.tree.fetch_commands(guild=bot.guilds[0]):
-        if cmd.options and isinstance(cmd.options[0], app_commands.AppCommandGroup):
+        if group is not None and cmd.options and isinstance(cmd.options[0], app_commands.AppCommandGroup):
             if group != cmd.name:
                 continue
             for inner in cmd.options:
                 if inner.name == name:
                     return inner
-        elif cmd.name == name:
+        elif group is None and cmd.name == name:
             return cmd
+    raise app_commands.CommandNotFound(name, [group] if group else [])
 
 
 class ConfigModal(Modal):
-    def __init__(self, title: str, config: dict, old_values: Optional[dict] = None, ephemeral: Optional[bool] = False):
+    def __init__(self, title: str, config: dict, old_values: dict | None = None, ephemeral: bool | None = False):
         super().__init__(title=title)
         self.ephemeral = ephemeral
         self.value = None
         self.config = config
-        if not old_values:
-            old_values = {}
+        self.setup(old_values or {})
+
+    def setup(self, old_values: dict):
         for k, v in self.config.items():
-            self.add_item(TextInput(custom_id=k,
-                                    label=v.get('label'),
-                                    style=discord.TextStyle(v.get('style', 1)),
-                                    placeholder=v.get('placeholder'),
-                                    default=str(old_values.get(k)) if old_values.get(k) is not None else v.get('default', ''),
-                                    required=v.get('required', False),
-                                    min_length=v.get('min_length'),
-                                    max_length=v.get('max_length')))
+            if v.get('type') in [int, str, float]:
+                component = discord.ui.TextInput(
+                    custom_id=k,
+                    style=discord.TextStyle(v.get('style', 1)),
+                    placeholder=v.get('placeholder'),
+                    default=self.parse(old_values.get(k)) if old_values.get(k) is not None else self.parse(v.get('default', '')),
+                    required=v.get('required', False),
+                    min_length=v.get('min_length'),
+                    max_length=v.get('max_length')
+                )
+            elif v.get('type') == list:
+                component = discord.ui.Select(
+                    custom_id=k,
+                    placeholder=v.get('placeholder'),
+                    options=[
+                        SelectOption(label=x, value=x, default=(old_values.get(k, v.get('default')) == x))
+                        for x in v.get('options', [])
+                    ],
+                    min_values=v.get('min_values', 1),
+                    max_values=v.get('max_values', 1),
+                    required=v.get('required', False)
+                )
+            elif v.get('type') == bool:
+                component = discord.ui.Checkbox(
+                    custom_id=k,
+                    default=old_values.get(k) or v.get('default', False)
+                )
+            else:
+                raise ValueError(f"{v.get('type')} is not a valid config type!")
+
+            self.add_item(discord.ui.Label(
+                text=v.get('label'),
+                component=component
+            ))
 
     @staticmethod
-    def unmap(value: str, t: str = None) -> Any:
+    def parse(value: Any) -> str:
+        if isinstance(value, bool):
+            return 'true' if value else 'false'
+        elif isinstance(value, datetime):
+            return value.strftime('%Y-%m-%d %H:%M:%S')
+        return str(value)
+
+    @staticmethod
+    def unparse(value: Any, t: type = None) -> Any:
         if not t or t == str:
             return value
-        elif not value:
+        elif value is None:
             return None
         elif t == int:
             return int(value)
         elif t == float:
             return float(value)
-        elif t == bool:
+        elif t == bool and isinstance(value, str):
             if value.lower() == 'true':
                 return True
             elif value.lower() == 'false':
                 return False
             else:
                 raise ValueError(f"{value} is not a boolean!")
+        return value
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        # noinspection PyUnresolvedReferences
         await interaction.response.defer(ephemeral=self.ephemeral)
+        # noinspection PyUnresolvedReferences
         self.value = {
-            v.custom_id: self.unmap(v.value, self.config[v.custom_id].get('type'))
+            v.component.custom_id: self.unparse(
+                v.component.value if getattr(v.component, 'value', None) is not None else v.component.values[0],
+                self.config[v.component.custom_id].get('type')
+            )
             for v in self.children
+#            if not isinstance(v, discord.ui.Label)
         }
         self.stop()
 
     async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
-        # noinspection PyUnresolvedReferences
-        await interaction.response.send_message(f"An error occurred: {error}")
+        if interaction.response.is_done():
+            await interaction.followup.send(f"An error occurred: {error}", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"An error occurred: {error}", ephemeral=True)
         self.stop()
 
 
 class DirectoryPicker(discord.ui.View):
 
-    def __init__(self, node: Node, base_dir: str, ignore: Optional[list[str]] = None):
+    def __init__(self, node: Node, base_dir: str, ignore: list[str] | None = None):
         super().__init__()
         self.node = node
         self.base_dir = base_dir
@@ -1316,7 +1495,7 @@ class DirectoryPicker(discord.ui.View):
             rel_dir = os.path.join(rel_dir, self.dir)
         return rel_dir
 
-    async def render(self, init=False) -> Optional[discord.Embed]:
+    async def render(self, init=False) -> discord.Embed | None:
         embed = discord.Embed(color=discord.Color.blue())
         embed.title = f"Current Directory: {self.rel_path}"
         if await self.create_select():
@@ -1335,12 +1514,16 @@ class DirectoryPicker(discord.ui.View):
                     ]
                 )
             )
+            # noinspection PyUnresolvedReferences
             self.children[0].disabled = False
         elif not init:
+            # noinspection PyUnresolvedReferences
             self.children[0].disabled = True
         else:
+            # noinspection PyUnresolvedReferences
             self.children[0].disabled = True
             embed = None
+        # noinspection PyUnresolvedReferences
         self.children[2].disabled = not self.dir
         return embed
 
@@ -1352,7 +1535,7 @@ class DirectoryPicker(discord.ui.View):
             select.options = [
                 SelectOption(label=os.path.basename(x), value=x)
                 for x in sub_dirs if os.path.basename(x)
-            ]
+            ][:25]
             return True
         else:
             select.options = [SelectOption(label="None", value="None")]
@@ -1375,22 +1558,25 @@ class DirectoryPicker(discord.ui.View):
         except Exception as ex:
             interaction.client.log.exception(ex)
 
-    @discord.ui.button(label="Upload", style=discord.ButtonStyle.green, row=2)
-    async def on_upload(self, interaction: discord.Interaction, button: Button):
+    # noinspection PyTypeChecker
+    @discord.ui.button(label="Upload", style=ButtonStyle.green, row=2)
+    async def on_upload(self, interaction: discord.Interaction, _button: Button):
         # noinspection PyUnresolvedReferences
         await interaction.response.defer()
         self.stop()
 
-    @discord.ui.button(label="Up", style=discord.ButtonStyle.secondary)
-    async def on_up(self, interaction: discord.Interaction, button: Button):
+    # noinspection PyTypeChecker
+    @discord.ui.button(label="Up", style=ButtonStyle.secondary)
+    async def on_up(self, interaction: discord.Interaction, _button: Button):
         # noinspection PyUnresolvedReferences
         await interaction.response.defer()
         if self.dir:
             self.dir = os.path.dirname(self.dir)
             await self.refresh(interaction)
 
-    @discord.ui.button(label="Create", style=discord.ButtonStyle.primary)
-    async def on_create(self, interaction: discord.Interaction, button: Button):
+    # noinspection PyTypeChecker
+    @discord.ui.button(label="Create", style=ButtonStyle.primary)
+    async def on_create(self, interaction: discord.Interaction, _button: Button):
         class TextModal(Modal, title="Create Directory"):
             name = TextInput(label="Name", max_length=80, required=True)
 
@@ -1411,8 +1597,9 @@ class DirectoryPicker(discord.ui.View):
                 self.dir = modal.name.value
             await self.refresh(interaction)
 
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.red, row=2)
-    async def on_cancel(self, interaction: discord.Interaction, button: Button):
+    # noinspection PyTypeChecker
+    @discord.ui.button(label="Cancel", style=ButtonStyle.red, row=2)
+    async def on_cancel(self, interaction: discord.Interaction, _button: Button):
         # noinspection PyUnresolvedReferences
         await interaction.response.defer()
         self.base_dir = self.dir = None
@@ -1421,11 +1608,11 @@ class DirectoryPicker(discord.ui.View):
 
 class UploadView(DirectoryPicker):
 
-    def __init__(self, node: Node, base_dir: str, ignore: Optional[list[str]] = None):
+    def __init__(self, node: Node, base_dir: str, ignore: list[str] | None = None):
         super().__init__(node, base_dir, ignore)
         self.overwrite = False
 
-    async def render(self, init=False) -> Optional[discord.Embed]:
+    async def render(self, init=False) -> discord.Embed | None:
         embed = await super().render(init)
         if 'Overwrite' not in cast(Button, self.children[-1]).label:
             button = Button(label="❌ Overwrite")
@@ -1443,7 +1630,7 @@ class UploadView(DirectoryPicker):
 
 class NodeUploadHandler:
 
-    def __init__(self, node: Node, message: discord.Message, pattern: list[str]):
+    def __init__(self, node: Node, message: discord.Message, patterns: list[str]):
         from services.bot import BotService
 
         self.node = node
@@ -1451,28 +1638,66 @@ class NodeUploadHandler:
         self.channel = message.channel
         self.log = node.log
         self.bot = ServiceRegistry.get(BotService).bot
-        self.pattern = pattern
+        self.patterns: list[re.Pattern[str]] = [
+            re.compile(p, flags=re.IGNORECASE) if isinstance(p, str) else p
+            for p in patterns
+        ]
         self.overwrite = False
 
     @staticmethod
-    def is_valid(message: discord.Message, pattern: list[str], roles: list[Union[int, str]]) -> bool:
-        # ignore bot messages or messages that do not contain miz attachments
-        if (message.author.bot or not message.attachments or
-                not any(att.filename.lower().endswith(ext) for ext in pattern for att in message.attachments)):
+    def is_valid(
+        message: discord.Message,
+        patterns: list[str | re.Pattern[str]],   # list of regexes (string or compiled)
+        roles: list[int | str]
+    ) -> bool:
+        """
+        Return True if *message* is a user‑sent message that contains at least
+        one attachment whose filename matches any of the supplied regular‑
+        expressions, and the author has at least one of the required *roles*.
+
+        Parameters
+        ----------
+        message : discord.Message
+            The message to validate.
+        patterns : list[str | re.Pattern]
+            Regex patterns to match against the attachment filenames.
+            Strings are compiled on‑the‑fly with ``re.IGNORECASE``.
+        roles : list[int | str]
+            Role IDs or names that are allowed to upload.
+
+        Returns
+        -------
+        bool
+            True if the message passes all checks, False otherwise.
+        """
+        if message.author.bot or not message.attachments:
             return False
-        # check if the user has the correct role to upload, defaults to DCS Admin
+
+        compiled_patterns: list[re.Pattern[str]] = [
+            re.compile(p, flags=re.IGNORECASE) if isinstance(p, str) else p
+            for p in patterns
+        ]
+
+        if not any(
+            any(p.search(att.filename) for p in compiled_patterns)
+            for att in message.attachments
+        ):
+            return False
+
         if not utils.check_roles(roles, message.author):
             return False
+
         return True
 
-    async def render(self, directory: str, ignore_list: Optional[list[str]] = None) -> Optional[str]:
+    async def render(self, directory: str, ignore_list: list[str] | None = None) -> str | None:
         # do we have multiple subdirectories to upload to?
         view = UploadView(self.node, directory, ignore=ignore_list)
         embed = await view.render(init=True) or discord.utils.MISSING
         try:
             msg = await self.channel.send(embed=embed, view=view)
         except Exception as ex:
-            return
+            self.log.exception(ex)
+            return None
         try:
             if await view.wait():
                 await self.channel.send(_('Upload aborted.'))
@@ -1482,9 +1707,11 @@ class NodeUploadHandler:
             if not directory:
                 await self.channel.send(_('Upload aborted.'))
                 return None
+
+            return directory
+
         finally:
             await msg.delete()
-        return directory
 
     async def upload_file(self, directory: str, att: discord.Attachment) -> UploadStatus:
         self.log.debug(f"Uploading {att.filename} to {self.node.name}:{directory} ...")
@@ -1516,15 +1743,18 @@ class NodeUploadHandler:
     async def post_upload(self, uploaded: list[discord.Attachment]):
         ...
 
-    async def upload(self, base_dir: str, ignore_list: Optional[list[str]] = None):
+    async def upload(self, base_dir: str, ignore_list: list[str] | None = None,
+                     attachments: list[discord.Attachment] | None = None):
         directory = await self.render(base_dir, ignore_list)
         if not directory:
             return
 
-        attachments = [
-            att for att in self.message.attachments
-            if any(att.filename.lower().endswith(ext) for ext in self.pattern)
-        ]
+        if not attachments:
+            attachments = [
+                att for att in self.message.attachments
+                if any(p.search(att.filename) for p in self.patterns)
+            ]
+
         # run all uploads in parallel
         tasks = [self.handle_attachment(directory, att) for att in attachments]
         ret_vals = await asyncio.gather(*tasks, return_exceptions=True)
@@ -1542,22 +1772,217 @@ class NodeUploadHandler:
 
 class ServerUploadHandler(NodeUploadHandler):
 
-    def __init__(self, server: Server, message: discord.Message, pattern: list[str]):
-        super().__init__(server.node, message, pattern)
+    def __init__(self, server: Server, message: discord.Message, patterns: list[str]):
+        super().__init__(server.node, message, patterns)
         self.server = server
 
     @staticmethod
-    async def get_server(message: discord.Message) -> Optional[Server]:
+    async def get_server(
+            message: discord.Message,
+            *,
+            channel_id: int | None = None,
+            filter_func: Callable[[Server], bool] = None
+    ) -> Server | None:
         from services.bot import BotService
-        from services.servicebus import ServiceBus
 
         bot = ServiceRegistry.get(BotService).bot
         server = bot.get_server(message, admin_only=True)
-        if not server and message.channel.id == bot.locals.get('channels', {}).get('admin'):
-            bus = ServiceRegistry.get(ServiceBus)
+        if not channel_id:
+            channel_id = bot.locals.get('channels', {}).get('admin')
+
+        if not server and message.channel.id == channel_id:
             ctx = await bot.get_context(message)
-            server = await utils.server_selection(bus, ctx, title=_("To which server do you want to upload?"))
+            server = await utils.server_selection(
+                bot,
+                ctx,
+                title=_("To which server do you want to upload?"),
+                filter_func=filter_func
+            )
             if not server:
                 await ctx.send(_('Upload aborted.'))
                 return None
         return server
+
+
+class DatabaseModal(Modal):
+    def __init__(
+            self,
+            node: Node,
+            table_name: str,
+            columns: list[str],
+            title: str = "Data Entry Form"
+    ):
+        super().__init__(title=title)
+        self.node = node
+        self.table_name = table_name
+        self.columns = columns
+        self.column_types = {}
+        self.response = {}
+
+    async def get_column_info(self) -> dict[str, dict[str, Any]]:
+        """
+        Fetch column information from the database schema using async psycopg3.
+        Returns a dictionary of column information including type, constraints, etc.
+        """
+        query = """
+                SELECT column_name,
+                       data_type,
+                       is_nullable,
+                       column_default,
+                       character_maximum_length,
+                       numeric_precision,
+                       numeric_scale
+                FROM information_schema.columns
+                WHERE table_name = %s
+                  AND column_name = ANY (%s::text[])
+                """
+
+        columns_info = {}
+        async with self.node.apool.connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                async for row in await cur.execute(query, (self.table_name, self.columns)):
+                    columns_info[row['column_name']] = {
+                        'data_type': row['data_type'],
+                        'is_nullable': row['is_nullable'] == 'YES',
+                        'default': row['column_default'],
+                        'max_length': row['character_maximum_length'],
+                        'numeric_precision': row['numeric_precision'],
+                        'numeric_scale': row['numeric_scale']
+                    }
+
+        return columns_info
+
+    async def setup_fields(self):
+        """
+        Set up TextInput fields based on column information
+        """
+        columns_info = await self.get_column_info()
+
+        for column_name in self.columns:
+            info = columns_info[column_name]
+
+            # Store column type for validation
+            self.column_types[column_name] = info['data_type']
+
+            # Configure TextInput based on data type
+            field_params: dict[str, Any] = {
+                'label': column_name.replace('_', ' ').title(),
+                'required': not info['is_nullable'],
+                'placeholder': f"Enter {column_name.replace('_', ' ')}..."
+            }
+
+            # Add max_length for text fields
+            if info['max_length']:
+                field_params['max_length'] = min(info['max_length'], 4000)  # Discord's limit
+
+            # Configure field based on data type
+            if info['data_type'] in ('integer', 'bigint', 'smallint'):
+                field_params['placeholder'] = 'Enter a number...'
+                field_params['max_length'] = 20
+            elif info['data_type'] in ('timestamp', 'timestamp without time zone'):
+                field_params['placeholder'] = 'YYYY-MM-DD HH:MM'
+            elif info['data_type'] in ('numeric', 'decimal'):
+                field_params['placeholder'] = f'Enter a decimal number...'
+                if info['numeric_precision']:
+                    max_digits = info['numeric_precision']
+                    if info['numeric_scale']:
+                        field_params['placeholder'] += f' (max {info["numeric_scale"]} decimal places)'
+                    field_params['max_length'] = max_digits + 1  # +1 for decimal point
+
+            # Create and add the TextInput field
+            text_input = TextInput(**field_params)
+            self.add_item(text_input)
+            setattr(self, column_name, text_input)
+
+    @staticmethod
+    def validate_integer(value: str) -> int:
+        """Validate and convert integer input"""
+        try:
+            return int(value)
+        except ValueError:
+            raise ValueError(f"'{value}' is not a valid integer")
+
+    @staticmethod
+    def validate_numeric(value: str, scale: int = None) -> float:
+        """Validate and convert numeric input"""
+        try:
+            num = float(value)
+            if scale is not None:
+                decimal_str = str(num).split('.')
+                if len(decimal_str) > 1 and len(decimal_str[1]) > scale:
+                    raise ValueError(f"Number can't have more than {scale} decimal places")
+            return num
+        except ValueError as e:
+            raise ValueError(f"'{value}' is not a valid number: {str(e)}")
+
+    @staticmethod
+    def validate_timestamp(value: str) -> datetime:
+        """Validate and convert timestamp input"""
+        try:
+            return datetime.strptime(value, '%Y-%m-%d %H:%M')
+        except ValueError:
+            raise ValueError("Invalid date format. Use YYYY-MM-DD HH:MM")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        # Validate and convert all inputs
+        validated_data = {}
+        columns_info = await self.get_column_info()
+
+        for column_name, column_info in columns_info.items():
+            value = getattr(self, column_name).value
+
+            # Skip empty optional fields
+            if not value and not getattr(self, column_name).required:
+                continue
+
+            # Validate based on column type
+            if column_info['data_type'] in ('integer', 'bigint', 'smallint'):
+                validated_data[column_name] = self.validate_integer(value)
+            elif column_info['data_type'] in ('numeric', 'decimal'):
+                validated_data[column_name] = self.validate_numeric(
+                    value,
+                    scale=column_info['numeric_scale']
+                )
+            elif column_info['data_type'] in ('timestamp', 'timestamp without time zone'):
+                validated_data[column_name] = self.validate_timestamp(value)
+            else:  # text, varchar, etc.
+                validated_data[column_name] = value
+
+        # Generate INSERT query
+        columns = ', '.join(validated_data.keys())
+        placeholders = ', '.join(['%s'] * len(validated_data))
+        query = f"""
+            INSERT INTO {self.table_name} ({columns})
+            VALUES ({placeholders})
+            RETURNING *
+        """
+
+        # Execute query
+        async with self.node.apool.connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(query, list(validated_data.values()))
+                self.response = await cur.fetchone()
+
+        # noinspection PyUnresolvedReferences
+        await interaction.response.send_message(
+            f"Data successfully inserted into {self.table_name}!",
+            ephemeral=True
+        )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        """Handle any errors that occur during modal submission"""
+        if isinstance(error, ValueError):
+            # Handle validation errors
+            # noinspection PyUnresolvedReferences
+            await interaction.response.send_message(
+                f"Validation error: {str(error)}",
+                ephemeral=True
+            )
+        else:
+            # Handle other errors
+            # noinspection PyUnresolvedReferences
+            await interaction.response.send_message(
+                f"An error occurred: {str(error)}",
+                ephemeral=True
+            )
+            logger.error(f"Error while inserting a new row in {self.table_name}: {error}")

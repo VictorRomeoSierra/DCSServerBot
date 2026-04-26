@@ -1,6 +1,6 @@
+import asyncio
 import logging
 import os
-import platform
 import psycopg
 import random
 import secrets
@@ -11,13 +11,15 @@ import sys
 if sys.platform == 'win32':
     import winreg
 
-from contextlib import closing, suppress
+from contextlib import suppress
 from core import utils, SAVED_GAMES, translations, COMMAND_LINE_ARGS
 from pathlib import Path
+from packaging.version import parse
+from psycopg import sql
 from rich import print
 from rich.console import Console
 from rich.prompt import IntPrompt, Prompt, Confirm
-from typing import Optional, Callable
+from typing import Callable, Any
 from urllib.parse import quote, urlparse
 
 # ruamel YAML support
@@ -25,16 +27,17 @@ from ruamel.yaml import YAML
 yaml = YAML()
 
 # for gettext // i18n
-_: Optional[Callable[[str], str]] = None
+_: Callable[[str], str] | None = None
 
 
 class Install:
 
     def __init__(self, node: str):
         self.node = node
-        self.log = logging.getLogger(name='dcsserverbot')
+        self.log = logging.getLogger(f"{self.__class__.__module__}.{self.__class__.__name__}")
         self.log.propagate = False
         self.log.setLevel(logging.DEBUG)
+        self.use_upnp = utils.is_upnp_available()
         formatter = logging.Formatter(fmt=u'%(asctime)s.%(msecs)03d %(levelname)s\t%(message)s',
                                       datefmt='%Y-%m-%d %H:%M:%S')
         os.makedirs('logs', exist_ok=True)
@@ -45,9 +48,7 @@ class Install:
         self.log.info("Installation started.")
 
     @staticmethod
-    def get_dcs_installation_linux() -> Optional[str]:
-        global _
-
+    def get_dcs_installation_linux() -> str | None:
         dcs_installation = None
         while dcs_installation is None:
             dcs_installation = Prompt.ask(prompt=_("Please enter the path to your DCS World installation"))
@@ -60,9 +61,7 @@ class Install:
         return dcs_installation
 
     @staticmethod
-    def get_dcs_installation_win32() -> Optional[str]:
-        global _
-
+    def get_dcs_installation_win32() -> str | None:
         print(_("Searching for DCS installations ..."))
         key = skey = None
         try:
@@ -100,7 +99,7 @@ class Install:
                 skey.Close()
 
     @staticmethod
-    def get_database_host(host: str = '127.0.0.1', port: int = 5432) -> Optional[tuple[str, int]]:
+    def get_database_host(host: str = '127.0.0.1', port: int = 5432) -> tuple[str, int] | None:
         if not utils.is_open(host, port):
             print(_('[red]No PostgreSQL-database found on {host}:{port}![/]').format(host=host, port=port))
             host = Prompt.ask(_("Enter the hostname of your PostgreSQL-database"), default='127.0.0.1')
@@ -109,46 +108,78 @@ class Install:
         return host, port
 
     @staticmethod
-    def get_database_url(user: str, database: str) -> Optional[str]:
+    def get_database_url(user: str, database: str, config_dir: str = 'config') -> str | None:
         host, port = Install.get_database_host('127.0.0.1', 5432)
-        while True:
+        for tries in range(1, 4):
             master_db = Prompt.ask(_('Please enter the name of your PostgreSQL master database'), default='postgres')
             master_user = Prompt.ask(_('Please enter your PostgreSQL master user name'), default='postgres')
-            master_passwd = Prompt.ask(_('Please enter your PostgreSQL master password (user={})').format(master_user))
+            try:
+                master_passwd = utils.get_password(master_user, config_dir)
+            except ValueError:
+                master_passwd = Prompt.ask(_('Please enter your PostgreSQL master password (user={})').format(master_user))
             url = f'postgres://{master_user}:{quote(master_passwd)}@{host}:{port}/{master_db}?sslmode=prefer'
             try:
                 with psycopg.connect(url, autocommit=True) as conn:
-                    with closing(conn.cursor()) as cursor:
-                        try:
-                            passwd = utils.get_password('database') or ''
-                        except ValueError:
+                    utils.set_password(master_user, master_passwd, config_dir)
+                    try:
+                        passwd = utils.get_password('database', config_dir) or ''
+                    except ValueError:
+                        passwd = secrets.token_urlsafe(8)
+                    try:
+                        cursor = conn.execute("""
+                            SELECT (current_setting('server_version_num')::int / 10000) 
+                                   || '.' || 
+                                   (current_setting('server_version_num')::int % 100) AS version
+                        """)
+                        version = cursor.fetchone()[0]
+                        if parse(version).major < 14:
+                            print(_('[yellow]Your PostgreSQL version is outdated. Please upgrade to 14 or higher![/]\n'))
+
+                        conn.execute(
+                            sql.SQL("CREATE USER {} WITH ENCRYPTED PASSWORD {}")
+                            .format(sql.Identifier(user), sql.Literal(passwd))
+                        )
+                    except psycopg.Error:
+                        print(_('[yellow]Existing {} user found![/]').format(user))
+                        for i in range(1, 4):
+                            passwd = Prompt.ask(
+                                _("Please enter your password for user {}").format(user))
+                            try:
+                                with psycopg.connect(f"postgres://{user}:{quote(passwd)}@{host}:{port}/{database}?sslmode=prefer"):
+                                    pass
+                                break
+                            except psycopg.Error:
+                                print(_("[red]Wrong password! Try again ({}/3).[/]").format(i+1))
+                        else:
+                            print(_('[yellow]You have entered 3x a wrong password. I have reset it.[/]'))
                             passwd = secrets.token_urlsafe(8)
-                        try:
-                            cursor.execute(f"CREATE USER {user} WITH ENCRYPTED PASSWORD '{passwd}'")
-                        except psycopg.Error:
-                            print(_('[yellow]Existing {} user found![/]').format(user))
-                            for i in range(1, 4):
-                                passwd = Prompt.ask(
-                                    _("Please enter your password for user {}").format(user))
-                                try:
-                                    with psycopg.connect(f"postgres://{user}:{quote(passwd)}@{host}:{port}/{database}?sslmode=prefer"):
-                                        pass
-                                    break
-                                except psycopg.Error:
-                                    print(_("[red]Wrong password! Try again ({}/3).[/]").format(i+1))
-                            else:
-                                print(_('[yellow]You have entered 3x a wrong password. I have reset it.[/]'))
-                                cursor.execute(f"ALTER USER {user} WITH ENCRYPTED PASSWORD '{passwd}'")
-                        # store the password
-                        utils.set_password('database', passwd)
-                        with suppress(psycopg.Error):
-                            cursor.execute(f"CREATE DATABASE {database}")
-                            cursor.execute(f"GRANT ALL PRIVILEGES ON DATABASE {database} TO {user}")
-                            cursor.execute(f"ALTER DATABASE {database} OWNER TO {user}")
-                        print(_("[green]Database user and database created.[/]"))
-                    return f"postgres://{user}:SECRET@{host}:{port}/{database}?sslmode=prefer"
-            except psycopg.OperationalError:
+                            conn.execute(
+                                sql.SQL("ALTER USER {} WITH ENCRYPTED PASSWORD {}")
+                                .format(sql.Identifier(user), sql.Literal(passwd))
+                            )
+                    # store the (new) password
+                    utils.set_password('database', passwd, config_dir)
+                    with suppress(psycopg.Error):
+                        conn.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database)))
+                        conn.execute(
+                            sql.SQL("GRANT ALL PRIVILEGES ON DATABASE {} TO {}")
+                            .format(sql.Identifier(database), sql.Identifier(user))
+                        )
+                        conn.execute(
+                            sql.SQL("ALTER DATABASE {} OWNER TO {}")
+                            .format(sql.Identifier(database), sql.Identifier(user))
+                        )
+                    print(_("[green]Database user and database created.[/]"))
+                return f"postgres://{user}:SECRET@{host}:{port}/{database}?sslmode=prefer"
+            except psycopg.errors.InvalidPassword:
                 print(_("[red]Master password wrong. Please try again.[/]"))
+                pkl_file = os.path.join(config_dir, '.secret', master_user + '.pkl')
+                if os.path.exists(pkl_file):
+                    os.remove(pkl_file)
+            except psycopg.OperationalError as ex:
+                print(_("[yellow]Connection issue to the database: {} \nPlease try again.[/]").format(ex))
+        print(_("[red]Could not connect to the database after 3 tries.[/]"))
+        return None
 
     def install_master(self) -> tuple[dict, dict, dict]:
         global _
@@ -163,7 +194,7 @@ class Install:
             print(_("\n[u]2. Discord Setup[/]"))
             guild_id = IntPrompt.ask(
                 _('Please enter your Discord Guild ID (right click on your Discord server, "Copy Server ID")'))
-            main = {
+            main: dict[str, Any] = {
                 "guild_id": guild_id,
                 "autoupdate": autoupdate
             }
@@ -274,11 +305,10 @@ For a successful installation, you need to fulfill the following prerequisites:
     def install(self, config_dir: str, user: str, database: str):
         global _
 
-        major_version = int(platform.python_version_tuple()[1])
-        if major_version <= 8:
-            print(f"""
-[red]!!! Your Python 3.{major_version} installation is not supported, you might face issues. Please use 3.9 or higher!!![/]
-            """)
+        if sys.version_info < (3,11):
+            print(f"[red]!!! Python {sys.version_info.major}.{sys.version_info.minor} is not supported."
+                  f"DCSServerBot requires Python >= 3.11 !!![/]")
+            exit(-2)
         print("""
 [bright_blue]Hello! Thank you for choosing DCSServerBot.[/]
 DCSServerBot supports everything from single server installations to huge server farms with multiple servers across 
@@ -314,18 +344,39 @@ If you need any further assistance, please visit the support discord, listed in 
                 if not Confirm.ask(_("[red]A configuration for this node exists already![/]\n"
                                      "Do you want to overwrite it?"), default=False):
                     self.log.warning(_("Aborted: configuration exists"))
-                    exit(-1)
+                    exit(-2)
             else:
-                print(_("[yellow]Configuration found, adding another node...[/]"))
+                is_new = Prompt.ask(
+                    _("[yellow]I cannot find a configuration for node {}.[/]\n"
+                      "Is this a [bold italic]new[/] node or did the hostname of an [bold italic]existing[/] node change?").format(self.node),
+                    choices=[_('new'), _('existing')], default="new"
+                )
+                if is_new == _('existing'):
+                    old_node = Prompt.ask(_("Please select the node name you want to replace:"),
+                                          choices=[_('Abort')] + list(nodes.keys()), default='Abort')
+                    if old_node == _('Abort'):
+                        self.log.warning(_("Aborted."))
+                        exit(-2)
+                    if not Confirm.ask(prompt=_("Are you sure you want to rename node {} to {}?").format(
+                            old_node, self.node), default=False):
+                        self.log.warning(_("Aborted."))
+                        exit(-2)
+                    print(_("\n\nUpdating your config files now..."))
+                    self.rename_node(config_dir, old_node, self.node)
+                    print(_("\n[green]Your configuration was updated. Node {} was renamed to node {}.[/]").format(
+                        old_node, self.node))
+                    return
+                else:
+                    print(_("[yellow]Adding another node...[/]"))
             master = False
             i = 0
 
         print(_("\n{}. [u]Database Setup[/]").format(i + 1))
         if master:
-            database_url = Install.get_database_url(user, database)
+            database_url = Install.get_database_url(user, database, config_dir)
             if not database_url:
                 self.log.error(_("Aborted: No valid Database URL provided."))
-                exit(-1)
+                exit(-2)
         else:
             if 'database' in main:
                 database_url = main['database']['url']
@@ -339,10 +390,10 @@ If you need any further assistance, please visit the support discord, listed in 
                 hostname, port = self.get_database_host(url.hostname, url.port)
                 database_url = f"{url.scheme}://{url.username}:{url.password}@{hostname}:{port}{url.path}?sslmode=prefer"
             else:
-                database_url = Install.get_database_url(user, database)
+                database_url = Install.get_database_url(user, database, config_dir)
                 if not database_url:
                     self.log.error(_("Aborted: No valid Database URL provided."))
-                    exit(-1)
+                    exit(-2)
 
         print(_("\n{}. [u]Node Setup[/]").format(i+2))
         if sys.platform == 'win32':
@@ -350,8 +401,32 @@ If you need any further assistance, please visit the support discord, listed in 
         else:
             dcs_installation = Install.get_dcs_installation_linux()
         node = nodes[self.node] = {
-            "listen_port": max([n.get('listen_port', 10041 + idx) for idx, n in enumerate(nodes.values())]) + 1 if nodes else 10042,
+            "listen_port": max([
+                n.get('listen_port', 10041 + idx) for idx, n in enumerate(nodes.values())
+            ]) + 1 if nodes else 10042,
+            "use_upnp": self.use_upnp
         }
+        # read public IP, if possible
+        try:
+            public_ip = asyncio.run(utils.get_public_ip())
+            if Confirm.ask(_("Is {} a static IP-address for this node?").format(public_ip), default=False):
+                node['public_ip'] = public_ip
+        except TimeoutError:
+            pass
+
+        print(_("DCSServerBot can subscribe to the DGSA banlist managed by a group of DCS administrators.\n"
+                "It is split into two parts: one for banned DCS players and one for banned Discord users.\n"
+                "For public servers, it's recommended to subscribe to this list for optimal security."))
+        dgsa_dcs = Confirm.ask(_("Do you want to use the global banlist for DCS players?"), default=True)
+        dgsa_discord = Confirm.ask(_("Do you want to use the global banlist for Discord users?"), default=True)
+        if dgsa_dcs or dgsa_discord:
+            cloud: dict[str, bool] = {
+                "dcs": dgsa_dcs,
+                "discord": dgsa_discord
+            }
+        else:
+            cloud = None
+
         if 'database' not in main:
             node["database"] = {
                 "url": database_url
@@ -363,6 +438,7 @@ If you need any further assistance, please visit the support discord, listed in 
 
             if Confirm.ask(_("Do you want your DCS installation being auto-updated by the bot?"), default=True):
                 node["DCS"]["autoupdate"] = True
+
             # Check for SRS
             srs_path = os.path.expandvars('%ProgramFiles%\\DCS-SimpleRadio-Standalone')
             if not os.path.exists(srs_path):
@@ -384,20 +460,33 @@ If you need any further assistance, please visit the support discord, listed in 
             # calculate unique bot ports
             bot_port = max([
                 i.get('bot_port', 6665 + idx)
-                for idx, i in enumerate([n.get('instances', []) for n in nodes.values()])
+                for idx, i in enumerate([
+                    n['instances'] for n in nodes.values() if 'instances' in n
+                ])
             ]) + 1 if nodes else 6666
+
             # calculate unique SRS ports
             srs_port = max([
                 i.get('extensions', {}).get('SRS', {}).get('port', 5001 + idx)
-                for idx, i in enumerate([n.get('instances', []) for n in nodes.values()])
+                for idx, i in enumerate([
+                    n['instances'] for n in nodes.values() if 'instances' in n
+                ])
             ]) + 1 if nodes else 5002
+
             print(_("Searching for existing DCS server configurations ..."))
             instances = utils.findDCSInstances()
             if not instances:
                 print(_("No configured DCS servers found."))
             for name, instance in instances:
-                if Confirm.ask(_('\n[i]DCS server "{}" found.[/i]\n'
-                                 'Would you like to manage this server through DCSServerBot?').format(name), default=True):
+                if not name or name in ['n/a', 'DCS Server']:
+                    print(_("DCS Server without name found in Saved Games\\{}.").format(instance))
+                    if not Confirm.ask(_("Would you like to give it a name?"), default=True):
+                        continue
+                    name = Prompt.ask("Please enter a server name:")
+                else:
+                    print(_('\n[i]DCS Server "{}" found.[/i]\n').format(name))
+
+                if Confirm.ask(_('Would you like to manage this server through DCSServerBot?'), default=True):
                     self.log.info(_("Adding instance {instance} with server {name} ...").format(instance=instance,
                                                                                                 name=name))
                     node['instances'][instance] = {
@@ -405,13 +494,13 @@ If you need any further assistance, please visit the support discord, listed in 
                         "home": os.path.join(SAVED_GAMES, instance)
                     }
                     if srs_path:
-                        srs_config = f"%USERPROFILE%\\Saved Games\\{instance}\\Config\\SRS.cfg"
                         node['instances'][instance]['extensions'] = {
                             "SRS": {
-                                "config": srs_config,
+                                "config": "{instance.home}/Config/SRS.cfg",
                                 "port": srs_port
                             }
                         }
+                        srs_config = os.path.join(SAVED_GAMES, instance, 'Config', 'SRS.cfg')
                         if not os.path.exists(os.path.expandvars(srs_config)):
                             if os.path.exists(os.path.join(srs_path, "server.cfg")):
                                 shutil.copy2(os.path.join(srs_path, "server.cfg"), os.path.expandvars(srs_config))
@@ -422,11 +511,11 @@ If you need any further assistance, please visit the support discord, listed in 
                     bot_port += 1
                     srs_port += 2
 
-                    # we only set up channels, if we configure a discord bot
+                    # we only set up channels if we configure a discord bot
                     if not bot.get('no_discord', False):
                         channels = {
                             "Status Channel": _("To display the mission and player status."),
-                            "Chat Channel": _("[bright_black]Optional:[/]: An in-game chat replication.")
+                            "Chat Channel": _("Optional: An in-game chat replication.")
                         }
                         if not bot.get('channels', {}).get('admin'):
                             channels['Admin Channel'] = _("For admin commands.")
@@ -468,6 +557,7 @@ If you need any further assistance, please visit the support discord, listed in 
                     else:
                         scheduler[instance] = {}
                     self.log.info(_("Instance {} configured.").format(instance))
+
         print(_("\n\nAll set. Writing / updating your config files now..."))
         if master:
             os.makedirs(config_dir, exist_ok=True)
@@ -480,6 +570,16 @@ If you need any further assistance, please visit the support discord, listed in 
                 yaml.dump(bot, out)
             print(_("- Created {}").format(os.path.join(config_dir, 'services', 'bot.yaml')))
             self.log.info(_("{} written.").format(os.path.join(config_dir, 'services', 'bot.yaml')))
+            if cloud:
+                os.makedirs(os.path.join(config_dir, 'plugins'), exist_ok=True)
+                file = os.path.join(config_dir, 'plugins', 'cloud.yaml')
+                if not os.path.exists(file):
+                    shutil.copy2('samples/plugins/cloud.yaml', file)
+                data = yaml.load(Path(file).read_text(encoding='utf-8'))
+                data.setdefault('DEFAULT', {}).update({
+                    "dcs-ban": cloud['dcs'],
+                    "discord-ban": cloud['discord']
+                })
         with open(os.path.join(config_dir, 'nodes.yaml'), mode='w', encoding='utf-8') as out:
             yaml.dump(nodes, out)
         print(_("- Created {}").format(os.path.join(config_dir, "nodes.yaml")))
@@ -512,8 +612,48 @@ If you need any further assistance, please visit the support discord, listed in 
         self.log.info(_("Installation finished."))
 
 
+    @staticmethod
+    def rename_node(config_dir: str, old_name: str, new_name: str):
+        for file in Path(config_dir).rglob('*.yaml'):
+            data = yaml.load(Path(file).read_text(encoding='utf-8'))
+            if old_name in data.keys():
+                data[new_name] = data.pop(old_name)
+                with Path(file).open('w', encoding='utf-8') as f:
+                    yaml.dump(data, f)
+        main = yaml.load(Path(os.path.join(config_dir, 'main.yaml')).read_text(encoding='utf-8'))
+        nodes = yaml.load(Path(os.path.join(config_dir, 'nodes.yaml')).read_text(encoding='utf-8'))
+        url = nodes.get(new_name, {}).get('database', {}).get('url', main.get('database', {}).get('url'))
+        if not url:
+            print(_("No database URL found. Please configure the database URL in the main.yaml or nodes.yaml file."))
+            return
+        url = url.replace('SECRET', quote(utils.get_password('database', config_dir)))
+        with psycopg.connect(url, autocommit=True) as conn:
+            # rename nodes in all relevant tables
+            conn.execute("UPDATE instances SET node = %s WHERE node = %s", (new_name, old_name))
+            conn.execute("UPDATE nodestats SET node = %s WHERE node = %s", (old_name, new_name))
+            conn.execute("UPDATE audit SET node = %s WHERE node = %s", (old_name, new_name))
+            # serverstats might not be there
+            conn.execute(
+                sql.SQL(
+                    """
+                    DO $$
+                    BEGIN
+                        IF to_regclass('public.serverstats') IS NOT NULL THEN
+                            UPDATE serverstats
+                            SET node = {new_val}
+                            WHERE node = {old_val};
+                        END IF;
+                    END $$;
+                    """
+                ).format(
+                    new_val=sql.Literal(new_name),
+                    old_val=sql.Literal(old_name),
+                )
+            )
+
+
 if __name__ == "__main__":
-    # get the command line args from core
+    # get the command line args from the core
     args = COMMAND_LINE_ARGS
     console = Console()
     try:

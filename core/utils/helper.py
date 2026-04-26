@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import aiohttp
 import asyncio
 import base64
 import builtins
+import certifi
 import functools
 import hashlib
 import importlib
+import inspect
 import json
+import keyword
 import logging
 import luadata
 import os
@@ -14,23 +18,25 @@ import pkgutil
 import re
 import secrets
 import shutil
+import ssl
 import string
 import tempfile
 import threading
 import time
+import traceback
 import unicodedata
-
-# for eval
-import random
-import math
 
 from collections.abc import Mapping
 from copy import deepcopy
+from core.data.const import Port
 from croniter import croniter
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone, tzinfo
+from difflib import unified_diff
 from importlib import import_module
+from lupa.lua51 import LuaSyntaxError
+from packaging.version import parse
 from pathlib import Path
-from typing import Optional, Union, TYPE_CHECKING, Generator, Iterable, Callable, Any
+from typing import TYPE_CHECKING, Generator, Iterable, Callable, Any
 from urllib.parse import urlparse
 
 # ruamel YAML support
@@ -55,6 +61,9 @@ __all__ = [
     "format_period",
     "slugify",
     "alternate_parse_settings",
+    "exception_to_dict",
+    "rebuild_exception",
+    "ReprException",
     "get_all_players",
     "is_ucid",
     "get_presets",
@@ -71,16 +80,24 @@ __all__ = [
     "tree_delete",
     "deep_merge",
     "hash_password",
+    "run_parallel_nofail",
+    "safe_set_result",
     "evaluate",
     "for_each",
     "YAMLError",
-    "DictWrapper"
+    "DictWrapper",
+    "default_serializer",
+    "format_dict_pretty",
+    "show_dict_diff",
+    "to_valid_pyfunc_name",
+    "pg_interval_to_seconds",
+    "pg_get_latest_version"
 ]
 
 logger = logging.getLogger(__name__)
 
 
-def parse_time(time_str: str, tz: datetime.tzinfo = None) -> datetime:
+def parse_time(time_str: str, tz: tzinfo = None) -> datetime:
     fmt, time_str = ('%H:%M', time_str.replace('24:', '00:')) \
         if time_str.find(':') > -1 else ('%H', time_str.replace('24', '00'))
     ret = datetime.strptime(time_str, fmt)
@@ -89,7 +106,7 @@ def parse_time(time_str: str, tz: datetime.tzinfo = None) -> datetime:
     return ret
 
 
-def is_in_timeframe(time: datetime, timeframe: str, tz: datetime.tzinfo = None) -> bool:
+def is_in_timeframe(time: datetime, timeframe: str, tz: tzinfo = None) -> bool:
     """
     Check if a given time falls within a specified timeframe.
 
@@ -114,6 +131,8 @@ def is_in_timeframe(time: datetime, timeframe: str, tz: datetime.tzinfo = None) 
         start_time = end_time = parse_time(timeframe, tz).replace(year=time.year, month=time.month, day=time.day,
                                                                   second=0, microsecond=0)
     check_time = time.replace(second=0, microsecond=0)
+    if tz:
+        check_time = check_time.astimezone(tz=tz)
     return start_time <= check_time <= end_time
 
 
@@ -145,7 +164,7 @@ def str_to_class(name: str):
         return None
 
 
-def format_string(string_: str, default_: Optional[str] = None, **kwargs) -> str:
+def format_string(string_: str, default_: str | None = None, **kwargs) -> str:
     """
     Format the given string using the provided keyword arguments.
 
@@ -160,17 +179,29 @@ def format_string(string_: str, default_: Optional[str] = None, **kwargs) -> str
                 spec = ''
                 value = default_ or ''
             elif isinstance(value, list):
-                value = '\n'.join(value)
+                value = repr(value)
             elif isinstance(value, dict):
                 value = json.dumps(value)
             elif isinstance(value, bool):
-                value = str(value).lower()
+                value = str(value)
+            elif isinstance(value, datetime) and value.tzinfo:
+                value = value.astimezone(timezone.utc).replace(tzinfo=None)
             return super().format_field(value, spec)
+
+        def get_value(self, key, args, kwargs):
+            if isinstance(key, int):
+                return args[key]
+            elif key in kwargs:
+                return kwargs[key]
+            else:
+                return "{" + key + "}"
 
     try:
         string_ = NoneFormatter().format(string_, **kwargs)
     except (KeyError, TypeError):
         string_ = ""
+    except IndexError as ex:
+        logger.exception(ex)
     return string_
 
 
@@ -272,7 +303,7 @@ def slugify(value, allow_unicode=False):
 
 
 def alternate_parse_settings(path: str):
-    def parse(value: str) -> Union[int, str, bool]:
+    def parse(value: str) -> int | str | bool:
         if value.startswith('"'):
             return value[1:-1]
         elif value == 'true':
@@ -309,8 +340,70 @@ def alternate_parse_settings(path: str):
     return settings
 
 
-def get_all_players(self, linked: Optional[bool] = None, watchlist: Optional[bool] = None,
-                    vip: Optional[bool] = None) -> list[tuple[str, str]]:
+def exception_to_dict(e: BaseException) -> dict[str, Any]:
+    """Return a JSON-friendly dict representation of an exception."""
+    payload: dict[str, Any] = {
+        'class': f'{e.__class__.__module__}.{e.__class__.__name__}',
+        'message': str(e),
+        'traceback': traceback.format_exception_only(type(e), e),
+        'args': list(e.args),
+    }
+
+    # Pull out useful OSError / socket attributes
+    # (only those that are JSON-friendly)
+    for key in ('errno', 'strerror', 'filename', 'filename2'):
+        if hasattr(e, key):
+            payload[key] = getattr(e, key)
+
+    # If the exception has a kwargs dict (rare), sanitize it
+    kwargs = getattr(e, 'kwargs', None)
+    if isinstance(kwargs, dict):
+        payload['kwargs'] = dict(kwargs)
+
+    return payload
+
+
+class ReprException(Exception):
+    """Wrapper that keeps the original payload if we can’t rebuild it."""
+    def __init__(self, payload: dict[str, Any]):
+        self.payload = payload
+        super().__init__(f'Unable to reconstruct exception from {payload!r}')
+
+
+def rebuild_exception(payload: dict[str, Any]) -> BaseException:
+    """
+    Recreate a BaseException from the serialized payload.
+    If the payload cannot be used to instantiate the original type,
+    we return a lightweight wrapper that stores the payload.
+    """
+    cls = str_to_class(payload['class'])
+    if not cls:
+        return ReprException(payload)
+
+    args = tuple(payload.get('args', ()))          # ensures a tuple
+    kwargs = dict(payload.get('kwargs', {}))      # ensures a dict
+
+    try:
+        return cls(*args, **kwargs)
+    except TypeError:
+        # Some exceptions, especially library HTTP exceptions, cannot be
+        # reconstructed from their constructor args. Fall back gracefully.
+        message = payload.get('message')
+        if message:
+            return Exception(message)
+        return ReprException(payload)
+    except Exception:
+        # Constructor raised an unexpected error – fall back.
+        return ReprException(payload)
+
+
+def get_all_players(
+        self,
+        linked: bool | None = None,
+        watchlist: bool | None = None,
+        vip: bool | None = None,
+        search: str | None = None
+) -> list[tuple[str, str]]:
     """
     This method `get_all_players` returns a list of tuples containing the UCID and name of players from the database. Filtering can be optionally applied by providing values for the parameters
     * `linked`, `watchlist`, and `vip`.
@@ -322,28 +415,51 @@ def get_all_players(self, linked: Optional[bool] = None, watchlist: Optional[boo
     * set to `False`, only players not on the watchlist will be returned. If not provided, no filtering based on watchlist status will be applied.
     :param vip: Optional boolean parameter to filter players based on whether they are VIP players or not. If set to `True`, only VIP players will be returned. If set to `False`, only non
     *-VIP players will be returned. If not provided, no filtering based on VIP status will be applied.
+    :param search: Optional string parameter to search for players by name or UCID. If provided, only players whose name or UCID contain the search string will be returned.
     :return: A list of tuples containing the UCID and name of players from the database.
 
     """
-    sql = "SELECT p.ucid, p.name FROM players p{} WHERE length(p.ucid) = 32"
-    sub_sql = ""
+    clauses = ["length(p.ucid) = 32"]
+    params: list[object] = []
+    join_watchlist = False
+    search_lc = search.lower() if search else None
+
     if watchlist:
-        sub_sql = " JOIN watchlist w ON p.ucid = w.player_ucid"
+        join_watchlist = True
     elif watchlist is False:
-        sql += " AND p.ucid NOT IN (SELECT player_ucid FROM watchlist)"
+        clauses.append("p.ucid NOT IN (SELECT player_ucid FROM watchlist)")
+
     if vip:
-        sql += " AND p.vip IS NOT FALSE"
-    if linked is not None:
-        if linked:
-            sql += " AND p.discord_id != -1 AND p.manual IS TRUE"
+        clauses.append("p.vip IS NOT FALSE")
+
+    if linked:
+        clauses.append("p.discord_id != -1 AND p.manual IS TRUE")
+    elif linked is False:
+        clauses.append("p.manual IS FALSE")
+
+    if search_lc is not None:
+        if is_ucid(search_lc):
+            clauses.append("p.ucid = %s")
+            params.append(search_lc)
         else:
-            sql += " AND p.manual IS FALSE"
-    sql = sql.format(sub_sql)
+            clauses.append("(p.name ILIKE %s OR p.ucid ILIKE %s)")
+            pattern = f"%{search_lc}%"
+            params.extend([pattern, pattern])
+
+    sql = "SELECT p.ucid, p.name FROM players p"
+    if join_watchlist:
+        sql += " JOIN watchlist w ON p.ucid = w.player_ucid"
+
+    sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY last_seen DESC LIMIT 25"
+
     with self.pool.connection() as conn:
-        return [(row[0], row[1]) for row in conn.execute(sql)]
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            return [(row[0], row[1]) for row in cur.fetchall()]
 
 
-def is_ucid(ucid: Optional[str]) -> bool:
+def is_ucid(ucid: str | None) -> bool:
     """
     :param ucid: The UCID (User Client ID) is a unique identifier used in the system.
     :return: Returns True if the UCID is valid, False otherwise.
@@ -367,27 +483,35 @@ def get_presets(node: Node) -> Iterable[str]:
     return presets
 
 
-def get_preset(node: Node, name: str, filename: Optional[str] = None) -> Optional[dict]:
+def get_preset(node: Node, name: str, filename: str | list[str] | None = None) -> dict | None:
     """
     :param node: The node where the configuration is stored.
     :param name: The name of the preset to retrieve.
     :param filename: The optional filename of the preset file to search in. If not provided, it will search for preset files in the 'config' directory.
     :return: The dictionary containing the preset data if found, or None if the preset was not found.
     """
-    def _read_presets_from_file(filename: Path, name: str) -> Optional[dict]:
-        all_presets = yaml.load(filename.read_text(encoding='utf-8'))
+    @cache_with_expiration(120)
+    def load_all_presets(filename: Path) -> dict:
+        return yaml.load(filename.read_text(encoding='utf-8'))
+
+    def _read_presets_from_file(filename: Path, name: str) -> dict | list | None:
+        all_presets = load_all_presets(filename)
         preset = all_presets.get(name)
         if isinstance(preset, list):
-            return {k: v for d in preset for k, v in all_presets.get(d, {}).items()}
+            return [_read_presets_from_file(filename, x) for x in preset]
         return preset
 
-    if filename:
-        return _read_presets_from_file(Path(filename), name)
+    if isinstance(filename, str):
+        preset_files = [filename]
+    elif isinstance(filename, list):
+        preset_files = filename
     else:
-        for file in Path(node.config_dir).glob('presets*.yaml'):
-            preset = _read_presets_from_file(file, name)
-            if preset:
-                return preset
+        preset_files = Path(node.config_dir).glob('presets*.yaml')
+
+    for file in preset_files:
+        preset = _read_presets_from_file(Path(file), name)
+        if preset:
+            return preset
     return None
 
 
@@ -450,19 +574,81 @@ def dynamic_import(package_name: str):
     package = importlib.import_module(package_name)
     for loader, module_name, is_pkg in pkgutil.walk_packages(package.__path__):
         if is_pkg:
-            globals()[module_name] = importlib.import_module(f"{package_name}.{module_name}")
+            try:
+                globals()[module_name] = importlib.import_module(f"{package_name}.{module_name}")
+            except Exception as ex:
+                logger.error(f"Failed to import {module_name} due to {ex}, skipping.")
 
+def async_cache(func: Callable):
+    cache: dict[Any, Any] = {}
+    pending: dict[Any, asyncio.Future] = {}
+    locks: dict[Any, asyncio.Lock] = {}
+    _SENTINEL = object()
 
-def async_cache(func):
-    cache = {}
+    def get_cache_key(*args, **kwargs):
+        signature = inspect.signature(func)
+        bound_args = signature.bind(*args, **kwargs)
+        bound_args.apply_defaults()
+
+        # Convert unhashable types to hashable forms
+        hashable_args = []
+        for k, v in bound_args.arguments.items():
+            if k not in ["interaction"]:  # Removed "self" from the exclusion list
+                # For the self-parameter, use its id as part of the key
+                if k == "self":
+                    hashable_args.append(id(v))
+                # if we have a .name element, use this as key instead
+                elif hasattr(v, "name") and not isinstance(v, (str, bytes)):
+                    hashable_args.append(("name", getattr(v, "name", None)))
+                # Convert lists to tuples and handle nested lists
+                elif isinstance(v, list):
+                    hashable_args.append(tuple(tuple(x) if isinstance(x, list) else x for x in v))
+                else:
+                    hashable_args.append(v)
+
+        # Use tuple instead of frozenset to preserve order and handle nested structures
+        return func.__name__, tuple(hashable_args)
+
+    async def _get_lock(key) -> asyncio.Lock:
+        lock = locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[key] = lock
+        return lock
 
     @functools.wraps(func)
-    async def wrapper(*args):
-        if args in cache:
-            return cache[args]
-        result = await func(*args)
-        cache[args] = result
-        return result
+    async def wrapper(*args, **kwargs):
+        key = get_cache_key(*args, **kwargs)
+
+        cached = cache.get(key, _SENTINEL)
+        if cached is not _SENTINEL:
+            return cached
+
+        lock = await _get_lock(key)
+        async with lock:
+            cached = cache.get(key, _SENTINEL)
+            if cached is not _SENTINEL:
+                return cached
+
+            fut = pending.get(key)
+            if fut is None:
+                loop = asyncio.get_running_loop()
+                fut = loop.create_future()
+                pending[key] = fut
+
+                async def run():
+                    try:
+                        result = await func(*args, **kwargs)
+                        cache[key] = result
+                        fut.set_result(result)
+                    except Exception as e:
+                        fut.set_exception(e)
+                    finally:
+                        _ = pending.pop(key, None)
+
+                loop.create_task(run())
+
+        return await fut
 
     return wrapper
 
@@ -470,32 +656,105 @@ def async_cache(func):
 def cache_with_expiration(expiration: int):
     """
     Decorator to cache function results for a specific duration.
-
-    :param expiration: Cache duration in seconds.
+    Works with both sync and async functions.
+    Adds concurrency safety (per-key in-flight coalescing).
     """
-
     def decorator(func: Callable) -> Callable:
         cache: dict[Any, Any] = {}
         cache_expiry: dict[Any, float] = {}
+        pending: dict[Any, asyncio.Future] = {}
+        locks: dict[Any, asyncio.Lock] = {}
+        _SENTINEL = object()
 
-        @functools.wraps(func)
-        async def wrapper(*args, **kwargs):
-            # Generate a key based on function arguments
-            hashable_kwargs = {k: tuple(v) if isinstance(v, list) else v for k, v in kwargs.items()}
-            cache_key = (args, frozenset(hashable_kwargs.items()))
+        def get_cache_key(*args, **kwargs):
+            signature = inspect.signature(func)
+            bound_args = signature.bind(*args, **kwargs)
+            bound_args.apply_defaults()
 
-            # Check if the cache is still valid
-            if cache_key in cache and cache_key in cache_expiry:
-                if time.time() < cache_expiry[cache_key]:
-                    return cache[cache_key]
+            # Convert unhashable types to hashable forms
+            hashable_args = []
+            for k, v in bound_args.arguments.items():
+                # For the self-parameter, use its id as part of the key
+                if k == "self":
+                    hashable_args.append(id(v))
+                # if we have a .name element, use this as key instead
+                elif hasattr(v, "name") and not isinstance(v, (str, bytes)):
+                    hashable_args.append(("name", getattr(v, "name", None)))
+                # Convert lists to tuples and handle nested lists
+                elif isinstance(v, list):
+                    hashable_args.append(tuple(tuple(x) if isinstance(x, list) else x for x in v))
+                else:
+                    hashable_args.append(v)
+            return func.__name__, tuple(hashable_args)
 
-            # Call the original function and cache its result
-            result = await func(*args, **kwargs)
+        def check_cache(cache_key):
+            ts = cache_expiry.get(cache_key)
+            if ts is not None and time.time() < ts:
+                return cache.get(cache_key, _SENTINEL)
+            return _SENTINEL
+
+        def update_cache(cache_key, result):
             cache[cache_key] = result
             cache_expiry[cache_key] = time.time() + expiration
             return result
 
-        return wrapper
+        async def _get_lock(cache_key) -> asyncio.Lock:
+            # Fast path
+            lock = locks.get(cache_key)
+            if lock is None:
+                # Create lazily; a small race is fine (we only need mutual exclusion, not singletons)
+                lock = asyncio.Lock()
+                locks[cache_key] = lock
+            return lock
+
+        @functools.wraps(func)
+        async def async_wrapper(*args, **kwargs):
+            cache_key = get_cache_key(*args, **kwargs)
+
+            cached_result = check_cache(cache_key)
+            if cached_result is not _SENTINEL:
+                return cached_result
+
+            lock = await _get_lock(cache_key)
+            async with lock:
+                cached_result = check_cache(cache_key)
+                if cached_result is not _SENTINEL:
+                    return cached_result
+
+                fut = pending.get(cache_key)
+                if fut is None:
+                    loop = asyncio.get_running_loop()
+                    fut = loop.create_future()
+                    pending[cache_key] = fut
+
+                    async def producer():
+                        try:
+                            result = await func(*args, **kwargs)
+                            update_cache(cache_key, result)
+                            fut.set_result(result)
+                        except Exception as e:
+                            fut.set_exception(e)
+                        finally:
+                            _ = pending.pop(cache_key, None)
+
+                    loop.create_task(producer())
+
+            return await fut
+
+        @functools.wraps(func)
+        def sync_wrapper(*args, **kwargs):
+            cache_key = get_cache_key(*args, **kwargs)
+
+            cached_result = check_cache(cache_key)
+            if cached_result is not _SENTINEL:
+                return cached_result
+
+            result = func(*args, **kwargs)
+            return update_cache(cache_key, result)
+
+        if inspect.iscoroutinefunction(func):
+            return async_wrapper
+        return sync_wrapper
 
     return decorator
 
@@ -576,14 +835,23 @@ class SettingsDict(dict):
         if not os.path.exists(self.path):
             return
         self.mtime = os.path.getmtime(self.path)
+        data = None
         if self.path.lower().endswith('.lua'):
             try:
-                data = luadata.read(self.path, encoding='utf-8')
+                ex = None
+                for i in range(0, 3):
+                    try:
+                        data = luadata.read(self.path, encoding='utf-8')
+                        break
+                    except LuaSyntaxError as ex:
+                        time.sleep(0.5)
+                else:
+                    raise ex
             except Exception as ex:
                 self.log.debug(f"Exception while reading {self.path}:\n{ex}")
                 data = alternate_parse_settings(self.path)
                 if not data:
-                    self.log.error("- Error while parsing {}!".format(os.path.basename(self.path)))
+                    self.log.error("- Error while parsing {}:\n{}".format(os.path.basename(self.path), ex))
                     raise ex
         elif self.path.lower().endswith('.yaml'):
             with open(self.path, mode='r', encoding='utf-8') as file:
@@ -648,17 +916,16 @@ class SettingsDict(dict):
             }
         }
         if self.bus:
-            asyncio.create_task(self.bus.send_to_node(msg))
+            self.bus.loop.create_task(self.bus.send_to_node(msg))
 
     def __setitem__(self, key, value, *, sync: bool = False):
         if os.path.exists(self.path) and self.mtime < os.path.getmtime(self.path):
             self.log.debug(f'{self.path} changed, re-reading from disk.')
             self.read_file()
-        if self.get(key) != value:
-            super().__setitem__(key, value)
-            self.write_file()
-            if not self.obj.node.master:
-                self.update_master(key, value, method='__setitem__')
+        super().__setitem__(key, value)
+        self.write_file()
+        if not self.obj.node.master:
+            self.update_master(key, value, method='__setitem__')
 
     def __getitem__(self, item):
         if os.path.exists(self.path) and self.mtime < os.path.getmtime(self.path):
@@ -702,14 +969,14 @@ class RemoteSettingsDict(dict):
     Args:
         server (ServerProxy): The server proxy object that handles communication with the remote server.
         obj (str): The name of the object on the remote server that the settings belong to.
-        data (Optional[dict]): Optional initial data for the settings dictionary.
+        data (dict | None): Optional initial data for the settings dictionary.
 
     Attributes:
         server (ServerProxy): The server proxy object that handles communication with the remote server.
         obj (str): The name of the object on the remote server that the settings belong to.
 
     """
-    def __init__(self, server: ServerProxy, obj: str, data: Optional[dict] = None):
+    def __init__(self, server: ServerProxy, obj: str, data: dict | None = None):
         from core.services.registry import ServiceRegistry
         from services.servicebus import ServiceBus
 
@@ -732,7 +999,7 @@ class RemoteSettingsDict(dict):
                     "value": value
                 }
             }
-            asyncio.create_task(self.bus.send_to_node(msg, node=self.server.node))
+            self.bus.loop.create_task(self.bus.send_to_node(msg, node=self.server.node))
 
     def __delitem__(self, key, *, sync: bool = True):
         super().__delitem__(key)
@@ -746,10 +1013,10 @@ class RemoteSettingsDict(dict):
                     "key": key
                 }
             }
-            asyncio.create_task(self.bus.send_to_node(msg, node=self.server.node))
+            self.bus.loop.create_task(self.bus.send_to_node(msg, node=self.server.node))
 
 
-def tree_delete(d: dict, key: str, debug: Optional[bool] = False):
+def tree_delete(d: dict, key: str, debug: bool | None = False):
     """
     Clears an element from nested structure (a mix of dictionaries and lists)
     given a key in the form "root/element1/element2".
@@ -780,23 +1047,47 @@ def tree_delete(d: dict, key: str, debug: Optional[bool] = False):
         curr_element.pop(int(keys[-1]))
 
 
-def deep_merge(dict1, dict2):
-    result = dict(dict1)  # Create a shallow copy of dict1
-    for key, value in dict2.items():
-        if key in result and isinstance(result[key], Mapping) and isinstance(value, Mapping):
-            # Recursively merge dictionaries
+def deep_merge(d1: Mapping[str, Any], d2: Mapping[str, Any]) -> Mapping[str, Any]:
+    """
+       Merge two dictionaries recursively.  Non‑mapping values are overwritten.
+
+       Parameters
+       ----------
+       d1, d2 : Mapping
+           Input mappings to merge.  They are *not* modified.
+
+       Returns
+       -------
+       dict
+           A new dictionary containing the deep merge of `d1` and `d2`.
+       """
+    if not isinstance(d1, Mapping):
+        raise TypeError(f"d1 must be a Mapping, got {type(d1).__name__}")
+    if not isinstance(d2, Mapping):
+        raise TypeError(f"d2 must be a Mapping, got {type(d2).__name__}")
+
+    result: dict = dict(d1)  # shallow copy of d1
+
+    for key, value in d2.items():
+        # If both sides are mappings, merge recursively
+        if (
+                key in result
+                and isinstance(result[key], Mapping)
+                and isinstance(value, Mapping)
+        ):
             result[key] = deep_merge(result[key], value)
         else:
-            # Overwrite or add the new key-value pair
+            # Overwrite or add the new key/value pair
             result[key] = value
+
     return result
 
 
 def hash_password(password: str) -> str:
-    # Generate an 11 character alphanumeric string
+    # Generate an 11-character alphanumeric string
     key = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(11))
 
-    # Create a 32 byte digest using the Blake2b hash algorithm
+    # Create a 32-byte-digest using the "Blake2b" hash algorithm
     # with the password as the input and the key as the key
     password_bytes = password.encode('utf-8')
     key_bytes = key.encode('utf-8')
@@ -811,7 +1102,17 @@ def hash_password(password: str) -> str:
     return hashed_password
 
 
-def evaluate(value: Union[str, int, float, bool, list, dict], **kwargs) -> Union[str, int, float, bool, list, dict]:
+async def run_parallel_nofail(*tasks):
+    """Run tasks in parallel, ignoring any failures."""
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def safe_set_result(fut: asyncio.Future, payload: dict) -> None:
+    if not fut.done():
+        fut.set_result(payload)
+
+
+def evaluate(value: str | int | float | bool | list | dict, **kwargs) -> str | int | float | bool | list | dict:
     """
     Evaluate the given value, replacing placeholders with keyword arguments if necessary.
 
@@ -821,23 +1122,35 @@ def evaluate(value: Union[str, int, float, bool, list, dict], **kwargs) -> Union
              If the input value is a string starting with '$', it will be evaluated with placeholders replaced by keyword arguments.
     """
     def _evaluate(value, **kwargs):
+        import random
+        import math
+
         if isinstance(value, (int, float, bool)) or not value.startswith('$'):
             return value
         value = format_string(value[1:], **kwargs)
         namespace = {k: v for k, v in globals().items() if not k.startswith("__")}
-        return eval(value, namespace, kwargs) if value else False
+        namespace |= {
+            'random': random,
+            'math': math
+        }
+        try:
+            return eval(value, namespace, kwargs) if value else False
+        except Exception:
+            logger.error(f"Error evaluating: {value} using kwargs={repr(kwargs)}")
+            raise
 
     if isinstance(value, list):
         for i in range(len(value)):
             value[i] = _evaluate(value[i], **kwargs)
+        return value
     elif isinstance(value, dict):
-        return {_evaluate(k, **kwargs): _evaluate(v, **kwargs) for k, v in value.items()}
+        return {_evaluate(k, **kwargs): evaluate(v, **kwargs) for k, v in value.items()}
     else:
         return _evaluate(value, **kwargs)
 
 
-def for_each(data: dict, search: list[str], depth: Optional[int] = 0, *,
-             debug: Optional[bool] = False, **kwargs) -> Generator[dict]:
+def for_each(data: dict, search: list[str], depth: int | None = 0, *,
+             debug: bool | None = False, **kwargs) -> Generator[dict | None]:
     """
     :param data: The data to iterate over.
     :param search: The search pattern to match elements in the data.
@@ -857,15 +1170,15 @@ def for_each(data: dict, search: list[str], depth: Optional[int] = 0, *,
     If the search pattern is fully matched or the data is empty, the method will yield the data itself. If debug is set to True, debug information will be printed during the search process
     *.
     """
-    def process_iteration(_next, data, search, depth, debug):
+    def process_iteration(_next, data, search, depth, debug, **kwargs):
         if isinstance(data, list):
             for value in data:
-                yield from for_each(value, search, depth + 1, debug=debug)
+                yield from for_each(value, search, depth + 1, debug=debug, **kwargs)
         elif isinstance(data, dict):
             for value in data.values():
-                yield from for_each(value, search, depth + 1, debug=debug)
+                yield from for_each(value, search, depth + 1, debug=debug, **kwargs)
 
-    def process_indexing(_next, data, search, depth, debug):
+    def process_indexing(_next, data, search, depth, debug, **kwargs):
         if isinstance(data, list):
             indexes = [int(x.strip()) for x in _next[1:-1].split(',')]
             for index in indexes:
@@ -875,7 +1188,7 @@ def for_each(data: dict, search: list[str], depth: Optional[int] = 0, *,
                     yield None
                 if debug:
                     logger.debug("  " * depth + f"|_ Selecting {index}. element")
-                yield from for_each(data[index - 1], search, depth + 1, debug=debug)
+                yield from for_each(data[index - 1], search, depth + 1, debug=debug, **kwargs)
         elif isinstance(data, dict):
             indexes = [x.strip() for x in _next[1:-1].split(',')]
             for index in indexes:
@@ -885,7 +1198,7 @@ def for_each(data: dict, search: list[str], depth: Optional[int] = 0, *,
                     yield None
                 if debug:
                     logger.debug("  " * depth + f"|_ Selecting element {index}")
-                yield from for_each(data[index], search, depth + 1, debug=debug)
+                yield from for_each(data[index], search, depth + 1, debug=debug, **kwargs)
 
     def process_pattern(_next, data, search, depth, debug, **kwargs):
         if isinstance(data, list):
@@ -893,33 +1206,44 @@ def for_each(data: dict, search: list[str], depth: Optional[int] = 0, *,
                 if evaluate(_next, **(kwargs | value)):
                     if debug:
                         logger.debug("  " * depth + f"  - Element {idx + 1} matches.")
-                    yield from for_each(value, search, depth + 1, debug=debug)
-        else:
-            if evaluate(_next, **(kwargs | data)):
+                    yield from for_each(value, search, depth + 1, debug=debug, **kwargs)
+        elif isinstance(data, dict):
+            if any(x for x in data.keys() if isinstance(x, int)):
+                for idx, value in data.items():
+                    if evaluate(_next, **(kwargs | value)):
+                        if debug:
+                            logger.debug("  " * depth + f"  - Element {idx} matches.")
+                        yield from for_each(value, search, depth + 1, debug=debug, **kwargs)
+            elif evaluate(_next, **(kwargs | data)):
                 if debug:
-                    logger.debug("  " * depth + "  - Element matches.")
-                yield from for_each(data, search, depth + 1, debug=debug)
+                    logger.debug("  " * depth + f"  - Element {format_string(_next[1:], **kwargs)} matches.")
+                yield from for_each(data, search, depth + 1, debug=debug, **kwargs)
 
     if not data or len(search) == depth:
-        if debug:
-            logger.debug("  " * depth + ("|_ RESULT found => Processing ..." if len(search) == depth else "|_ NO result found, skipping."))
-        yield data if len(search) == depth else None
+        if len(search) == depth:
+            if debug:
+                logger.debug("  " * depth + "|_ RESULT found => Processing ...")
+            yield data
+        else:
+            logger.debug("  " * depth +  "|_ NO result found, skipping.")
+            yield None
     else:
         _next = search[depth]
         if _next == '*':
             if debug:
                 logger.debug("  " * depth + f"|_ Iterating over {len(data)} {search[depth - 1]} elements")
-            yield from process_iteration(_next, data, search, depth, debug)
+            yield from process_iteration(_next, data, search, depth, debug, **kwargs)
         elif _next.startswith('['):
-            yield from process_indexing(_next, data, search, depth, debug)
+            yield from process_indexing(_next, data, search, depth, debug, **kwargs)
         elif _next.startswith('$'):
             if debug:
-                logger.debug("  " * depth + f"|_ Searching pattern {_next} on {len(data)} {search[depth - 1]} elements")
+                pattern = format_string(_next[1:], **kwargs)
+                logger.debug("  " * depth + f"|_ Searching pattern {pattern} on {len(data)} {search[depth - 1]} elements")
             yield from process_pattern(_next, data, search, depth, debug, **kwargs)
         elif _next in data:
             if debug:
                 logger.debug("  " * depth + f"|_ {_next} found.")
-            yield from for_each(data.get(_next), search, depth + 1, debug=debug)
+            yield from for_each(data.get(_next), search, depth + 1, debug=debug, **kwargs)
         else:
             if debug:
                 logger.debug("  " * depth + f"|_ {_next} not found.")
@@ -929,12 +1253,12 @@ def for_each(data: dict, search: list[str], depth: Optional[int] = 0, *,
 class YAMLError(Exception):
     """
 
-    The `YAMLError` class is an exception class that is raised when there is an error encountered while parsing or scanning a YAML file.
+    The `YAMLError` class is an exception class raised when there is an error encountered while parsing or scanning a YAML file.
 
     **Methods:**
 
     """
-    def __init__(self, file: str, ex: Union[MarkedYAMLError, ValueError, SchemaError]):
+    def __init__(self, file: str, ex: MarkedYAMLError | ValueError | SchemaError):
         super().__init__(f"Error in {file}, " + ex.__str__().replace('"<unicode string>"', file))
 
 
@@ -1017,3 +1341,200 @@ class DictWrapper:
     def clone(self):
         """Deeply clone the DictWrapper object."""
         return DictWrapper(deepcopy(self.to_dict()))
+
+
+def default_serializer(obj):
+    if isinstance(obj, Port):
+        return repr(obj)
+    return str(obj)
+
+
+def format_dict_pretty(d: dict) -> str:
+    """Convert dictionary to pretty-printed JSON string with indentation."""
+
+    # Convert to string keys and sort manually
+    items = sorted(d.items(), key=lambda x: str(x[0]))
+    sorted_dict = dict(items)
+
+    return json.dumps(sorted_dict, indent=4, sort_keys=False, default=default_serializer)
+
+
+def show_dict_diff(old_dict: dict[str, Any], new_dict: dict[str, Any], context_lines: int = 3) -> str:
+    """
+    Generate a Discord-friendly diff between two dictionaries with context lines.
+
+    Args:
+        old_dict: Original dictionary
+        new_dict: Modified dictionary
+        context_lines: Number of context lines to show before and after changes
+
+    Returns:
+        String formatted for Discord with diff syntax highlighting
+    """
+    # Convert both dictionaries to a pretty-printed format
+    old_str = format_dict_pretty(old_dict).splitlines()
+    new_str = format_dict_pretty(new_dict).splitlines()
+
+    # Generate a unified diff with specified context
+    diff = list(unified_diff(old_str, new_str, lineterm='', n=context_lines))
+
+    # Build the formatted string for Discord
+    result = ["```diff"]
+    for line in diff:
+        # Skip the header lines that show file names
+        if line.startswith('---') or line.startswith('+++'):
+            continue
+        result.append(line)
+    result.append("```")
+
+    return '\n'.join(result)
+
+
+def to_valid_pyfunc_name(raw_name: str) -> str:
+    """
+    Convert an arbitrary name (e.g. 'test-1') into a legal Python identifier.
+
+    Rules applied (in order):
+
+    1. Replace every character that is **not** `[A-Za-z0-9_]` with an underscore.
+    2. If the resulting string starts with a digit, prepend an underscore.
+    3. If the result is a Python keyword (`def`, `class`, …), prefix it with an underscore as well.
+
+    The function returns the sanitized name; the original name is kept unchanged.
+    """
+    # 1️⃣  Replace everything that is not a word character
+    cleaned = re.sub(r'\W', '_', raw_name)
+
+    # 2️⃣  If it starts with a digit, add a leading underscore
+    if re.match(r'^\d', cleaned):
+        cleaned = '_' + cleaned
+
+    # 3️⃣  Avoid Python keywords
+    if keyword.iskeyword(cleaned):
+        cleaned = '_' + cleaned
+
+    return cleaned
+
+
+# -------------------------------------------------------------
+# 1️⃣  Unit → seconds mapping (only integer units allowed)
+# -------------------------------------------------------------
+_UNIT_TO_SECONDS = {
+    # days
+    "day": 24 * 3600,
+    "days": 24 * 3600,
+    "d": 24 * 3600,
+    # weeks
+    "week": 7 * 24 * 3600,
+    "weeks": 7 * 24 * 3600,
+    "w": 7 * 24 * 3600,
+    # months → 30 days (approx)
+    "month": 30 * 24 * 3600,
+    "months": 30 * 24 * 3600,
+    "mon": 30 * 24 * 3600,
+    # years → 365 days (approx)
+    "year": 365 * 24 * 3600,
+    "years": 365 * 24 * 3600,
+    # hours
+    "hour": 3600,
+    "hours": 3600,
+    "h": 3600,
+    "hrs": 3600,
+    # minutes
+    "minute": 60,
+    "minutes": 60,
+    "min": 60,
+    "mins": 60,
+    # seconds (no fractions allowed)
+    "second": 1,
+    "seconds": 1,
+    "sec": 1,
+    "secs": 1,
+}
+
+# -------------------------------------------------------------
+# 2️⃣  Regex: captures "number + unit" pairs
+# -------------------------------------------------------------
+#   - number must be an integer (optional sign, no decimal point)
+#   - unit must be one of the keys in _UNIT_TO_SECONDS
+_INTERVAL_RE = re.compile(r'([+-]?\d+)\s*(\w+)', re.IGNORECASE)
+
+
+def _is_valid_unit(unit: str) -> bool:
+    return unit.lower() in _UNIT_TO_SECONDS
+
+
+def pg_interval_to_seconds(interval: str) -> int:
+    """
+    Convert a PostgreSQL‑style interval literal to whole seconds.
+
+    Rules
+    -----
+    * Only integer values are accepted for all units.
+      If a value contains a decimal point, a ValueError is raised.
+    * Units below “seconds” (milliseconds, microseconds, …) are rejected.
+    * The function returns an *integer* number of seconds (no fractional part).
+
+    Parameters
+    ----------
+    interval : str
+        Example: "1 day 2 hours", "3 weeks", "-2 days 15 minutes 30 seconds"
+
+    Returns
+    -------
+    int
+        Total number of seconds.
+
+    Raises
+    ------
+    ValueError
+        If the string contains a fractional value, an unknown unit, or
+        a sub‑second unit.
+    """
+    total_seconds = 0
+
+    # Scan the string for all "number unit" pairs
+    for num_str, unit in _INTERVAL_RE.findall(interval):
+        # 1️⃣  Unit check
+        if not _is_valid_unit(unit):
+            raise ValueError(f"Unsupported or sub‑second unit: '{unit}'")
+
+        # 2️⃣  Value check – must be an integer
+        #      (num_str comes from the regex that only accepts plain integers)
+        #      The regex already guarantees no decimal point,
+        #      so we can safely convert to int.
+        try:
+            value = int(num_str)
+        except ValueError:  # pragma: no cover – defensive
+            raise ValueError(f"Invalid number: {num_str!r}")
+
+        # 3️⃣  Convert to seconds and accumulate
+        total_seconds += value * _UNIT_TO_SECONDS[unit.lower()]
+
+    return total_seconds
+
+
+async def pg_get_latest_version(node: Node, version: str | None = None) -> dict | None:
+    ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+
+    async with aiohttp.ClientSession(
+        connector=aiohttp.TCPConnector(ssl=ssl_ctx)
+    ) as session:
+        async with session.get(
+            "https://www.postgresql.org/versions.json",
+            proxy=node.proxy,
+            proxy_auth=node.proxy_auth,
+        ) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json(encoding="utf-8")
+
+    # if we did not pass a version, return the latest available
+    if not version:
+        return data[-1]
+
+    my_version = parse(version)
+    check = next((x for x in data if x['major'] == str(my_version.major)), None)
+    if not check:
+        return None
+    return check

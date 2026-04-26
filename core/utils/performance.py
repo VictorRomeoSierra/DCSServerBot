@@ -1,5 +1,5 @@
-import asyncio
 import cProfile
+import inspect
 import io
 import logging
 import pstats
@@ -60,16 +60,18 @@ class PerformanceLog(ContextDecorator):
 def performance_log(use_profiling: bool = False):
     def decorator(func):
 
-        if asyncio.iscoroutinefunction(func):
+        if inspect.iscoroutinefunction(func):
             async def wrapped(*args, **kwargs):
                 log_name = f'{func.__qualname__}()'
                 with PerformanceLog(log_name, use_profiling=use_profiling):
                     return await func(*args, **kwargs)
+                return None
         else:
             def wrapped(*args, **kwargs):
                 log_name = f'{func.__qualname__}()'
                 with PerformanceLog(log_name, use_profiling=use_profiling):
                     return func(*args, **kwargs)
+                return None
         return wrapped
 
     return decorator
@@ -77,7 +79,7 @@ def performance_log(use_profiling: bool = False):
 
 def log_call():
     def decorator(func):
-        if asyncio.iscoroutinefunction(func):
+        if inspect.iscoroutinefunction(func):
             async def wrapped(*args, **kwargs):
                 logger.debug(f"> {func.__qualname__}")
                 try:

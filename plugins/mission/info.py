@@ -2,13 +2,15 @@ import discord
 
 from core import report, Side, Player, DataObjectFactory, Member, utils
 from datetime import datetime, timezone
-from typing import Union, Optional
 from psycopg.rows import dict_row
+from plugins.mission.players import UNIT_TYPES
+from plugins.srs.commands import SRS
+from typing import cast
 
 
 class Header(report.EmbedElement):
 
-    async def render(self, member: Union[discord.Member, str]):
+    async def render(self, member: discord.Member | str, ruler_length: int):
         sql = """
             SELECT p.first_seen, p.last_seen, 
                    CASE WHEN b.ucid IS NOT NULL THEN TRUE ELSE FALSE END AS banned, b.reason as ban_reason, b.banned_by, 
@@ -16,7 +18,7 @@ class Header(report.EmbedElement):
                    CASE WHEN w.player_ucid IS NOT NULL THEN TRUE ELSE FALSE END AS watchlist, w.reason as watch_reason, 
                    w.created_by, w.created_at, p.vip
             FROM players p 
-            LEFT OUTER JOIN bans b ON (b.ucid = p.ucid) 
+            LEFT OUTER JOIN bans b ON (b.ucid = p.ucid AND b.banned_until > NOW() AT TIME ZONE 'utc') 
             LEFT OUTER JOIN watchlist w ON (w.player_ucid = p.ucid)
             WHERE p.discord_id = 
         """
@@ -36,8 +38,8 @@ class Header(report.EmbedElement):
                 await cursor.execute(sql)
                 rows = await cursor.fetchall()
                 if not rows:
-                    self.embed.description = 'User "{}" is not linked or unknown.'.format(
-                        utils.escape_string(member if isinstance(member, str) else member.display_name)
+                    self.embed.description = 'User {} is not linked or unknown.'.format(
+                        utils.escape_string(member if isinstance(member, str) else member.mention)
                     )
                     # do we maybe have a permanent ban without a user?
                     if isinstance(member, str) and utils.is_ucid(member):
@@ -47,14 +49,14 @@ class Header(report.EmbedElement):
                                    w.reason as watch_reason, w.created_by, w.created_at, FALSE as vip 
                             FROM bans b LEFT OUTER JOIN watchlist w
                             ON b.ucid = w.player_ucid 
-                            WHERE ucid = %s
+                            WHERE ucid = %s AND b.banned_until > NOW() AT TIME ZONE 'utc'
                         """, (member,))
                         rows = await cursor.fetchall()
                         if not rows:
                             return
         self.embed.description = f'Information about '
         if isinstance(member, discord.Member):
-            self.embed.description += 'member **{}**:'.format(utils.escape_string(member.display_name))
+            self.embed.description += 'member **{}**:'.format(member.display_name)
             self.add_field(name='Discord', value=f"{member.mention}\nID: {member.id}")
         else:
             self.embed.description += 'a non-member user:'
@@ -71,14 +73,14 @@ class Header(report.EmbedElement):
                     last_seen = row['last_seen']
                 banned = row['banned'] or banned
                 watchlist = row['watchlist'] or watchlist
-        if first_seen and last_seen:
-            self.add_datetime_field('Last seen', last_seen.replace(tzinfo=timezone.utc))
-            self.add_datetime_field('First seen', first_seen.replace(tzinfo=timezone.utc))
+            if first_seen < datetime(2999, 12, 31) and last_seen > datetime(1970, 1, 1):
+                self.add_datetime_field('Last seen', last_seen.replace(tzinfo=timezone.utc))
+                self.add_datetime_field('First seen', first_seen.replace(tzinfo=timezone.utc))
         if rows:
             if rows[0]['vip']:
                 self.add_field(name="VIP", value="⭐")
             if banned or watchlist:
-                self.add_field(name='▬' * 13 + ' Bans & Watches ' + '▬' * 13, value='_ _', inline=False)
+                await report.Ruler(self.env).render(header='Bans & Watches', ruler_length=ruler_length)
                 if banned:
                     banned_until = rows[0]['banned_until']
                     if banned_until.year != 9999:
@@ -95,7 +97,7 @@ class Header(report.EmbedElement):
 
 
 class UCIDs(report.EmbedElement):
-    async def render(self, member: Union[discord.Member, str]):
+    async def render(self, member: discord.Member | str, ruler_length: int):
         sql = 'SELECT p.ucid, p.manual, COALESCE(p.name, \'?\') AS name FROM players p WHERE p.discord_id = '
         if isinstance(member, str):
             sql += f"(SELECT discord_id FROM players WHERE ucid = '{member}' AND discord_id != -1) OR " \
@@ -107,7 +109,7 @@ class UCIDs(report.EmbedElement):
                 await cursor.execute(sql)
                 rows = await cursor.fetchall()
         if rows:
-            self.add_field(name='▬' * 13 + ' Connected UCIDs ' + '▬' * 12, value='_ _', inline=False)
+            await report.Ruler(self.env).render(header='Connected UCIDs', ruler_length=ruler_length)
             self.add_field(name='UCID', value='\n'.join([row['ucid'] for row in rows]))
             self.add_field(name='DCS Name', value='\n'.join([utils.escape_string(row['name']) for row in rows]))
             if isinstance(member, discord.Member):
@@ -116,8 +118,8 @@ class UCIDs(report.EmbedElement):
 
 
 class History(report.EmbedElement):
-    async def render(self, member: Union[discord.Member, str]):
-        sql = 'SELECT name, max(time) AS time FROM players_hist p WHERE p.ucid '
+    async def render(self, member: discord.Member | str, ruler_length: int):
+        sql = 'SELECT name, min(time) AS time FROM players_hist p WHERE p.ucid '
         if isinstance(member, discord.Member):
             sql += f"IN (SELECT ucid FROM players WHERE discord_id = {member.id})"
         else:
@@ -128,28 +130,29 @@ class History(report.EmbedElement):
                 await cursor.execute(sql)
                 rows = await cursor.fetchall()
         if rows:
-            self.add_field(name='▬' * 13 + ' Change History ' + '▬' * 13, value='_ _', inline=False)
+            await report.Ruler(self.env).render(header='Change History', ruler_length=ruler_length)
             self.add_field(name='DCS Name', value='\n'.join([
                 utils.escape_string(row['name'] or 'n/a') for row in rows
             ]))
             self.add_field(name='Time (UTC)', value='\n'.join([
-                f'{row["time"].replace(tzinfo=timezone.utc).strftime("%y-%m-%d %H:%Mz")} / '
+                f'{row["time"].replace(tzinfo=timezone.utc).strftime("%m-%d %H:%M")} / '
                 f'<t:{int(row["time"].replace(tzinfo=timezone.utc).timestamp())}:R>' for row in rows
             ]))
 
 
 class ServerInfo(report.EmbedElement):
-    async def render(self, member: Union[discord.Member, str], player: Optional[Player]):
+    async def render(self, member: discord.Member | str, player: Player | None, ruler_length: int):
         if player:
-            self.add_field(name='▬' * 13 + ' Current Activity ' + '▬' * 13, value='_ _', inline=False)
+            await report.Ruler(self.env).render(header='Current Activity', ruler_length=ruler_length)
             self.add_field(name='Active on Server', value=player.server.display_name)
             self.add_field(name='DCS Name', value=player.display_name)
-            self.add_field(name='Slot', value=player.unit_type if player.side != Side.SPECTATOR else 'Spectator')
+            self.add_field(name='Slot', value=player.unit_type if player.side != Side.NEUTRAL else 'Spectator')
 
 
 class Footer(report.EmbedElement):
-    async def render(self, member: Union[discord.Member, str], banned: bool, watchlist: bool, player: Optional[Player]):
-        self.add_field(name='▬' * 33, value='_ _', inline=False)
+    async def render(self, member: discord.Member | str, banned: bool, watchlist: bool, player: Player | None,
+                     ruler_length: int):
+        await report.Ruler(self.env).render(ruler_length=ruler_length)
         footer = ''
         if isinstance(member, discord.Member):
             _member = DataObjectFactory().new(Member, name=member.name, node=self.node, member=member)
@@ -174,16 +177,15 @@ class PlayerInfo(report.EmbedElement):
             self.add_field(name="Discord", value=f"<@{player.member.id}>")
         else:
             self.add_field(name='Not Linked', value='_ _')
-        self.add_field(name='_ _', value='_ _')
+        self.add_field(name='IP Hash', value=utils.hash_ip_addr(player.ipaddr))
 
         self.add_field(name="Server", value=player.server.display_name)
         self.add_field(name="Side",
                        value='Blue' if player.side == Side.BLUE else 'Red' if player.side == Side.RED else '_ _')
         if player.slot != -1:
             self.add_field(name="Slot", value=player.unit_callsign)
-
-            self.add_field(name="Module", value=player.unit_display_name)
-            srs_plugin = self.bot.cogs.get('SRS', None)
+            self.add_field(name="Module", value=UNIT_TYPES.get(player.unit_type, player.unit_display_name))
+            srs_plugin = cast(SRS, self.bot.cogs.get('SRS'))
             if srs_plugin:
                 srs_users = srs_plugin.eventlistener.srs_users.get(player.server.name, {})
                 if player.name in srs_users:

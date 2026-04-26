@@ -3,7 +3,10 @@ schema;node_realweather_schema:
   nullable: false
   allowempty: true
   mapping:
-    installation: {type: str, required: true, nullable: false, range: {min: 1}, func: file_exists}
+    name: {type: str, nullable: false, range: {min: 1}}
+    installation: {type: str, required: true, nullable: false, range: {min: 1}, func: dir_exists}
+    autoupdate: {type: bool, nullable: false}
+    ignore_errors: {type: bool, nullable: false}
     realweather:
       type: map
       nullable: false
@@ -80,13 +83,15 @@ schema;instance_realweather_schema:
   nullable: false
   mapping:
     enabled: {type: bool, nullable: false}
+    name: {type: str, nullable: false, range: {min: 1}}
     debug: {type: bool, nullable: false}
+    ignore_errors: {type: bool, nullable: false}
     terrains:
       type: map
       nullable: false
       allowempty: true
       mapping:
-        regex;(Caucasus|Syria|PersianGulf|SinaiMap|TheChannel|Nevada|Normandy|MarianaIslands|Falklands|Kola|Afghanistan|Iraq):
+        regex;(Caucasus|Syria|PersianGulf|SinaiMap|TheChannel|Nevada|Normandy|MarianaIslands|Falklands|Kola|Afghanistan|Iraq|GermanyCW):
           include: 'instance_realweather_schema'
     realweather:
       type: map
@@ -203,6 +208,9 @@ schema;instance_realweather_schema:
                 maximum: {type: int, range: {max: 50}, nullable: false}
                 gust-minimum: {type: int, range: {min: 0}, nullable: false}
                 gust-maximum: {type: int, range: {max: 50}, nullable: false}
+                scale-factor: {type: float, range: {min: 0.1}, nullable: false}
+                direction-minimum: {type: int, range: {min: 0, max: 359}, nullable: false}
+                direction-maximum: {type: int, range: {min: 0, max: 359}, nullable: false}
                 stability: {type: float, nullable: false}
                 fixed-reference: {type: bool, nullable: false}
             clouds:

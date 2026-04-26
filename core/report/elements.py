@@ -5,8 +5,10 @@ import discord
 import inspect
 import numpy as np
 import os
+import pandas as pd
 import re
 import sys
+import traceback
 import uuid
 import warnings
 
@@ -15,9 +17,10 @@ from core import utils
 from datetime import timedelta, datetime
 from discord import ButtonStyle, Interaction
 from io import BytesIO
+from matplotlib.axes import Axes
 from matplotlib import pyplot as plt
 from psycopg.rows import dict_row
-from typing import Optional, Any, TYPE_CHECKING, Union
+from typing import Any, TYPE_CHECKING, cast
 
 from .env import ReportEnv
 from .errors import UnknownGraphElement, ClassNotFound, TooManyElements, UnknownValue, NothingToPlot
@@ -27,7 +30,20 @@ from .__utils import parse_params
 if TYPE_CHECKING:
     from services.bot import DCSServerBot
 
+# ignore glyph warnings on MatPlotLib
+warnings.filterwarnings('ignore', category=UserWarning, module='matplotlib')
+warnings.filterwarnings('ignore', message='.*glyph.*missing from font.*')
+
+def _escape_matplotlib_label(label: str) -> str:
+    return (
+        str(label)
+        .replace('\\', r'\\')
+        .replace('$', r'\$')
+    )
+
+
 __all__ = [
+    "df_to_table",
     "ReportElement",
     "EmbedElement",
     "Image",
@@ -40,6 +56,7 @@ __all__ = [
     "Graph",
     "SQLField",
     "SQLTable",
+    "SQLRenderedTable",
     "BarChart",
     "SQLBarChart",
     "PieChart",
@@ -64,6 +81,60 @@ def get_supported_fonts() -> set[str]:
     return _languages
 
 
+def df_to_table(ax: Axes, df: pd.DataFrame, *, col_labels: list[str] = None, fontsize: int = 10) -> Axes:
+    df = df.copy()
+    for col in df.select_dtypes(include='timedelta64[ns]').columns:
+        df[col] = df[col].dt.total_seconds().apply(
+            lambda sec: utils.convert_time(sec) if not pd.isna(sec) else sec
+        )
+
+    ax.axis('off')
+    ax.set_frame_on(False)
+    table = ax.table(
+        cellText=df.values,
+        colLabels=df.columns if col_labels is None else col_labels,
+        cellLoc='left',
+        loc='bottom',
+    )
+    table.auto_set_font_size(False)
+    if fontsize is None:
+        # fall back to the figure’s default
+        fontsize = plt.rcParams["font.size"]
+    table.set_fontsize(fontsize)
+
+    for i in range(len(df.columns)):
+        table.auto_set_column_width(i)
+
+    baseline_fontsize = 10
+    scale_factor = fontsize / baseline_fontsize
+    table.scale(scale_factor, scale_factor * 1.5)
+
+    for (row, col), cell in table.get_celld().items():
+        if row == 0:  # header row
+            cell.set_facecolor('#4c9f44')  # dark green
+            cell.set_text_props(weight='bold', color='white')
+        else:
+            # alternate row colors for readability
+            bg = '#e8f5e9' if row % 2 else '#ffffff'
+            cell.set_facecolor(bg)
+            # Determine alignment
+            val = df.iloc[row - 1, col]
+            if isinstance(val, (int, float, np.number)):
+                alignment = 'right'
+            elif isinstance(val, (datetime, pd.Timestamp, timedelta)):
+                alignment = 'center'
+            else:
+                # Check if the string looks like a date/time (e.g. from SQL TO_CHAR)
+                str_val = str(val)
+                if re.match(r'^\d{2}-\d{2}-\d{2}', str_val) or re.match(r'^\d{4}-\d{2}-\d{2}', str_val):
+                    alignment = 'center'
+                else:
+                    alignment = 'left'
+            cell.set_text_props(color='black', ha=alignment)
+
+    return ax
+
+
 class ReportElement(ABC):
     def __init__(self, env: ReportEnv):
         self.env = env
@@ -74,7 +145,7 @@ class ReportElement(ABC):
         self.apool = env.bot.apool
 
     @abstractmethod
-    async def render(self, **kwargs):
+    async def render(self, **kwargs) -> None:
         ...
 
 
@@ -83,9 +154,10 @@ class EmbedElement(ReportElement):
         super().__init__(env)
         self.embed = env.embed
 
-    def add_field(self, *, name: str, value: str, inline=True):
+    def add_field(self, *, name: str, value: str, inline=True) -> discord.Embed:
         if len(self.embed.fields) >= 25:
-            return
+            self.log.warning(f"Can't add field '{name}': too many fields in embed.")
+            return self.embed
         if name is None or name == '':
             name = '_ _'
         else:
@@ -122,24 +194,24 @@ class Image(EmbedElement):
 
 
 class Ruler(EmbedElement):
-    async def render(self, header: Optional[str] = '', ruler_length: Optional[int] = 34, *, text: Optional[str] = None):
+    async def render(self, header: str = '', ruler_length: int = 34, *, text: str | None = None):
         self.add_field(name=utils.print_ruler(header=header, ruler_length=ruler_length),
                        value=text or '_ _', inline=False)
 
 
 class Field(EmbedElement):
-    async def render(self, name: str, value: Any, inline: Optional[bool] = True, default: Optional[str] = '_ _'):
+    async def render(self, name: str, value: Any, inline: bool = True, default: str | None = '_ _'):
         self.add_field(name=utils.format_string(name, '_ _', **self.env.params),
                        value=utils.format_string(value, default, **self.env.params), inline=inline)
 
 
 class Table(EmbedElement):
-    async def render(self, values: Union[dict, list[dict]], obj: Optional[str] = None, inline: Optional[bool] = True,
-                     ansi_colors: Optional[bool] = False):
+    async def render(self, values: dict | list[dict], obj: str | None = None, inline: bool = True,
+                     ansi_colors: bool | None = False):
         if obj:
             table = self.env.params[obj]
-            _values: dict = values.copy()
-            values = list[dict]()
+            _values: dict = cast(dict, values.copy())
+            values: list[dict] = []
             if isinstance(table, list):
                 for row in table:
                     values.append({_values[k]: v for k, v in row.items() if k in _values.keys()})
@@ -164,8 +236,8 @@ class Table(EmbedElement):
 
 
 class Button(ReportElement):
-    async def render(self, style: str, label: str, custom_id: Optional[str] = None, url: Optional[str] = None,
-                     disabled: Optional[bool] = False, interaction: Optional[Interaction] = None):
+    async def render(self, style: str, label: str, custom_id: str | None = None, url: str | None = None,
+                     disabled: bool = False, interaction: Interaction | None = None):
         b = discord.ui.Button(style=ButtonStyle(style), label=label, url=url, disabled=disabled)
         if interaction:
             await b.callback(interaction=interaction)
@@ -175,11 +247,11 @@ class Button(ReportElement):
 
 
 class GraphElement(ReportElement):
-    def __init__(self, env: ReportEnv, rows: int, cols: int, row: Optional[int] = 0, col: Optional[int] = 0,
-                 colspan: Optional[int] = 1, rowspan: Optional[int] = 1, polar: Optional[bool] = False):
+    def __init__(self, env: ReportEnv, rows: int, cols: int, row: int = 0, col: int = 0,
+                 colspan: int = 1, rowspan: int = 1, polar: bool = False):
         super().__init__(env)
-        self.axes = plt.subplot2grid((rows, cols), (row, col), colspan=colspan, rowspan=rowspan, fig=self.env.figure,
-                                     polar=polar)
+        self.axes = plt.subplot2grid((rows, cols), (row, col), colspan=colspan, rowspan=rowspan,
+                                     fig=self.env.figure, polar=polar)
 
     @abstractmethod
     async def render(self, **kwargs):
@@ -187,17 +259,22 @@ class GraphElement(ReportElement):
 
 
 class MultiGraphElement(ReportElement):
-    def __init__(self, env: ReportEnv, rows: int, cols: int, params: list[dict]):
+    def __init__(self, env: ReportEnv, rows: int, cols: int, params: list[dict],
+                 wspace: float = 0.5, hspace: float = 0.5):
         super().__init__(env)
         self.axes = []
+        self.wspace = wspace
+        self.hspace = hspace
         for i in range(0, len(params)):
             colspan = params[i]['colspan'] if 'colspan' in params[i] else 1
             rowspan = params[i]['rowspan'] if 'rowspan' in params[i] else 1
             sharex = params[i]['sharex'] if 'sharex' in params[i] else False
-            self.axes.append(plt.subplot2grid((rows, cols), (params[i]['row'], params[i]['col']), colspan=colspan,
-                                              rowspan=rowspan, fig=self.env.figure,
+            self.axes.append(plt.subplot2grid((rows, cols), (params[i]['row'], params[i]['col']),
+                                              colspan=colspan, rowspan=rowspan, fig=self.env.figure,
                                               sharex=self.axes[-1] if sharex else None,
                                               polar=params[i].get('polar', False)))
+
+        plt.subplots_adjust(wspace=self.wspace, hspace=self.hspace)
 
     @abstractmethod
     async def render(self, **kwargs):
@@ -205,36 +282,71 @@ class MultiGraphElement(ReportElement):
 
 
 class Graph(ReportElement):
-    def __init__(self, env: ReportEnv):
+    def __init__(self, env: ReportEnv, width: int, height: int, cols: int, rows: int, elements: list[dict],
+                     wspace: float = 0.5, hspace: float = 0.5, dpi = 100, facecolor: str | None = '#2C2F33'):
         super().__init__(env)
         plt.switch_backend('agg')
+        self.width = width
+        self.height = height
+        self.cols = cols
+        self.rows = rows
+        self.elements = elements
+        self.wspace = wspace
+        self.hspace = hspace
+        self.dpi = dpi
+        self.facecolor = facecolor
         self.plot_lock = asyncio.Lock()
 
     def _plot(self):
-        plt.subplots_adjust(hspace=0.5, wspace=0.5)
+        plt.subplots_adjust(wspace=self.wspace, hspace=self.hspace)
+
+        # ask the renderer for the tight bounding box (in pixels)
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore', message='.*glyph.*missing from font.*')
+            renderer = self.env.figure.canvas.get_renderer()
+            tight_bbox = self.env.figure.get_tightbbox(renderer)
+
+        # convert that pixel‑bbox to inches and resize the figure
+        fig_w, fig_h = tight_bbox.width, tight_bbox.height
+        self.env.figure.set_size_inches(fig_w, fig_h, forward=True)
+
+        # Save with adjusted dimensions while maintaining aspect ratio
         self.env.filename = f'{uuid.uuid4()}.png'
         self.env.buffer = BytesIO()
-        warnings.filterwarnings("ignore", category=UserWarning, message=".*Glyph.*")
-        self.env.figure.savefig(self.env.buffer, format='png', bbox_inches='tight', facecolor='#2C2F33')
+        self.env.figure.savefig(
+            self.env.buffer,
+            format='png',
+            bbox_inches='tight',
+            facecolor=self.facecolor,
+            dpi=self.dpi
+        )
         self.env.buffer.seek(0)
 
-    async def _async_plot(self):
-        async with self.plot_lock:
-            self._plot()
-
-    async def render(self, width: int, height: int, cols: int, rows: int, elements: list[dict],
-                     facecolor: Optional[str] = None):
+    async def render(self, **kwargs):
         plt.style.use('dark_background')
-        plt.rcParams['axes.facecolor'] = '2C2F33'
+        plt.rcParams['axes.facecolor'] = self.facecolor
+        plt.rcParams['figure.facecolor'] = self.facecolor
+        plt.rcParams['savefig.facecolor'] = self.facecolor
         fonts = get_supported_fonts()
+        font_list = []
         if fonts:
-            plt.rcParams['font.family'] = [f"Noto Sans {x}" for x in fonts] + ['sans-serif']
-        self.env.figure = plt.figure(figsize=(width, height))
+            font_list.extend([f"Noto Sans {x}" for x in fonts])
+        font_list.extend(['Arial', 'sans-serif'])
+        plt.rcParams['font.family'] = font_list
+        if isinstance(self.width, str):
+            self.width = float(utils.evaluate(self.width, **kwargs))
+        if isinstance(self.height, str):
+            self.height = float(utils.evaluate(self.height, **kwargs))
+        if isinstance(self.dpi, str):
+            self.dpi = float(utils.evaluate(self.dpi, **kwargs))
+        # Initialize the figure
+        self.env.figure = plt.figure(figsize=(self.width, self.height), dpi=self.dpi)
         try:
-            if facecolor:
-                self.env.figure.set_facecolor(facecolor)
+            if self.facecolor:
+                self.env.figure.set_facecolor(self.facecolor)
+                self.env.figure.patch.set_facecolor(self.facecolor)
             tasks = []
-            for element in elements:
+            for element in self.elements:
                 if 'params' in element:
                     element_args = parse_params(self.env.params, element['params'])
                 else:
@@ -243,28 +355,39 @@ class Graph(ReportElement):
                 if not element_class and 'type' in element:
                     element_class = getattr(sys.modules[__name__], element['type'])
                 if element_class:
-                    # remove parameters, that are not in the class __init__ signature
+                    # remove the parameters that are not in the class __init__ signature
                     signature = inspect.signature(element_class.__init__).parameters.keys()
                     class_args = {name: value for name, value in element_args.items() if name in signature}
                     # instantiate the class
-                    element_class = element_class(self.env, rows, cols, **class_args)
+                    element_class = element_class(self.env, self.rows, self.cols, **class_args)
                     if isinstance(element_class, (GraphElement, MultiGraphElement)):
-                        # remove parameters, that are not in the render methods signature
-                        signature = inspect.signature(element_class.render).parameters.keys()
-                        render_args = {name: value for name, value in element_args.items() if name in signature}
+                        # remove the parameters that are not in the render methods signature
+                        signature = inspect.signature(element_class.render).parameters
+                        has_kwargs = any(p.kind == p.VAR_KEYWORD for p in signature.values())
+                        if not has_kwargs:
+                            render_args = {
+                                name: value for name, value in element_args.items() if name in signature.keys()
+                            }
+                        else:
+                            render_args = element_args
                         tasks.append(asyncio.create_task(element_class.render(**render_args)))
                     else:
                         raise UnknownGraphElement(element['class'])
                 else:
                     raise ClassNotFound(element['class'])
-            # check for any exceptions and raise them
-            try:
-                await asyncio.gather(*tasks)
-            except NothingToPlot:
-                return
-            # only render the graph, if we don't have a rendered graph already attached as a file (image)
+            # check for any exceptions and print them
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    if not isinstance(result, NothingToPlot):
+                        self.log.error("{filename}: Error in Graph\n{stacktrace}".format(
+                            filename=self.env.report, stacktrace=''.join(traceback.format_exception(result)))
+                        )
+
+            # only render the graph if we don't have a rendered graph already attached as a file (image)
             if not self.env.filename:
-                await self._async_plot()
+                async with self.plot_lock:
+                    await asyncio.to_thread(self._plot)
             self.env.embed.set_image(url='attachment://' + os.path.basename(self.env.filename))
             footer = self.env.embed.footer.text or ''
             if footer is None:
@@ -278,7 +401,7 @@ class Graph(ReportElement):
                 self.env.figure = None
 
 
-def _display_no_data(element: EmbedElement, no_data: Union[str, dict], inline: bool):
+def _display_no_data(element: EmbedElement, no_data: str | dict, inline: bool):
     if isinstance(no_data, str):
         element.add_field(name='_ _', value=no_data, inline=inline)
     else:
@@ -287,14 +410,14 @@ def _display_no_data(element: EmbedElement, no_data: Union[str, dict], inline: b
 
 
 class SQLField(EmbedElement):
-    async def render(self, sql: str, inline: Optional[bool] = True, no_data: Optional[Union[str, dict]] = None,
-                     on_error: Optional[dict] = None):
+    async def render(self, sql: str, inline: bool = True, no_data: str | dict | None = None,
+                     on_error: dict | None = None):
         try:
             async with self.apool.connection() as conn:
                 async with conn.cursor(row_factory=dict_row) as cursor:
                     await cursor.execute(utils.format_string(sql, **self.env.params), self.env.params)
-                    if cursor.rowcount > 0:
-                        row = await cursor.fetchone()
+                    row: dict | None = await cursor.fetchone()
+                    if row:
                         name = list(row.keys())[0]
                         value = row[name]
                         if isinstance(value, datetime):
@@ -312,52 +435,154 @@ class SQLField(EmbedElement):
 
 
 class SQLTable(EmbedElement):
-    async def render(self, sql: str, inline: Optional[bool] = True, no_data: Optional[Union[str, dict]] = None,
-                     ansi_colors: Optional[bool] = False, on_error: Optional[dict] = None):
+    """
+    Render the result of an SQL query as a Discord embed.
+    Internally, the data is first collected into a pandas DataFrame.
+    """
+    async def render(
+        self,
+        sql: str,
+        inline: bool = True,
+        no_data: str | dict | None = None,
+        ansi_colors: bool | None = False,
+        on_error: dict | None = None,
+    ):
+        """
+        Parameters
+        ----------
+        sql : str
+            The SQL statement to execute.
+        inline : bool | None, default=True
+            Whether the embed fields should be rendered inline.
+        no_data : str | dict | None
+            Message to display if the query returns 0 rows.
+        ansi_colors : bool | None, default=False
+            Wrap values in ```ansi … ``` if True.
+        on_error : dict | None
+            Custom error‑handling messages; each key/value pair is rendered
+            as a field when an exception occurs.
+        """
         try:
             async with self.apool.connection() as conn:
                 async with conn.cursor(row_factory=dict_row) as cursor:
-                    await cursor.execute(utils.format_string(sql, **self.env.params), self.env.params)
-                    if cursor.rowcount == 0:
-                        if no_data:
-                            _display_no_data(self, no_data, False)
-                        return
-                    header = None
-                    cols = []
-                    elements = 0
-                    async for row in cursor:
-                        elements = len(row)
-                        if not header:
-                            header = list(row.keys())
-                        values = list(row.values())
-                        for i in range(0, elements):
-                            if isinstance(values[i], datetime):
-                                value = values[i].strftime('%Y-%m-%d %H:%M')
-                            else:
-                                value = str(values[i])
-                            if len(cols) <= i:
-                                cols.append(('```ansi\n' if ansi_colors else '') + value + '\n')
-                            else:
-                                cols[i] += value + '\n'
-                    for i in range(0, elements):
-                        self.add_field(name=header[i], value=cols[i] + ('```' if ansi_colors else ''), inline=inline)
-                    if elements % 3 and inline:
-                        for i in range(0, 3 - elements % 3):
-                            self.add_field(name='_ _', value='_ _')
+                    await cursor.execute(
+                        utils.format_string(sql, **self.env.params),
+                        self.env.params
+                    )
+                    rows = await cursor.fetchall()
+
+            df = pd.DataFrame(rows)  # rows may be [] → empty DataFrame
+            if df.empty:
+                if no_data:
+                    _display_no_data(self, no_data, False)
+                return
+
+            # Helper: format a single value
+            def fmt_val(v):
+                if isinstance(v, datetime):
+                    return v.strftime('%Y-%m-%d %H:%M')
+                return str(v)
+
+            # Apply formatting; keep the original dtype for later use
+            formatted = df.map(fmt_val)
+
+            for col in formatted.columns:
+                # Join rows with a trailing newline (matches the old behavior)
+                col_text = '\n'.join(formatted[col]) + '\n'
+
+                # Wrap with ANSI markers if requested
+                if ansi_colors:
+                    col_text = f'```ansi\n{col_text}```'
+
+                self.add_field(name=col, value=col_text, inline=inline)
+
+            if df.shape[1] % 3 and inline:     # df.shape[1] == number of columns
+                missing = 3 - (df.shape[1] % 3)
+                for _ in range(missing):
+                    self.add_field(name='_ _', value='_ _')
+
         except Exception as ex:
             if on_error:
-                for key, value in on_error.items():
-                    self.add_field(name=key, value=utils.format_string(value, ex=ex), inline=inline)
+                for key, tmpl in on_error.items():
+                    self.add_field(
+                        name=key,
+                        value=utils.format_string(tmpl, ex=ex),
+                        inline=inline,
+                    )
             else:
                 raise
 
 
+class SQLRenderedTable(GraphElement):
+    def __init__(self, env: ReportEnv, rows: int, cols: int, row: int, col: int, colspan: int = 1,
+                 rowspan: int = 1, title: str | None = '', color: str | None = None,
+                 fontsize: int = 12, show_no_data: bool | None = True):
+        super().__init__(env, rows, cols, row, col, colspan, rowspan)
+        self.title = title
+        self.color = color
+        self.fontsize = fontsize
+        self.show_no_data = show_no_data
+
+    async def render(self, sql: str, no_data: str = None, **kwargs):
+        # ----------------------------------------------------------------
+        # 1. Execute the query and fetch *all* rows as a list of dicts
+        # ----------------------------------------------------------------
+        async with self.apool.connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cursor:
+                await cursor.execute(
+                    utils.format_string(sql, **self.env.params),
+                    self.env.params
+                )
+                rows = await cursor.fetchall()
+
+        # ----------------------------------------------------------------
+        # 2. Convert to a DataFrame (empty if no rows)
+        # ----------------------------------------------------------------
+        df = pd.DataFrame(rows)  # rows may be [] → empty DataFrame
+
+        # ----------------------------------------------------------------
+        # 3. Handle the “no data” case early
+        # ----------------------------------------------------------------
+        if not df.empty or self.show_no_data:
+
+            if df.empty:
+                self.axes.set_axis_off()  # hide spines, ticks, grid, and background
+
+                self.axes.text(0.5, 0.5, no_data or 'No data available.',
+                               ha='center', va='center',
+                               rotation=45, fontsize=self.fontsize,
+                               transform=self.axes.transAxes)
+                return
+
+            # ----------------------------------------------------------------
+            # 4. Prepare each column for the embed
+            # ----------------------------------------------------------------
+            # Helper: format a single value
+            def fmt_val(v):
+                if isinstance(v, datetime):
+                    return v.strftime('%Y-%m-%d %H:%M')
+                return v
+
+            # Apply formatting; keep the original dtype for later use
+            formatted = df.map(fmt_val)
+            # render the table
+            try:
+                if self.title:
+                    self.axes.set_title(utils.format_string(self.title, **kwargs), color='white',
+                                        fontsize=self.fontsize * 1.5)
+                self.axes = df_to_table(self.axes, formatted, fontsize=self.fontsize)
+            except Exception as ex:
+                self.log.exception(ex)
+        else:
+            self.axes.set_visible(False)
+
+
 class BarChart(GraphElement):
-    def __init__(self, env: ReportEnv, rows: int, cols: int, row: int, col: int, colspan: Optional[int] = 1,
-                 rowspan: Optional[int] = 1, title: Optional[str] = '', color: Optional[str] = None,
-                 rotate_labels: Optional[int] = 0, bar_labels: Optional[bool] = False, is_time: Optional[bool] = False,
-                 orientation: Optional[str] = 'vertical', width: Optional[float] = 0.5,
-                 show_no_data: Optional[bool] = True):
+    def __init__(self, env: ReportEnv, rows: int, cols: int, row: int, col: int, colspan: int = 1,
+                 rowspan: int = 1, title: str = '', color: str | None = None,
+                 rotate_labels: int = 0, bar_labels: bool | None = False, is_time: bool | None = False,
+                 orientation: str = 'vertical', width: float | None = 0.5,
+                 show_no_data: bool | None = True):
         super().__init__(env, rows, cols, row, col, colspan, rowspan)
         self.title = title
         self.color = color
@@ -368,9 +593,9 @@ class BarChart(GraphElement):
         self.width = width
         self.show_no_data = show_no_data
 
-    async def render(self, values: dict[str, float]):
+    async def render(self, values: dict[str, float], **kwargs):
         if len(values) or self.show_no_data:
-            labels = list(values.keys())
+            labels = [_escape_matplotlib_label(label) for label in values.keys()]
             values = list(values.values())
             if self.orientation == 'vertical':
                 self.axes.bar(labels, values, width=self.width, color=self.color)
@@ -378,11 +603,11 @@ class BarChart(GraphElement):
                 self.axes.barh(labels, values, height=self.width, color=self.color)
             else:
                 raise UnknownValue('orientation', self.orientation)
-            self.axes.set_title(self.title, color='white', fontsize=25)
+            self.axes.set_title(utils.format_string(self.title, **kwargs), color='white', fontsize=16)
             if self.rotate_labels > 0:
                 for label in self.axes.get_xticklabels():
                     label.set_rotation(self.rotate_labels)
-                    label.set_ha('right')
+                    label.set_horizontalalignment('right')
             if self.bar_labels:
                 for c in self.axes.containers:
                     self.axes.bar_label(c, fmt='%.1f h' if self.is_time else '%.1f', label_type='edge', padding=2)
@@ -396,7 +621,7 @@ class BarChart(GraphElement):
 
 
 class SQLBarChart(BarChart):
-    async def render(self, sql: str):
+    async def render(self, sql: str, **kwargs):
         async with self.apool.connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cursor:
                 await cursor.execute(utils.format_string(sql, **self.env.params), self.env.params)
@@ -413,10 +638,9 @@ class SQLBarChart(BarChart):
 
 
 class PieChart(GraphElement):
-    def __init__(self, env: ReportEnv, rows: int, cols: int, row: int, col: int, colspan: Optional[int] = 1,
-                 rowspan: Optional[int] = 1, title: Optional[str] = '', colors: Optional[list[str]] = None,
-                 is_time: Optional[bool] = False, show_no_data: Optional[bool] = True,
-                 textcolor: Optional[str] = 'black'):
+    def __init__(self, env: ReportEnv, rows: int, cols: int, row: int, col: int, colspan: int = 1,
+                 rowspan: int = 1, title: str = '', colors: list[str] | None = None,
+                 is_time: bool | None = False, show_no_data: bool | None = True, textcolor: str | None = 'black'):
         super().__init__(env, rows, cols, row, col, colspan, rowspan)
         self.title = title
         self.colors = colors
@@ -431,17 +655,17 @@ class PieChart(GraphElement):
         else:
             return '{:.1f}%\n({:d})'.format(pct, absolute)
 
-    async def render(self, values: dict[str, Any]):
+    async def render(self, values: dict[str, Any], **kwargs):
         values = {k: v for k, v in values.copy().items() if v}
         if len(values) or self.show_no_data:
-            labels = values.keys()
+            labels = list(values.keys())
             values = list(values.values())
             patches, texts, pcts = self.axes.pie(
                 values, labels=labels, autopct=lambda pct: self.func(pct, values), colors=self.colors,
                 wedgeprops={'linewidth': 3.0, 'edgecolor': 'black'}, normalize=True
             )
             plt.setp(pcts, color=self.textcolor, fontweight='bold')
-            self.axes.set_title(self.title, color='white', fontsize=25)
+            self.axes.set_title(utils.format_string(self.title, **kwargs), color='white', fontsize=16)
             self.axes.axis('equal')
             if len(values) == 0:
                 self.axes.set_xticks([])
@@ -451,7 +675,7 @@ class PieChart(GraphElement):
 
 
 class SQLPieChart(PieChart):
-    async def render(self, sql: str):
+    async def render(self, sql: str, **kwargs):
         async with self.apool.connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cursor:
                 await cursor.execute(utils.format_string(sql, **self.env.params), self.env.params)

@@ -5,7 +5,7 @@ import discord
 import os
 import zipfile
 
-from aiohttp import BasicAuth
+from aiohttp import BasicAuth, ClientConnectorDNSError
 from core import utils, FatalException
 from core.services.base import Service
 from core.services.registry import ServiceRegistry
@@ -15,7 +15,7 @@ from io import BytesIO
 from matplotlib import font_manager
 from pathlib import Path
 from ssl import SSLCertVerificationError
-from typing import Optional, Union, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 from .dcsserverbot import DCSServerBot
 from .dummy import DummyBot
@@ -26,7 +26,7 @@ from ruamel.yaml import YAML
 yaml = YAML()
 
 if TYPE_CHECKING:
-    from core import Server, Plugin, Node
+    from core import Server, Node
 
 __all__ = ["BotService"]
 
@@ -67,7 +67,8 @@ class BotService(Service):
 
     def __init__(self, node):
         super().__init__(node=node, name="Bot")
-        self.bot: Optional[DCSServerBot] = None
+        self.bot: DCSServerBot | DummyBot | None = None
+        self._connect_task: asyncio.Task | None = None
         # do we need to change the bot.yaml file?
         dirty = self._migrate_autorole()
         dirty = self._secure_token() or dirty
@@ -76,18 +77,18 @@ class BotService(Service):
             self.save_config()
 
     @property
-    def token(self) -> Optional[str]:
+    def token(self) -> str | None:
         try:
             return utils.get_password('token', self.node.config_dir)
         except ValueError:
             return None
 
     @property
-    def proxy(self) -> Optional[str]:
+    def proxy(self) -> str | None:
         return self.locals.get('proxy', {}).get('url')
 
     @property
-    def proxy_auth(self) -> Optional[BasicAuth]:
+    def proxy_auth(self) -> BasicAuth | None:
         username = self.locals.get('proxy', {}).get('username')
         try:
             password = utils.get_password('proxy', self.node.config_dir)
@@ -95,6 +96,7 @@ class BotService(Service):
             return None
         if username and password:
             return BasicAuth(username, password)
+        return None
 
     def init_bot(self):
         if self.locals.get('no_discord', False):
@@ -104,7 +106,7 @@ class BotService(Service):
                             locals=self.locals)
         else:
             def get_prefix(client, message):
-                prefixes = [self.locals.get('command_prefix', '.')]
+                prefixes = []
                 # Allow users to @mention the bot instead of using a prefix
                 return commands.when_mentioned_or(*prefixes)(client, message)
 
@@ -131,35 +133,89 @@ class BotService(Service):
         try:
             self.bot = self.init_bot()
             await self.install_fonts()
-            await self.bot.login(token=self.token)
-            # noinspection PyAsyncCall
-            asyncio.create_task(self.bot.connect(reconnect=reconnect))
-        except Exception as ex:
-            self.log.exception(ex)
+            token: str | None = self.token
+            if not token:
+                raise FatalException("No Discord token found! You need to configure it in the bot.yaml file.")
+
+            await self.bot.login(token=token)
+
+            async def connect_with_retry() -> None:
+                delay = 5
+                max_delay = 60
+                while not self.node.is_shutdown.is_set():
+                    try:
+                        await self.bot.connect(reconnect=reconnect)
+                        return
+                    except asyncio.CancelledError:
+                        raise
+                    except (ClientConnectorDNSError, OSError) as ex:
+                        self.log.warning(f"Discord connection/DNS error: {ex}. Retrying in {delay}s ...")
+                    except discord.HTTPException as ex:
+                        self.log.error(f"Discord HTTP error during connect: {ex}")
+                        raise
+                    except Exception as ex:
+                        self.log.exception("Unexpected error while connecting to Discord", exc_info=ex)
+                        raise
+
+                    try:
+                        await asyncio.wait_for(self.node.is_shutdown.wait(), timeout=delay)
+                        return
+                    except asyncio.TimeoutError:
+                        delay = min(delay * 2, max_delay)
+
+            self._connect_task = asyncio.create_task(connect_with_retry())
+
         except PermissionError as ex:
             self.log.error("Please check the permissions for " + str(ex))
             raise
         except discord.HTTPException:
             raise FatalException("Error while logging in your Discord bot. Check you token!")
         except SSLCertVerificationError:
-            raise FatalException("The Discord certificate is invalid. You need to import it manually. "
-                                 "Check the known issues section in my Discord for help.")
+            raise FatalException(
+                "The Discord certificate is invalid. You need to import it manually. "
+                "Check the known issues section in my Discord for help."
+            )
+        except Exception as ex:
+            self.log.exception(ex)
+            raise
 
     async def stop(self):
+        if self._connect_task and not self._connect_task.done():
+            self._connect_task.cancel()
+            try:
+                await self._connect_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as ex:
+                self.log.debug(f"Ignored connect task failure during shutdown: {ex}")
+
         if self.bot:
             await self.bot.close()
         await super().stop()
 
-    async def alert(self, title: str, message: str, server: Optional[Server] = None) -> None:
-        mentions = ''.join([self.bot.get_role(role).mention for role in self.bot.roles['Alert'] if role is not None])
-        embed = utils.create_warning_embed(title=title, text=utils.escape_string(message))
-        admin_channel = self.bot.get_admin_channel(server)
-        audit_channel = self.bot.get_channel(self.bot.locals.get('channels', {}).get('audit', -1))
-        channel = admin_channel or audit_channel
-        if channel:
-            await channel.send(content=mentions, embed=embed)
-        else:
-            self.log.critical(f"{title}: {message}")
+    async def alert(self, title: str, message: str, server: Server | None = None) -> None:
+        try:
+            # if we have dedicated managers of a server, send the alerts to them
+            if server and server.locals.get('managed_by'):
+                alert_roles = server.locals['managed_by']
+            # use the default Alert role otherwise
+            else:
+                alert_roles = self.bot.roles['Alert']
+            try:
+                mentions = ''.join([self.bot.get_role(role).mention for role in alert_roles if role is not None])
+            except AttributeError:
+                self.log.error(f"Alert-Role {alert_roles} not found.")
+                mentions = ""
+            embed = utils.create_warning_embed(title=title, text=utils.escape_string(message))
+            admin_channel = self.bot.get_admin_channel(server)
+            audit_channel = self.bot.get_channel(self.bot.locals.get('channels', {}).get('audit', -1))
+            channel = admin_channel or audit_channel
+            if channel:
+                await channel.send(content=mentions, embed=embed)
+            else:
+                self.log.critical(f"{title}: {message}")
+        except Exception:
+            self.log.warning("Audit message discarded due to master takeover: " + message)
 
     async def install_fonts(self):
         font_dir = Path('fonts')
@@ -180,9 +236,9 @@ class BotService(Service):
         for f in font_manager.findSystemFonts('fonts'):
             font_manager.fontManager.addfont(f)
 
-    async def send_message(self, channel: Optional[int] = -1, content: Optional[str] = None,
-                           server: Optional[Server] = None, filename: Optional[str] = None,
-                           embed: Optional[dict] = None, mention: Optional[list] = None):
+    async def send_message(self, channel: int | None = -1, content: str | None = None,
+                           server: Server | None = None, filename: str | None = None,
+                           embed: dict | None = None, mention: list | None = None):
         _channel = self.bot.get_channel(channel)
         if not _channel:
             if channel and channel != -1:
@@ -202,13 +258,6 @@ class BotService(Service):
             content = _mention + (content or "")
         await _channel.send(content=content, file=file, embed=_embed)
 
-    async def audit(self, message, user: Optional[Union[discord.Member, str]] = None,
-                    server: Optional[Server] = None, node: Optional[Node] = None, **kwargs):
+    async def audit(self, message, user: discord.Member | str | None = None,
+                    server: Server | None = None, node: Node | None = None, **kwargs):
         await self.bot.audit(message, user=user, server=server, node=node, **kwargs)
-
-    async def rename_server(self, server: Server, new_name: str):
-        async with self.apool.connection() as conn:
-            async with conn.transaction():
-                # call rename() in all Plugins
-                for plugin in self.bot.cogs.values():  # type: Plugin
-                    await plugin.rename(conn, server.name, new_name)

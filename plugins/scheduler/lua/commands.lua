@@ -17,31 +17,39 @@ end
 
 function dcsbot.shutdown(json)
     log.write('DCSServerBot', log.DEBUG, 'Scheduler: shutdown()')
-	DCS.exitProcess()
+	Sim.exitProcess()
 end
 
-function handlePassword(json, settings, passwordKey, passwordHashKey)
+function _handlePassword(json, settings, passwordKey, passwordHashKey)
     local password = json[passwordKey]
     if password then
         if password == '' then
-            settings['advanced'][passwordHashKey] = nil
+            settings.advanced[passwordHashKey] = nil
         else
-            settings['advanced'][passwordHashKey] = net.hash_password(password)
+            settings.advanced[passwordHashKey] = net.hash_password(password)
         end
     end
+end
+
+
+function dcsbot.setPassword(json)
+    log.write('DCSServerBot', log.DEBUG, 'Scheduler: setPassword()')
+    utils.saveSettings({
+        password = json.password
+    })
 end
 
 function dcsbot.setCoalitionPassword(json)
     log.write('DCSServerBot', log.DEBUG, 'Scheduler: setCoalitionPassword()')
     local settings = utils.loadSettingsRaw()
 
-    handlePassword(json, settings, 'bluePassword', 'bluePasswordHash')
-    handlePassword(json, settings, 'redPassword', 'redPasswordHash')
+    _handlePassword(json, settings, 'bluePassword', 'bluePasswordHash')
+    _handlePassword(json, settings, 'redPassword', 'redPasswordHash')
 
     utils.saveSettings(settings)
 end
 
 function dcsbot.reloadScripts(json)
     log.write('DCSServerBot', log.DEBUG, 'Scheduler: reloadScripts()')
-    DCS.reloadUserScripts()
+    Sim.reloadUserScripts()
 end

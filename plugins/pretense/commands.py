@@ -48,8 +48,10 @@ class Pretense(Plugin):
         try:
             file_data = await server.node.read_file(json_file_path)
         except FileNotFoundError:
-            await interaction.followup.send(_("No player_stats.json found on this server! Is Pretense active?"),
-                                            ephemeral=True)
+            await interaction.followup.send(
+                _("No {} found on this server! Is Pretense active?").format(os.path.basename(json_file_path)),
+                ephemeral=True
+            )
             return
         content = file_data.decode(encoding='utf-8')
         data = json.loads(content)
@@ -57,7 +59,9 @@ class Pretense(Plugin):
         env = await report.render(data=data, server=server)
         try:
             file = discord.File(fp=env.buffer, filename=env.filename) if env.filename else MISSING
-            await interaction.followup.send(embed=env.embed, file=file)
+            msg = await interaction.original_response()
+            await msg.edit(embed=env.embed, attachments=[file],
+                           delete_after=self.bot.locals.get('message_autodelete'))
         finally:
             if env.buffer:
                 env.buffer.close()
@@ -80,11 +84,11 @@ class Pretense(Plugin):
         if what == 'persistence' or what == 'both':
             path = os.path.join(await server.get_missions_dir(), 'Saves', "pretense_*.json")
             await server.node.remove_file(path)
-            await interaction.followup.send(_("Pretense persistence reset."))
+            await interaction.followup.send(_("Pretense persistence reset."), ephemeral=ephemeral)
         if what == 'statistics' or what == 'both':
-            path = os.path.join(await server.get_missions_dir(), 'Saves', "player_stats.json")
+            path = os.path.join(await server.get_missions_dir(), 'Saves', "player_stats*.json")
             await server.node.remove_file(path)
-            await interaction.followup.send(_("Pretense statistics reset."))
+            await interaction.followup.send(_("Pretense statistics reset."), ephemeral=ephemeral)
 
     @tasks.loop(seconds=120)
     async def update_leaderboard(self):
@@ -125,9 +129,10 @@ class Pretense(Plugin):
             return
         if not message.attachments or not utils.check_roles(self.bot.roles['DCS Admin'], message.author):
             return
-        server: Server = self.bot.get_server(message, admin_only=True)
+
+        server = self.bot.get_server(message, admin_only=True)
         for attachment in message.attachments:
-            if not (attachment.filename == 'player_stats.json' or
+            if not (attachment.filename in ['player_stats.json', 'player_stats_v2.0.json'] or
                     (attachment.filename.startswith('pretense') and attachment.filename.endswith('.json'))):
                 continue
             if not server:
@@ -137,7 +142,7 @@ class Pretense(Plugin):
                 if not admin_channel or admin_channel != message.channel.id:
                     return
                 try:
-                    server = await utils.server_selection(self.bus, ctx,
+                    server = await utils.server_selection(self.bot, ctx,
                                                           title=_("To which server do you want to upload to?"))
                     if not server:
                         await ctx.send(_('Upload aborted.'))

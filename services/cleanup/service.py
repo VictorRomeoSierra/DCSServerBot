@@ -1,6 +1,5 @@
 import asyncio
 import os
-from typing import Optional
 
 from core import ServiceRegistry, Service, utils, Instance
 from datetime import timedelta, datetime
@@ -11,6 +10,7 @@ from services.cron.actions import purge_channel
 
 @ServiceRegistry.register()
 class CleanupService(Service):
+
     def __init__(self, node):
         super().__init__(node=node, name="Cleanup")
         self.bot = None
@@ -31,6 +31,8 @@ class CleanupService(Service):
                 if file_mtime < threshold_timestamp:
                     self.log.debug(f"  => {file_path.name} is older than {delete_after} days, deleting ...")
                     await asyncio.to_thread(utils.safe_rmtree, file_path)
+            except FileNotFoundError:
+                pass
             except Exception as ex:
                 self.log.error(f"Could not delete {file_path}: {ex}")
 
@@ -48,7 +50,7 @@ class CleanupService(Service):
             search_pattern = f"**/{pattern}" if recursive else pattern
             for file_path in directory.glob(search_pattern):
                 tasks.append(check_and_delete(file_path))
-        await asyncio.gather(*tasks)
+        await utils.run_parallel_nofail(*tasks)
 
     async def do_channel_cleanup(self, config: dict):
         try:
@@ -56,27 +58,28 @@ class CleanupService(Service):
         except Exception as ex:
             self.log.error(f"Could not purge channel {config['channel']}: {ex}")
 
-    async def do_cleanup(self, instance: Optional[Instance] = None) -> None:
-        if instance:
-            for name, config in self.get_config(instance.server).items():
-                self.log.debug(f"- Running cleanup for {name} ...")
-                if 'directory' in config:
-                    await self.do_directory_cleanup(instance, config)
-        else:
-            config = self.get_config()
-            if 'channel' in config:
-                self.log.debug(f"- Running channel cleanup ...")
-                await self.do_channel_cleanup(config)
+    async def do_cleanup(self, instance: Instance | None = None) -> None:
+        try:
+            if instance:
+                for name, config in self.get_config(instance.server).items():
+                    self.log.debug(f"- Running cleanup for {name} ...")
+                    if 'directory' in config:
+                        await self.do_directory_cleanup(instance, config)
+            else:
+                for name, config in self.get_config().items():
+                    if self.node.master and 'channel' in config:
+                        self.log.debug(f"- Running channel cleanup ...")
+                        await self.do_channel_cleanup(config)
+        except Exception:
+            self.log.exception("Error in cleanup:", exc_info=True)
 
     @tasks.loop(hours=12)
     async def schedule(self):
         if not self.locals:
             return
         if self.node.master:
-            # noinspection PyAsyncCall
             asyncio.create_task(self.do_cleanup())
-        for instance in self.node.instances:
-            # noinspection PyAsyncCall
+        for instance in self.node.instances.values():
             asyncio.create_task(self.do_cleanup(instance))
 
     @schedule.before_loop

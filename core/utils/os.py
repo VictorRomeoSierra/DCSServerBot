@@ -1,40 +1,51 @@
-import getpass
+from __future__ import annotations
 
-import aiohttp
-import ipaddress
+import asyncio
 import logging
 import os
 import pickle
 import platform
 import psutil
-import socket
 import stat
-import subprocess
 import sys
+
+from contextlib import suppress
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from typing import Generator
+
 if sys.platform == 'win32':
     import ctypes
     import pywintypes
     import win32api
     import win32console
+    import winreg
 
-from contextlib import closing, suppress
-from logging.handlers import RotatingFileHandler
-from pathlib import Path
-from typing import Optional, Union
+    from pywinauto.win32defines import SEE_MASK_NOCLOSEPROCESS, SW_HIDE, SW_SHOWMINNOACTIVE
 
-API_URLS = [
-    'https://api4.my-ip.io/ip',
-    'https://api4.ipify.org/'
-]
+    class SHELLEXECUTEINFO(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", ctypes.c_ulong),
+            ("fMask", ctypes.c_ulong),
+            ("hwnd", ctypes.c_void_p),
+            ("lpVerb", ctypes.c_wchar_p),
+            ("lpFile", ctypes.c_wchar_p),
+            ("lpParameters", ctypes.c_wchar_p),
+            ("lpDirectory", ctypes.c_wchar_p),
+            ("nShow", ctypes.c_int),
+            ("hInstApp", ctypes.c_void_p),
+            ("lpIDList", ctypes.c_void_p),
+            ("lpClass", ctypes.c_wchar_p),
+            ("hkeyClass", ctypes.c_void_p),
+            ("dwHotKey", ctypes.c_ulong),
+            ("hIcon", ctypes.c_void_p),
+            ("hProcess", ctypes.c_void_p),
+        ]
 
-ENABLE_QUICK_EDIT_MODE = 0x40
-ENABLE_EXTENDED_FLAGS = 0x80
 
 __all__ = [
-    "is_open",
-    "get_public_ip",
     "find_process",
-    "is_process_running",
+    "find_process_async",
     "get_windows_version",
     "get_drive_space",
     "list_all_files",
@@ -47,62 +58,58 @@ __all__ = [
     "set_password",
     "get_password",
     "delete_password",
+    "sanitize_filename",
+    "get_win32_error_message",
     "CloudRotatingFileHandler",
-    "sanitize_filename"
+    "run_elevated",
+    "is_uac_enabled",
+    "start_elevated"
 ]
 
 logger = logging.getLogger(__name__)
 
 
-def is_open(ip, port):
-    with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
-        s.settimeout(1.0)
-        return s.connect_ex((ip, int(port))) == 0
-
-
-async def get_public_ip():
-    for url in API_URLS:
-        with suppress(aiohttp.ClientError, ValueError):
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url) as resp:
-                    return ipaddress.ip_address(await resp.text()).compressed
-
-
-def find_process(proc: str, instance: Optional[str] = None):
+def find_process(proc: str, instance: str | None = None) -> Generator[psutil.Process, None, None]:
     proc_set = {name.casefold() for name in proc.split("|")}
 
-    for p in psutil.process_iter(['cmdline']):
+    # Get all processes at once with their info
+    processes = {p.pid: p for p in psutil.process_iter(['name', 'cmdline'])}
+
+    # Filter by name first
+    matching_processes = {pid: p for pid, p in processes.items()
+                          if p.info['name'] and p.info['name'].casefold() in proc_set}
+
+    # Then check instance if needed
+    for p in matching_processes.values():
         try:
-            if p.name().casefold() not in proc_set:
-                continue
             if instance:
                 cmdline = p.info['cmdline']
                 if not cmdline:
                     continue
-                # Check if `instance` is part of any cmdline parameter (case-insensitive)
-                if any(instance.casefold() in c.replace('\\', '/').casefold() for c in cmdline):
-                    return p
+                if any(instance.casefold() in c.replace('\\', '/').casefold().split('/')
+                       for c in cmdline):
+                    yield p
             else:
-                return p
+                yield p
         except (psutil.AccessDenied, psutil.NoSuchProcess, IndexError):
             continue
-    return None
 
 
-def is_process_running(process: Union[subprocess.Popen, psutil.Process]):
-    if isinstance(process, subprocess.Popen):
-        return process.poll() is None
-    elif isinstance(process, psutil.Process):
-        return process.is_running()
+async def find_process_async(proc: str, instance: str | None = None):
+    def _find_first_match():
+        return next(find_process(proc, instance), None)
+
+    return await asyncio.to_thread(_find_first_match)
 
 
 MS_LSB_MULTIPLIER = 65536
 
 
-def get_windows_version(cmd: str) -> Optional[str]:
+def get_windows_version(cmd: str) -> str | None:
     if sys.platform != 'win32':
         return None
     try:
+        # noinspection PyUnresolvedReferences
         info = win32api.GetFileVersionInfo(os.path.expandvars(cmd), '\\')
         version = "%d.%d.%d.%d" % (info['FileVersionMS'] / MS_LSB_MULTIPLIER,
                                    info['FileVersionMS'] % MS_LSB_MULTIPLIER,
@@ -118,6 +125,7 @@ def get_drive_space(directory) -> tuple[int, int]:
         free_bytes = ctypes.c_ulonglong(0)
         total_bytes = ctypes.c_ulonglong(0)
 
+        # noinspection PyUnresolvedReferences
         ctypes.windll.kernel32.GetDiskFreeSpaceExW(ctypes.c_wchar_p(directory),
                                                    ctypes.pointer(free_bytes),
                                                    ctypes.pointer(total_bytes),
@@ -152,7 +160,7 @@ def make_unix_filename(*args) -> str:
     return '/'.join(arg.replace('\\', '/').strip('/') for arg in args)
 
 
-def safe_rmtree(path: Union[str, Path]):
+def safe_rmtree(path: str | Path):
     # if path is a single file, delete that
     if os.path.isfile(path):
         os.chmod(path, stat.S_IWUSR)
@@ -182,13 +190,14 @@ def is_junction(path):
         return False
     if os.path.islink(path):
         return True
+    # noinspection PyUnresolvedReferences
     attrs = ctypes.windll.kernel32.GetFileAttributesW(path)
     if attrs == -1:
         raise ctypes.WinError()
     return bool(attrs & 0x0400)
 
 
-def terminate_process(process: Optional[psutil.Process]):
+def terminate_process(process: psutil.Process | None):
     if process is not None and process.is_running():
         process.terminate()
         try:
@@ -198,8 +207,14 @@ def terminate_process(process: Optional[psutil.Process]):
             process.wait(timeout=3)
 
 
-def quick_edit_mode(turn_on=None):
+def quick_edit_mode(turn_on=None) -> bool:
     """ Enable/Disable windows console Quick Edit Mode """
+    if sys.platform != 'win32':
+        return False
+
+    ENABLE_QUICK_EDIT_MODE = 0x40
+    ENABLE_EXTENDED_FLAGS = 0x80
+
     screen_buffer = win32console.GetStdHandle(-10)
     orig_mode = screen_buffer.GetConsoleMode()
     is_on = (orig_mode & ENABLE_QUICK_EDIT_MODE)
@@ -219,6 +234,8 @@ def create_secret_dir(config_dir='config'):
         os.makedirs(path, exist_ok=True)
         if sys.platform == 'win32':
             import ctypes
+
+            # noinspection PyUnresolvedReferences
             ctypes.windll.kernel32.SetFileAttributesW(path, 2)
 
 
@@ -243,36 +260,88 @@ def delete_password(key: str, config_dir='config'):
         raise ValueError(key)
 
 
-def sanitize_filename(filename: str, base_directory: str) -> str:
+def sanitize_filename(
+    filename: str,
+    base_directory: str | Path,
+    *,
+    return_absolute: bool = True,
+) -> Path:
     """
-    Sanitizes an input filename to prevent relative path injection.
-    Ensures the file path is within the `base_directory`.
+    Convert *filename* into a safe path that **cannot** escape *base_directory*.
 
-    Args:
-        filename (str): The input filename to sanitize.
-        base_directory (str): The base directory where all downloads should be stored.
+    Parameters
+    ----------
+    filename:
+        The user‑supplied relative path.  It may contain `..`, symlinks,
+        or even invalid characters for the underlying OS.
+    base_directory:
+        The directory that *must* contain the resulting file.
+    return_absolute:
+        If ``True`` (default) return an absolute path; if ``False`` return
+        the relative path that lives inside *base_directory*.
 
-    Returns:
-        str: A sanitized, safe file path.
+    Returns
+    -------
+    pathlib.Path
+        A safe, validated path.
 
-    Raises:
-        ValueError: If the filename contains invalid patterns or escapes the base directory.
+    Raises
+    ------
+    ValueError
+        If the path tries to escape the base directory or contains
+        prohibited characters.
     """
-    # Ensure the base_directory is absolute
-    base_directory = os.path.abspath(base_directory)
 
-    # Resolve the filename into an absolute path
-    resolved_path = os.path.abspath(os.path.join(base_directory, filename))
+    # 1. Normalize the inputs
+    base = Path(base_directory).resolve(strict=True)          # absolute & real
+    user_path = Path(filename)
 
-    # Ensure the resolved path is within the base directory
-    if not os.path.commonpath([base_directory, resolved_path]) == base_directory:
-        raise ValueError(f"Relative path injection attempt detected: {filename}")
+    # 2. Resolve the combined path (collapse .., symlinks, etc.)
+    resolved = (
+        user_path.resolve(strict=False)
+        if user_path.is_absolute()
+        else (base / user_path).resolve(strict=False)
+    )
 
-    # Optional: Check file name for illegal characters (e.g., reject ../)
-    if ".." in filename or filename.startswith(("/")):
-        raise ValueError(f"Invalid filename detected: {filename}")
+    # 3. Ensure containment – this is the heart of the check
+    if not resolved.is_relative_to(base):
+        raise ValueError(
+            f"Attempt to escape base directory: {filename!r} → {resolved}"
+        )
 
-    return resolved_path
+    # 4. Strip OS‑specific illegal characters
+    #    Windows:  < > : " / \ | ? *   and NUL (chr(0))
+    #    Linux:    /   and NUL (chr(0))
+    illegal_chars = (r'/', r'<>:"/\|?*')[sys.platform.startswith("win")]
+
+    cleaned = "".join(c for c in resolved.name if c not in illegal_chars)
+
+    if not cleaned:
+        raise ValueError(f"Filename contains only illegal characters: {filename!r}")
+
+    resolved = resolved.with_name(cleaned)
+
+    # 5. Return the requested representation
+    return resolved if return_absolute else resolved.relative_to(base)
+
+
+def get_win32_error_message(error_code: int) -> str:
+    # Load the system message corresponding to the error code
+    if sys.platform != 'win32':
+        return ""
+
+    buffer = ctypes.create_unicode_buffer(512)
+    # noinspection PyUnresolvedReferences
+    ctypes.windll.kernel32.FormatMessageW(
+        0x00001000,  # FORMAT_MESSAGE_FROM_SYSTEM
+        None,
+        error_code,
+        0,  # Default language
+        buffer,
+        len(buffer),
+        None
+    )
+    return buffer.value.strip()
 
 
 class CloudRotatingFileHandler(RotatingFileHandler):
@@ -286,3 +355,97 @@ class CloudRotatingFileHandler(RotatingFileHandler):
             if log_file_size >= self.maxBytes:
                 return 1
         return 0
+
+
+def run_elevated(exe_path, cwd, *args):
+    """Start *exe_path* as Administrator and return the return code."""
+    if sys.platform != 'win32':
+        return -1
+
+    sei = SHELLEXECUTEINFO()
+    sei.cbSize = ctypes.sizeof(sei)
+    sei.fMask  = SEE_MASK_NOCLOSEPROCESS
+    sei.lpVerb = "runas"
+    sei.lpFile = os.path.abspath(exe_path)
+    sei.lpDirectory = os.path.abspath(cwd) if cwd else os.path.dirname(exe_path)
+    sei.lpParameters = ' '.join(map(str, args))
+    sei.nShow = SW_HIDE
+
+    # noinspection PyUnresolvedReferences
+    if not ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(sei)):
+        raise ctypes.WinError()
+
+    hproc = sei.hProcess
+    # noinspection PyUnresolvedReferences
+    ctypes.windll.kernel32.WaitForSingleObject(hproc, ctypes.c_ulong(-1))
+
+    exit_code = ctypes.c_ulong()
+    # noinspection PyUnresolvedReferences
+    ctypes.windll.kernel32.GetExitCodeProcess(hproc, ctypes.byref(exit_code))
+
+    return ctypes.c_int32(exit_code.value).value
+
+
+def is_uac_enabled() -> bool:
+    """Return True if UAC is enabled; False if it is disabled."""
+    if sys.platform != 'win32':
+        # non Win32 systems don't have a UAC, but need to tackle permissions differently
+        return False
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"Software\Microsoft\Windows\CurrentVersion\Policies\System",
+            0,
+            winreg.KEY_READ | winreg.KEY_WOW64_64KEY,
+        ) as key:
+            # check if UAC is enabled at all
+            lua_enabled, _ = winreg.QueryValueEx(key, 'EnableLUA')
+            if lua_enabled == 0:
+                return False
+            # now check if we get prompted (if not, treat UAC as disabled)
+            admin_behaviour, _ = winreg.QueryValueEx(key, "ConsentPromptBehaviorAdmin")
+            return admin_behaviour > 0          # > 0 => True, 0 = False
+    except (FileNotFoundError, PermissionError):
+        # if not found or permission is denied, fall back to a safe default.
+        return True
+
+
+def start_elevated(exe_path: str, cwd: str, *args) -> psutil.Process | None:
+    """
+    Start exe_path as Administrator and return a psutil.Process for the started process (Popen-like).
+    Returns None on non-Windows platforms.
+
+    Note: The returned handle refers to the primary process created by ShellExecuteExW.
+    """
+    if sys.platform != 'win32':
+        return None
+
+    sei = SHELLEXECUTEINFO()
+    sei.cbSize = ctypes.sizeof(sei)
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS
+    sei.lpVerb = "runas"
+    sei.lpFile = os.path.abspath(exe_path)
+    sei.lpDirectory = os.path.abspath(cwd) if cwd else os.path.dirname(exe_path)
+    sei.lpParameters = ' '.join(map(str, args))
+    sei.nShow = SW_SHOWMINNOACTIVE
+
+    # noinspection PyUnresolvedReferences
+    if not ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(sei)):
+        raise ctypes.WinError()
+
+    hproc = sei.hProcess
+
+    # Try to get PID from the handle to wrap in psutil.Process.
+    # Kernel32 GetProcessId returns DWORD PID.
+    GetProcessId = ctypes.windll.kernel32.GetProcessId  # type: ignore[attr-defined]
+    GetProcessId.argtypes = [ctypes.c_void_p]
+    GetProcessId.restype = ctypes.c_ulong
+    pid = GetProcessId(hproc)
+
+    if pid:
+        try:
+            return psutil.Process(pid)
+        except psutil.NoSuchProcess:
+            return None
+    else:
+        return None

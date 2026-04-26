@@ -15,35 +15,45 @@ MyNode:
   extensions:
     SRS:
       installation: '%ProgramFiles%\DCS-SimpleRadio-Standalone'
+      beta: true  # allow beta versions
       autoupdate: true      # auto update your DCS-SRS installation, if a new version is available online (default: false)
-#      autoupdate:           # alternative configuration with a message being posted to Discord after every update
-#        title: DCS-SRS has been updated to version {}!
-#        description: 'The following servers have been updated:'
-#        footer: Please make sure you update your DCS-SRS client also!
-#        mention:            # Optional mentioning
-#          - DCS
+      use_upnp: true        # Do you want to use UPnP to auto-forward your SRS ports? If not set, the global setting will be used.
+      auto_affinity:        # Optional: core affinity settings
+        min_cores: 1        # Min number of cores to be used (default: 1)
+        max_cores: 1        # Max number of cores to be used (default: 1)
+        quality: 0          # Quality (0 = low, 1 = normal, 2 = high, default: 0)
+      announce:             # Optional: post a message to Discord after every update
+        channel: 1122334455667788
+        title: DCS-SRS has been updated to version {}!
+        description: 'The following servers have been updated:'
+        footer: Please make sure you update your DCS-SRS client also!
+        mention:            # Optional mentioning
+          - DCS
   # [...]
   instances:
-    DCS.release_server:
+    DCS.dcs_serverrelease:
       # [...]
       extensions:
         SRS:
-          config: '%USERPROFILE%\Saved Games\DCS.release_server\Config\SRS.cfg'
+          config: '{instance.home}\Config\SRS.cfg'
           host: 127.0.0.1
           port: 5002
-          minimized: true     # start SRS minimized (default: true)
-          autoconnect: true   # install the appropriate DCS-SRS-AutoConnectGameGUI.lua, default: true
-          awacs: true         # if you use LotAtc
+          gui_server: true          # Optional: use the SRS-Server.exe (GUI server) instead of the command line one
+          minimized: true           # Optional: start GUI server minimized (default: true)
+          autoconnect: true         # install the appropriate DCS-SRS-AutoConnectGameGUI.lua, default: true
+          disconnect_grace_loops: 3 # Internal: number of loops until a client is considered disconnected
+          awacs: true               # if you use LotAtc
           lotatc_export_port: 10712
           blue_password: blue
           red_password: red
+          show_passwords: false     # Optional: do not show red/blue passwords in the status embed (default: true)
           radio_effect_override: false                # optional: disable radio effects (LOS, etc)
           global_lobby_frequencies: 248.22,30.0,127.0 # optional: set your music channels in here
-          autostart: true     # optional: if you manage your SRS servers outside of DCSSB, set that to false
-          always_on: true     # start SRS as soon as possible  (includes no_shutdown: true)
-          no_shutdown: true   # optional: don't shut down SRS on mission end (default: false)
+          autostart: true           # optional: if you manage your SRS servers outside DCSSB, set that to false
+          always_on: true           # start SRS as soon as possible  (includes no_shutdown: true)
+          no_shutdown: true         # optional: don't shut down SRS on mission end (default: false)
           srs_nudge_message: 'Optional nudge message' # optional: overwrite the existing nudge message
-          
+          instructor_mode: true     # enable instructor mode (as of SRS 2.3.3.0)
 ```
 You need one entry in the node section, pointing to your DCS-SRS installation and one in every instance section, 
 where you want to use SRS with. The next time the bot starts your server, it will auto-launch SRS and take care of it.
@@ -57,6 +67,17 @@ __Optional__ parameters (will change server.cfg if necessary):</br>
 * **red_password** AWACS mode, password red.
 * **autostart** If true, the SRS server will be auto-started (default).
 
-> ⚠️ **Attention!**<br>
-> You need to disable User-Access-Control (UAC) to use SRS-autoupdate.
+> [!IMPORTANT]
+> You need to give the bot-user write permission on the SRS installation directory to use SRS-autoupdate.
 
+> [!WARNING]
+> The new REST service for SRS is not supported yet, as it needs administrative elevation.
+> I am in contact with Ciribob already to remove this requirement.
+
+> [!TIP]
+> You can rename the SRS extension in your server status embed by setting a "name" in the configuration like so:
+> ```yaml
+> extension:
+>   SRS:
+>     name: MyFancyName  # Optional: default is "SRS
+> ```

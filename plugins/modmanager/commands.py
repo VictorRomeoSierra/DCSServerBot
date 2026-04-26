@@ -1,16 +1,18 @@
 import aiohttp
 import discord
 import os
-import psycopg
 
-from core import Status, Plugin, utils, Server, ServiceRegistry, PluginInstallationError, Group, get_translation
-from discord import SelectOption, TextStyle, app_commands
-from discord.ui import View, Select, Button, Modal, TextInput
+from core import Status, Plugin, utils, Server, ServiceRegistry, PluginInstallationError, Group, get_translation, \
+    ServerUploadHandler
+from discord import SelectOption, app_commands, ButtonStyle, TextStyle
+from discord.ext import commands
+from discord.ui import View, Select, Button, Modal, TextInput, Label
 from services.bot import DCSServerBot
 from services.modmanager import ModManagerService, Folder
-from typing import Optional
 
 _ = get_translation(__name__.split('.')[1])
+
+WARNING_ICON = "https://github.com/Special-K-s-Flightsim-Bots/DCSServerBot/blob/master/images/warning.png?raw=true"
 
 
 async def get_installed_mods(service: ModManagerService, server: Server) -> list[tuple[Folder, str, str]]:
@@ -23,10 +25,14 @@ async def get_installed_mods(service: ModManagerService, server: Server) -> list
     return sorted(installed)
 
 
-async def get_available_mods(service: ModManagerService, server: Server) -> list[tuple[Folder, str, str]]:
+async def get_available_mods(
+        interaction: discord.Interaction, service: ModManagerService, server: Server
+) -> list[tuple[Folder, str, str]]:
     available = []
     config = service.get_config(server)
     for folder in Folder:
+        if folder == Folder.RootFolder and utils.is_restricted(interaction):
+            continue
         packages = []
         for x in os.listdir(os.path.expandvars(config[folder.value])):
             if x.startswith('.') or x.casefold() in ['desktop.ini']:
@@ -46,17 +52,17 @@ async def installed_mods_autocomplete(interaction: discord.Interaction, current:
         return []
     service = ServiceRegistry.get(ModManagerService)
     try:
-        server: Server = await utils.ServerTransformer().transform(interaction,
-                                                                   utils.get_interaction_param(interaction, 'server'))
+        server: Server = await utils.ServerTransformer().transform(interaction, interaction.namespace.server)
         if not server:
             return []
         return [
-            app_commands.Choice(name=name + f'_v{version}', value=f"{folder.value}/{name}/{version}")
+            app_commands.Choice[str](name=name + f'_v{version}', value=f"{folder.value}/{name}/{version}")
             for folder, name, version in sorted(await get_installed_mods(service, server))
             if not current or current.casefold() in name.casefold()
         ][:25]
     except Exception as ex:
         interaction.client.log.exception(ex)
+        return []
 
 
 async def available_mods_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
@@ -64,18 +70,19 @@ async def available_mods_autocomplete(interaction: discord.Interaction, current:
         return []
     service = ServiceRegistry.get(ModManagerService)
     try:
-        server: Server = await utils.ServerTransformer().transform(interaction,
-                                                                   utils.get_interaction_param(interaction, 'server'))
+        server: Server = await utils.ServerTransformer().transform(interaction, interaction.namespace.server)
         if not server:
             return []
         return [
-            app_commands.Choice(name=name, value=f"{folder.value}/{name}")
-            for folder, name in sorted(set((folder, name) for folder, name, _ in await get_available_mods(service,
-                                                                                                          server)))
+            app_commands.Choice[str](name=name, value=f"{folder.value}/{name}")
+            for folder, name in sorted(set(
+                (folder, name) for folder, name, _ in await get_available_mods(interaction, service, server))
+            )
             if not current or current.casefold() in name.casefold()
         ][:25]
     except Exception as ex:
         interaction.client.log.exception(ex)
+        return []
 
 
 async def available_versions_autocomplete(interaction: discord.Interaction,
@@ -84,21 +91,21 @@ async def available_versions_autocomplete(interaction: discord.Interaction,
         return []
     service = ServiceRegistry.get(ModManagerService)
     try:
-        server: Server = await utils.ServerTransformer().transform(interaction,
-                                                                   utils.get_interaction_param(interaction, 'server'))
+        server: Server = await utils.ServerTransformer().transform(interaction, interaction.namespace.server)
         if not server:
             return []
         try:
-            folder, mod = utils.get_interaction_param(interaction, 'mod').split('/')
-        except AttributeError:
+            folder, mod = interaction.namespace.mod.split('/')
+        except (ValueError, AttributeError):
             return []
         return [
-            app_commands.Choice(name=version, value=version)
+            app_commands.Choice[str](name=version, value=version)
             for version in sorted(await service.get_available_versions(server, Folder(folder), mod), reverse=True)
             if not current or current.casefold() in version.casefold()
         ][:25]
     except Exception as ex:
         interaction.client.log.exception(ex)
+        return []
 
 
 async def repo_version_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
@@ -106,17 +113,18 @@ async def repo_version_autocomplete(interaction: discord.Interaction, current: s
         return []
     service = ServiceRegistry.get(ModManagerService)
     try:
-        repo = utils.get_interaction_param(interaction, 'url')
+        repo = interaction.namespace.url
 
         if not repo or not utils.is_github_repo(repo):
             return []
         return [
-            app_commands.Choice(name=version, value=version)
+            app_commands.Choice[str](name=version, value=version)
             for version in sorted(await service.get_repo_versions(repo), reverse=True)
             if not current or current.casefold() in version.casefold()
         ][:25]
     except Exception as ex:
         interaction.client.log.exception(ex)
+        return []
 
 
 class ModManager(Plugin):
@@ -128,19 +136,9 @@ class ModManager(Plugin):
             self.log.warning(
                 f"  => ModManager: your modmanager.yaml belongs into {self.node.config_dir}/services/modmanager.yaml, "
                 f"not in {self.node.config_dir}/plugins!")
-        self.service = ServiceRegistry.get(ModManagerService)
+        self.service: ModManagerService = ServiceRegistry.get(ModManagerService)
         if not self.service:
             raise PluginInstallationError(plugin=self.plugin_name, reason='ModManager service not loaded.')
-
-    async def prune(self, conn: psycopg.AsyncConnection, *, days: int = -1, ucids: list[str] = None,
-                    server: Optional[str] = None) -> None:
-        self.log.debug('Pruning ModManager ...')
-        if server:
-            await conn.execute("DELETE FROM mm_packages WHERE server_name = %s", (server, ))
-        self.log.debug('ModManager pruned.')
-
-    async def rename(self, conn: psycopg.AsyncConnection, old_name: str, new_name: str):
-        await conn.execute('UPDATE mm_packages SET server_name = %s WHERE server_name = %s', (new_name, old_name))
 
     # New command group "/mods"
     mods = Group(name="mods", description=_("Commands to manage custom mods in your DCS server"))
@@ -184,9 +182,11 @@ class ModManager(Plugin):
                             update += latest + '\n'
                         else:
                             update += '_ _\n'
-                    derived.embed.add_field(name=_('Mod'), value=packages)
-                    derived.embed.add_field(name=_('Version'), value=versions)
-                    derived.embed.add_field(name=_('Update'), value=update)
+                    derived.embed.add_field(name=_('Mod'), value=packages[:1024])
+                    derived.embed.add_field(name=_('Version'), value=versions[:1024])
+                    derived.embed.add_field(name=_('Update'), value=update[:1024])
+                    if len(packages) > 1024 or len(versions) > 1024 or len(update) > 1024:
+                        derived.embed.set_footer(text=_("List was truncated."))
                 else:
                     derived.embed.add_field(name='_ _', value=_('There are no mods installed.'), inline=False)
 
@@ -212,21 +212,25 @@ class ModManager(Plugin):
                                     row=1)
                     select.callback = derived.uninstall
                     derived.add_item(select)
-                button = Button(label=_("Download"), style=discord.ButtonStyle.primary, row=2)
+                # noinspection PyTypeChecker
+                button = Button(label=_("Download"), style=ButtonStyle.primary, row=2)
                 button.callback = derived.download
                 derived.add_item(button)
                 if server.status != Status.SHUTDOWN:
-                    button = Button(label=_("Shutdown"), style=discord.ButtonStyle.secondary, row=2)
+                    # noinspection PyTypeChecker
+                    button = Button(label=_("Shutdown"), style=ButtonStyle.secondary, row=2)
                     button.callback = derived.shutdown
                     derived.add_item(button)
                     derived.embed.set_footer(
-                        text=_("⚠️ Server {} needs to be shut down to change mods.").format(server.name))
+                        text=_("Server {} needs to be shut down to change mods.").format(server.name),
+                        icon_url=WARNING_ICON)
                 else:
                     for i in range(1, len(derived.children)):
                         # noinspection PyUnresolvedReferences
                         if isinstance(derived.children[i], Button) and derived.children[i].label == "Shutdown":
                             derived.remove_item(derived.children[i])
-                button = Button(label=_("Quit"), style=discord.ButtonStyle.red, row=2)
+                # noinspection PyTypeChecker
+                button = Button(label=_("Quit"), style=ButtonStyle.red, row=2)
                 button.callback = derived.cancel
                 derived.add_item(button)
 
@@ -241,28 +245,29 @@ class ModManager(Plugin):
                         await interaction.edit_original_response(embed=derived.embed)
                         if not await self.service.uninstall_package(server, folder, package, current):
                             derived.embed.set_footer(
-                                text=_("Mod {mod}_v{version} could not be uninstalled!").format(mod=package,
-                                                                                                version=version))
+                                text=_("Mod {mod}_v{version} could not be uninstalled!").format(
+                                    mod=package, version=version), icon_url=WARNING_ICON)
                             await interaction.edit_original_response(embed=derived.embed)
                         elif not await self.service.install_package(server, folder, package, version):
                             derived.embed.set_footer(
-                                text=_("Mod {mod}_v{version} could not be installed!").format(mod=package,
-                                                                                              version=version))
+                                text=_("Mod {mod}_v{version} could not be installed!").format(
+                                    mod=package, version=version), icon_url=WARNING_ICON)
                             await interaction.edit_original_response(embed=derived.embed)
                         else:
                             derived.embed.set_footer(text=_("Mod {} updated.").format(package))
                             derived.installed = await get_installed_mods(self.service, server)
-                            derived.available = await get_available_mods(self.service, server)
+                            derived.available = await get_available_mods(interaction, self.service, server)
                             await derived.render()
                     else:
                         derived.embed.set_footer(text=_("Installing mod {}, please wait ...").format(package))
                         await interaction.edit_original_response(embed=derived.embed)
                         if not await self.service.install_package(server, folder, package, version):
-                            derived.embed.set_footer(text=_("Installation of mod {} failed.").format(package))
+                            derived.embed.set_footer(text=_("Installation of mod {} failed.").format(package),
+                                                     icon_url=WARNING_ICON)
                         else:
                             derived.embed.set_footer(text=_("Mod {} installed.").format(package))
                             derived.installed = await get_installed_mods(self.service, server)
-                            derived.available = await get_available_mods(self.service, server)
+                            derived.available = await get_available_mods(interaction, self.service, server)
                             await derived.render()
                     await interaction.edit_original_response(embed=derived.embed, view=derived)
                 except Exception as ex:
@@ -276,56 +281,88 @@ class ModManager(Plugin):
                 await interaction.edit_original_response(embed=derived.embed)
                 if not await self.service.uninstall_package(server, folder, mod, version):
                     derived.embed.set_footer(
-                        text=_("Mod {mod}_v{version} could not be uninstalled!").format(mod=mod, version=version))
+                        text=_("Mod {mod}_v{version} could not be uninstalled!").format(mod=mod, version=version),
+                        icon_url=WARNING_ICON)
                 else:
                     derived.embed.set_footer(text=_("Mod {} uninstalled.").format(mod))
                     derived.installed = await get_installed_mods(self.service, server)
-                    derived.available = await get_available_mods(self.service, server)
+                    derived.available = await get_available_mods(interaction, self.service, server)
                     await derived.render()
                 await interaction.edit_original_response(embed=derived.embed, view=derived)
 
             async def download(derived, interaction: discord.Interaction):
                 class UploadModal(Modal, title=_("Download a new Mod")):
-                    url = TextInput(label=_("URL / GitHub Repo"), placeholder='https://github.com/...',
-                                    style=TextStyle.short, required=True)
-                    dest = TextInput(label=_("Destination (S=Saved Games / R=Root Folder)"), style=TextStyle.short,
-                                     required=True, min_length=1, max_length=1)
-                    version = TextInput(label=_("Version"), style=TextStyle.short, required=False, default='latest')
+                    url = Label(
+                        text=_("URL / GitHub Repo"),
+                        component=TextInput(
+                            placeholder='https://github.com/...',
+                            style=TextStyle.short,
+                            required=True
+                        )
+                    )
+                    dest = Label(
+                        text=_("Destination"),
+                        component=Select(
+                            options=[
+                                SelectOption(label='Saved Games', value='S', default=True),
+                                SelectOption(label='Root Folder', value='R')
+                            ]
+                        )
+                    )
+                    version = Label(
+                        text=_("Version"),
+                        component=TextInput(
+                            style=TextStyle.short,
+                            required=False,
+                            default='latest'
+                        )
+                    )
 
                     async def on_submit(_, interaction: discord.Interaction) -> None:
-                        # noinspection PyUnresolvedReferences
                         await interaction.response.defer()
 
                 async def download(modal: UploadModal):
-                    if utils.is_valid_url(modal.url.value):
-                        folder = Folder.RootFolder if modal.dest.value == 'R' else Folder.SavedGames
-                        if utils.is_github_repo(modal.url.value):
-                            await self.service.download_from_repo(modal.url.value, folder, version=modal.version.value)
+                    url = modal.url.component.value
+                    version = modal.version.component.value
+
+                    if utils.is_valid_url(url):
+                        folder = Folder.RootFolder if modal.dest.component.values[0] == 'R' else Folder.SavedGames
+                        if utils.is_github_repo(url):
+                            if await self.service.download_from_repo(url, folder, version=version):
+                                raise ValueError(_("Multiple returns, use /{group} {name} instead.").format(
+                                    group=self.mods.name,
+                                    name=self.download.name
+                                ))
                         else:
-                            await self.service.download(modal.url.value, folder)
+                            await self.service.download(url, folder, "")
                     else:
                         raise ValueError(_("Not a valid URL!"))
 
                 modal = UploadModal()
-                # noinspection PyUnresolvedReferences
                 await interaction.response.send_modal(modal)
                 if not await modal.wait():
-                    if not utils.is_valid_url(modal.url.value):
-                        derived.embed.set_footer(text=_("{} is not a valid URL!").format(modal.url.value))
+                    url = modal.url.component.value
+                    if not utils.is_valid_url(url):
+                        derived.embed.set_footer(text=_("{} is not a valid URL!").format(url),
+                                                 icon_url=WARNING_ICON)
                     else:
-                        derived.embed.set_footer(text=_("Downloading {} , please wait ...").format(modal.url.value))
+                        derived.embed.set_footer(text=_("Downloading {}, please wait ...").format(
+                            os.path.basename(url)))
                         for child in derived.children:
                             child.disabled = True
                         await interaction.edit_original_response(embed=derived.embed, view=derived)
                         try:
                             await download(modal)
                             embed.remove_footer()
-                            derived.available = get_available_mods(self.service, server)
+                            derived.available = await get_available_mods(interaction, self.service, server)
                         except aiohttp.client_exceptions.ClientResponseError as ex:
-                            self.log.error(f"{ex.code}: {modal.url.value} {ex.message}")
-                            embed.set_footer(text=f"{ex.code}: {ex.message}")
+                            self.log.error(f"{ex.code}: {url} {ex.message}")
+                            embed.set_footer(text=f"{ex.code}: {ex.message}", icon_url=WARNING_ICON)
+                        except ValueError as ex:
+                            embed.set_footer(text=_("Error: {}").format(str(ex)), icon_url=WARNING_ICON)
                         except Exception as ex:
-                            embed.set_footer(text=_("Error: {}").format(ex.__class__.__name__))
+                            self.log.exception(ex)
+                            embed.set_footer(text=_("Error: {}").format(ex.__class__.__name__), icon_url=WARNING_ICON)
                         for child in derived.children:
                             child.disabled = False
                         await derived.render()
@@ -338,7 +375,7 @@ class ModManager(Plugin):
         embed.description = _("Install or uninstall mods to {}").format(server.name)
         view = PackageView(embed,
                            installed=await get_installed_mods(self.service, server),
-                           available=await get_available_mods(self.service, server))
+                           available=await get_available_mods(interaction, self.service, server))
         await view.render()
         # noinspection PyUnresolvedReferences
         await interaction.response.send_message(embed=embed, view=view, ephemeral=utils.get_ephemeral(interaction))
@@ -359,11 +396,11 @@ class ModManager(Plugin):
         if server.status != Status.SHUTDOWN:
             # noinspection PyUnresolvedReferences
             await interaction.response.send_message(
-                _("Server {} needs to be shut down to install mods.").format(server.name))
+                _("Server {} needs to be shut down to install mods.").format(server.name), ephemeral=True)
             return
         if '/' not in mod:
             # noinspection PyUnresolvedReferences
-            await interaction.response.send_message(_("Mod {} not found!").format(mod))
+            await interaction.response.send_message(_("Mod {} not found!").format(mod), ephemeral=True)
             return
         _folder, package = mod.split('/')
         folder = Folder(_folder)
@@ -373,7 +410,7 @@ class ModManager(Plugin):
         current = await self.service.get_installed_package(reference, folder, package)
         if current == version:
             await interaction.followup.send(
-                _("Mod {mod}_v{version} is already installed!").format(mod=package, version=version))
+                _("Mod {mod}_v{version} is already installed!").format(mod=package, version=version), ephemeral=True)
             return
         if current:
             msg = await interaction.followup.send(
@@ -408,7 +445,7 @@ class ModManager(Plugin):
         if server.status != Status.SHUTDOWN:
             # noinspection PyUnresolvedReferences
             await interaction.response.send_message(
-                _("Server {} needs to be shut down to uninstall mods.").format(server.name))
+                _("Server {} needs to be shut down to uninstall mods.").format(server.name), ephemeral=True)
             return
         folder, package, version = mod.split('/')
         # noinspection PyUnresolvedReferences
@@ -434,7 +471,7 @@ class ModManager(Plugin):
         if not len(installed[Folder.RootFolder]) and not len(installed[Folder.SavedGames]):
             # noinspection PyUnresolvedReferences
             await interaction.response.send_message(_("No mod installed on server {}.").format(server.name),
-                                                    ephemeral=ephemeral)
+                                                    ephemeral=True)
             return
         embed = discord.Embed(color=discord.Color.blue())
         embed.description = _("The following mods are installed on server {}:").format(server.name)
@@ -444,14 +481,15 @@ class ModManager(Plugin):
                 embed.add_field(name=_("Mod"), value='\n'.join([x[0] for x in installed[folder]]))
                 embed.add_field(name=_("Version"), value='\n'.join([x[1] for x in installed[folder]]))
         # noinspection PyUnresolvedReferences
-        await interaction.response.send_message(embed=embed)
+        await interaction.response.send_message(embed=embed, ephemeral=ephemeral)
 
     @mods.command(description=_('Download a mod'))
     @app_commands.guild_only()
+    @app_commands.check(utils.restricted_check)
     @utils.app_has_roles(['Admin'])
     @app_commands.describe(url=_("GitHub repo link or download URL"))
     @app_commands.autocomplete(version=repo_version_autocomplete)
-    async def download(self, interaction: discord.Interaction, folder: Folder, url: str, version: Optional[str]):
+    async def download(self, interaction: discord.Interaction, folder: Folder, url: str, version: str | None = None):
         ephemeral = utils.get_ephemeral(interaction)
         if not utils.is_valid_url(url):
             # noinspection PyUnresolvedReferences
@@ -460,14 +498,35 @@ class ModManager(Plugin):
         # noinspection PyUnresolvedReferences
         await interaction.response.defer(ephemeral=ephemeral)
         if utils.is_github_repo(url) and not version:
-            version = await self.service.get_latest_repo_version(url)
+            try:
+                version = await self.service.get_latest_repo_version(url)
+            except aiohttp.ClientResponseError as ex:
+                await interaction.followup.send(
+                    _("Can't connect to {url}: {message}").format(url=url, message=ex.message), ephemeral=True
+                )
+                return
         if version:
             package_name = self.service.extract_repo_name(url).split('/')[-1]
             msg = await interaction.followup.send(
                 _("Downloading {mod}_v{version} from GitHub ...").format(mod=package_name, version=version),
                 ephemeral=ephemeral)
             try:
-                await self.service.download_from_repo(url, folder, version=version)
+                urls = await self.service.download_from_repo(url, folder, version=version)
+                if urls:
+                    download = await utils.selection(
+                        interaction,
+                        title='Select a download',
+                        options=[
+                            SelectOption(label=os.path.basename(url), value=os.path.basename(url))
+                            for url in urls
+                        ]
+                    )
+                    if not download:
+                        await interaction.followup.send(_("Aborted."))
+                        return
+
+                    # download the file
+                    await self.service.download_from_repo(url, folder, version=version, package_name=download[:-4])
             except FileExistsError:
                 if not await utils.yn_question(interaction, _("File exists. Do you want to overwrite it?"),
                                                ephemeral=ephemeral):
@@ -480,20 +539,53 @@ class ModManager(Plugin):
                 return
             await msg.edit(content=_("{file} downloaded. Use {command} to install it.").format(
                 file=f"{package_name}_v{version}",
-                command=(await utils.get_command(self.bot, group='mods', name='install')).mention
+                command=(await utils.get_command(self.bot, group=self.mods.name, name=self._install.name)).mention
             ))
         else:
             filename = url.split('/')[-1]
             msg = await interaction.followup.send(_("Downloading {} ...").format(filename), ephemeral=ephemeral)
             try:
-                await self.service.download(url, folder)
+                await self.service.download(url, folder, version)
             except FileExistsError:
                 if not await utils.yn_question(interaction, _("File exists. Do you want to overwrite it?"),
                                                ephemeral=ephemeral):
                     return
-                await self.service.download_from_repo(url, folder, version=version, force=True)
+                await self.service.download(url, folder, version, force=True)
             await msg.edit(content=_("{file} downloaded. Use {command} to install it.").format(
-                file=filename, command=(await utils.get_command(self.bot, group='mods', name='install')).mention))
+                file=filename, command=(await utils.get_command(self.bot, group=self.mods.name,
+                                                                name=self._install.name)).mention))
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        patterns = [r'^(?P<package>.+?)_v(?P<version>\d+(?:\.\d+)+)\.zip$']
+        if not ServerUploadHandler.is_valid(message, patterns=patterns, roles=self.bot.roles['DCS Admin']):
+            return
+        try:
+            server = await ServerUploadHandler.get_server(message)
+            if not server:
+                return
+
+            ctx = await self.bot.get_context(message)
+            folder = await utils.selection(
+                ctx,
+                title="Where do you want to upload the mod?",
+                options=[
+                    SelectOption(label="SavedGames", value="SavedGames"),
+                    SelectOption(label="RootFolder", value="RootFolder"),
+                ]
+            )
+            if not folder:
+                await message.channel.send(_("Aborted."))
+                return
+
+            handler = ServerUploadHandler(server=server, message=message, patterns=patterns)
+            config = self.service.get_config(server)
+            base_dir = os.path.expandvars(config[folder])
+            await handler.upload(base_dir)
+        except Exception as ex:
+            self.log.exception(ex)
+        finally:
+            await message.delete()
 
 
 async def setup(bot: DCSServerBot):

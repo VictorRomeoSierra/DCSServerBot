@@ -1,17 +1,18 @@
 import asyncio
 
-from .node import Node
-from .server import Server
-from .const import Status, Coalition
-
-from ..utils.helper import format_time
+from core import utils
+from core.data.node import Node
+from core.data.server import Server
+from core.data.const import Status, Coalition
+from core.utils.helper import format_time
 
 
 class ServerMaintenanceManager:
-    def __init__(self, node: Node, warn_times: list[int], message: str):
+    def __init__(self, node: Node, *, warn_times: list[int] = None, message: str = None, shutdown: bool = True):
         self.node: Node = node
-        self.warn_times: list[int] = warn_times
-        self.message: str = message
+        self.warn_times: list[int] = warn_times or [120, 60, 10]
+        self.message: str = message or "Server is going down for maintenance in {}"
+        self.shutdown: bool = shutdown
         self.to_start: list[Server] = []
         self.in_maintenance: list[Server] = []
 
@@ -28,26 +29,32 @@ class ServerMaintenanceManager:
 
     async def __aenter__(self):
         tasks = []
-        for instance in self.node.instances:
+        for instance in self.node.instances.values():
             server = instance.server
-            if not server or server.status not in [Status.RUNNING, Status.PAUSED, Status.STOPPED]:
+            if not server or server.status == Status.SHUTDOWN:
                 continue
             if server.maintenance:
                 self.in_maintenance.append(server)
             else:
                 server.maintenance = True
             self.to_start.append(server)
-            tasks.append(asyncio.create_task(self.shutdown_with_warning(server)))
+            if self.shutdown:
+                tasks.append(asyncio.create_task(self.shutdown_with_warning(server)))
         # wait for DCS servers to shut down
         if tasks:
-            await asyncio.gather(*tasks)
+            await utils.run_parallel_nofail(*tasks)
 
     async def __aexit__(self, exc_type, exc_value, traceback):
+        tasks = []
         for server in self.to_start:
             if server not in self.in_maintenance:
                 server.maintenance = False
-            try:
-                # the server was running before (being in maintenance mode), so start it again
-                await server.startup()
-            except (TimeoutError, asyncio.TimeoutError):
-                self.node.log.warning(f'Timeout while starting {server.display_name}, please check it manually!')
+            if self.shutdown:
+                tasks.append(server.startup())
+
+        if tasks:
+            ret = await asyncio.gather(*tasks, return_exceptions=True)
+            for idx in range(0, len(ret)):
+                server = self.to_start[idx]
+                if isinstance(ret[idx], Exception):
+                    self.node.log.error(f'Timeout while starting {server.display_name}, please check it manually!')

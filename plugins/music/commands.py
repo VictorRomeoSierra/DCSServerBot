@@ -1,16 +1,15 @@
 import asyncio
 import discord
 import os
-import psycopg
 
-from core import Plugin, TEventListener, PluginInstallationError, Status, Group, utils, Server, ServiceRegistry, \
-    get_translation, NodeUploadHandler, Channel
+from core import (Plugin, PluginInstallationError, Status, Group, utils, Server, ServiceRegistry, get_translation,
+                  NodeUploadHandler, Channel)
 from discord import app_commands
 from discord.ext import commands
 from pathlib import Path
 from services.bot import DCSServerBot
 from services.music import MusicService
-from typing import Type, Optional
+from typing import Type
 
 from .listener import MusicEventListener
 from .utils import get_tag, Playlist
@@ -30,11 +29,12 @@ async def playlist_autocomplete(interaction: discord.Interaction, current: str) 
     try:
         playlists = await get_all_playlists(interaction)
         return [
-            app_commands.Choice(name=playlist, value=playlist)
+            app_commands.Choice[str](name=playlist, value=playlist)
             for playlist in playlists if not current or current.casefold() in playlist.casefold()
-        ]
+        ][:25]
     except Exception as ex:
         interaction.client.log.exception(ex)
+        return []
 
 
 async def all_songs_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
@@ -44,7 +44,9 @@ async def all_songs_autocomplete(interaction: discord.Interaction, current: str)
         ret = []
         service = ServiceRegistry.get(MusicService)
         music_dir = await service.get_music_dir()
-        _, file_list = await interaction.client.node.list_directory(music_dir, pattern=['*.mp3', '*.ogg'], traverse=True)
+        _, file_list = await interaction.client.node.list_directory(
+            music_dir, pattern=['*.mp3', '*.ogg'], traverse=True
+        )
         for song in file_list:
             if os.path.isdir(song):
                 continue
@@ -52,10 +54,13 @@ async def all_songs_autocomplete(interaction: discord.Interaction, current: str)
             title = os.path.join(os.path.dirname(song_path), get_tag(song).title or os.path.basename(song))
             if current and current.casefold() not in title.casefold():
                 continue
-            ret.append(app_commands.Choice(name=title[:100], value=song_path))
-        return ret[:25]
+            ret.append(app_commands.Choice[str](name=title[:100], value=song_path))
+            if len(ret) == 25:
+                break
+        return ret
     except Exception as ex:
         interaction.client.log.exception(ex)
+        return []
 
 
 async def songs_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
@@ -64,50 +69,52 @@ async def songs_autocomplete(interaction: discord.Interaction, current: str) -> 
     try:
         service = ServiceRegistry.get(MusicService)
         music_dir = await service.get_music_dir()
-        playlist = await Playlist.create(utils.get_interaction_param(interaction, 'playlist'))
+        playlist = await Playlist.create(interaction.namespace.playlist)
         ret = []
         for song in playlist.items:
             title = get_tag(os.path.join(music_dir, song)).title or song
             if current and current.casefold() not in title.casefold():
                 continue
-            ret.append(app_commands.Choice(name=title[:100], value=song))
-        return ret[:25]
+            ret.append(app_commands.Choice[str](name=title[:100], value=song))
+            if len(ret) == 25:
+                break
+        return ret
     except Exception as ex:
         interaction.client.log.exception(ex)
+        return []
 
 
 async def radios_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
     if not await interaction.command._check_can_run(interaction):
         return []
     try:
-        server: Server = await utils.ServerTransformer().transform(
-            interaction, utils.get_interaction_param(interaction, 'server'))
+        server: Server = await utils.ServerTransformer().transform(interaction, interaction.namespace.server)
         if not server:
             return []
         service = ServiceRegistry.get(MusicService)
-        choices: list[app_commands.Choice[str]] = [
-            app_commands.Choice(name=x, value=x) for x in service.get_config(server)['radios'].keys()
+        return [
+            app_commands.Choice[str](name=x, value=x) for x in service.get_config(server)['radios'].keys()
             if not current or current.casefold() in x.casefold()
-        ]
-        return choices[:25]
+        ][:25]
     except Exception as ex:
         interaction.client.log.exception(ex)
+        return []
 
 
-async def subfolder_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+async def subfolder_autocomplete(interaction: discord.Interaction, _current: str) -> list[app_commands.Choice[str]]:
     if not await interaction.command._check_can_run(interaction):
         return []
     try:
         service = ServiceRegistry.get(MusicService)
         music_dir = await service.get_music_dir()
         _, file_list = await interaction.client.node.list_directory(music_dir, is_dir=True, traverse=True)
-        ret: list[app_commands.Choice[str]] = [
-            app_commands.Choice(name=os.path.relpath(folder, music_dir), value=folder)
+        return [
+            app_commands.Choice[str](name=os.path.relpath(folder, music_dir), value=folder)
             for folder in file_list
-        ]
-        return ret[:25]
+        ][:25]
     except Exception as ex:
         interaction.client.log.exception(ex)
+        return []
 
 
 class Music(Plugin[MusicEventListener]):
@@ -120,18 +127,11 @@ class Music(Plugin[MusicEventListener]):
         if not self.service.locals:
             raise PluginInstallationError(plugin=self.plugin_name, reason=r"No config\services\music.yaml found!")
 
-    def get_config(self, server: Optional[Server] = None, *, plugin_name: Optional[str] = None,
-                   use_cache: Optional[bool] = True) -> dict:
+    def get_config(self, server: Server | None = None, *, plugin_name: str | None = None,
+                   use_cache: bool | None = True) -> dict:
         if plugin_name:
             return super().get_config(server, plugin_name=plugin_name, use_cache=use_cache)
         return self.service.get_config(server)
-
-    async def prune(self, conn: psycopg.AsyncConnection, *, days: int = -1, ucids: list[str] = None,
-                    server: Optional[str] = None) -> None:
-        self.log.debug('Pruning Music ...')
-        if server:
-            await conn.execute("DELETE FROM music_radios WHERE server_name = %s", (server, ))
-        self.log.debug('Music pruned.')
 
     # New command group "/music"
     music = Group(name="music", description=_("Commands to manage music in your (DCS) server"))
@@ -150,7 +150,7 @@ class Music(Plugin[MusicEventListener]):
             # noinspection PyUnresolvedReferences
             await interaction.response.send_message(
                 _("You don't have any playlists to play. Please create one with {}.").format(
-                    (await utils.get_command(self.bot, group='playlist', name='add')).mention
+                    (await utils.get_command(self.bot, group=self.plgroup.name, name=self.add.name)).mention
                 ), ephemeral=True)
             return
         view = MusicPlayer(server=_server, radio_name=radio_name, playlists=playlists)
@@ -174,9 +174,9 @@ class Music(Plugin[MusicEventListener]):
     @app_commands.autocomplete(radio_name=radios_autocomplete)
     @app_commands.autocomplete(song=all_songs_autocomplete)
     async def play(self, interaction: discord.Interaction,
-                   server: app_commands.Transform[Server, utils.ServerTransformer(status=[Status.RUNNING,
-                                                                                          Status.PAUSED])],
-                   radio_name: str, playlist: Optional[str] = None, song: Optional[str] = None):
+                   server: app_commands.Transform[Server, utils.ServerTransformer(
+                       status=[Status.RUNNING, Status.PAUSED])],
+                   radio_name: str, playlist: str | None = None, song: str | None = None):
         if server.status != Status.RUNNING:
             # noinspection PyUnresolvedReferences
             await interaction.response.send_message(_('Server {} is not running.').format(server.name), ephemeral=True)
@@ -238,7 +238,7 @@ class Music(Plugin[MusicEventListener]):
     @app_commands.describe(subfolder='Add all songs within a subfolder of the main music directory.')
     @app_commands.autocomplete(playlist=playlist_autocomplete)
     @app_commands.autocomplete(subfolder=subfolder_autocomplete)
-    async def add_all(self, interaction: discord.Interaction, playlist: str, subfolder: Optional[str] = None):
+    async def add_all(self, interaction: discord.Interaction, playlist: str, subfolder: str | None = None):
         ephemeral = utils.get_ephemeral(interaction)
         music_dir = await self.service.get_music_dir()
         if subfolder:
@@ -269,7 +269,7 @@ class Music(Plugin[MusicEventListener]):
     @utils.app_has_role('DCS Admin')
     @app_commands.autocomplete(playlist=playlist_autocomplete)
     @app_commands.autocomplete(song=songs_autocomplete)
-    async def delete(self, interaction: discord.Interaction, playlist: str, song: Optional[str] = None):
+    async def delete(self, interaction: discord.Interaction, playlist: str, song: str | None = None):
         ephemeral = utils.get_ephemeral(interaction)
         p = await Playlist.create(playlist)
         try:
@@ -292,8 +292,8 @@ class Music(Plugin[MusicEventListener]):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        pattern =  ['.mp3', '.ogg']
-        if not NodeUploadHandler.is_valid(message, pattern, self.bot.roles['DCS Admin']):
+        patterns =  [r'\.mp3$', r'\.ogg$']
+        if not NodeUploadHandler.is_valid(message, patterns, self.bot.roles['DCS Admin']):
             return
         admin_channels = []
         if self.bot.locals.get('channels', {}).get('admin'):
@@ -304,7 +304,7 @@ class Music(Plugin[MusicEventListener]):
         if message.channel.id not in admin_channels:
             return
         try:
-            handler = NodeUploadHandler(self.node, message, pattern)
+            handler = NodeUploadHandler(self.node, message, patterns)
             base_dir = await self.service.get_music_dir()
             await handler.upload(base_dir)
         except Exception as ex:

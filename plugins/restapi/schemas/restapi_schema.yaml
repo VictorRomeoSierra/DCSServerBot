@@ -5,6 +5,29 @@ mapping:
     type: map
     nullable: false
     mapping:
-      listen: {type: str, pattern: '\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}', nullable: false}
-      port: {type: int, range: {min: 80, max: 65535}, nullable: false}
       prefix: {type: str, nullable: false}
+      api_key: {type: text, nullable: false}
+      endpoints:
+        type: map
+        nullable: false
+        mapping:
+          servers:
+            type: map
+            nullable: false
+            mapping:
+              filter:
+                type: seq
+                nullable: false
+                func: is_server
+                sequence:
+                  - type: str
+                    nullable: false
+                    unique: true
+              include_weather: {type: bool, nullable: false, default: true}
+          server_attendance:
+            type: map
+            nullable: true
+            mapping:
+              enabled: {type: bool, nullable: false, default: true}
+          regex;(.+):
+            type: any

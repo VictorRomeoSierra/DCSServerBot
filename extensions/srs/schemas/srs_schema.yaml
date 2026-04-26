@@ -1,14 +1,37 @@
 schema;node_srs_schema:
   type: map
   nullable: false
-  allowempty: true
   mapping:
-    installation: {type: str, nullable: false, range: {min: 1}, func: file_exists}
-    autoupdate: {type: any, nullable: false, func: bool_or_map, enum: ['autoupdate']}
+    name: {type: str, nullable: false, range: {min: 1}}
+    installation: {type: str, nullable: false, range: {min: 1}, func: dir_exists}
+    autoupdate: {type: bool, nullable: false}
+    use_upnp: {type: bool, nullable: false}
+    auto_affinity:
+      type: map
+      nullable: false
+      mapping:
+        min_cores: {type: int, nullable: false, range: {min: 1, max: 1}}
+        max_cores: {type: int, nullable: false, range: {min: 1, max: 1}}
+        quality: {type: int, nullable: false, range: {min: 0, max: 1}}
+    announce:
+      type: map
+      nullable: false
+      mapping:
+        channel: { type: int, required: true, nullable: false }
+        title: { type: str, nullable: false, range: { min: 1 } }
+        description: { type: str, nullable: false, range: { min: 1 } }
+        footer: { type: str, nullable: false, range: { min: 1 } }
+        mention:
+          type: seq
+          nullable: false
+          sequence:
+            - { type: text, nullable: false }
+    beta: {type: bool, nullable: false}
     autostart: {type: bool, nullable: false}
     host: {type: str, nullable: false, range: {min: 1}}
     minimized: {type: bool, nullable: false}
     debug: {type: bool, nullable: false}
+    gui_server: {type: bool, nullable: false}
     awacs: {type: bool, nullable: false}
     blue_password: {type: str, nullable: false, range: {min: 1}}
     red_password: {type: str, nullable: false, range: {min: 1}}
@@ -19,15 +42,25 @@ schema;node_srs_schema:
     always_on: {type: bool, nullable: false}
     radio_effect_override: {type: bool, nullable: false}
     global_lobby_frequencies: {type: str, nullable: false, range: {min: 1}}
+    instructor_mode: {type: bool, nullable: false}
+
 schema;instance_srs_schema:
   type: map
   nullable: false
-  allowempty: true
   mapping:
     enabled: {type: bool, nullable: false}
+    name: {type: str, nullable: false, range: {min: 1}}
     config: {type: str, required: true, nullable: false}
     host: {type: str, nullable: false, range: {min: 1}}
-    port: {type: int, range: {min: 80, max: 65535}, nullable: false}
+    port: {type: int, nullable: false, func: unique_port}
+    auto_affinity:
+      type: map
+      nullable: false
+      mapping:
+        min_cores: {type: int, nullable: false, range: {min: 1, max: 1}}
+        max_cores: {type: int, nullable: false, range: {min: 1, max: 1}}
+        quality: {type: int, nullable: false, range: {min: 0, max: 1}}
+    gui_server: {type: bool, nullable: false}
     minimized: {type: bool, nullable: false}
     debug: {type: bool, nullable: false}
     awacs: {type: bool, nullable: false}
@@ -41,4 +74,6 @@ schema;instance_srs_schema:
     always_on: {type: bool, nullable: false}
     radio_effect_override: {type: bool, nullable: false}
     global_lobby_frequencies: {type: str, nullable: false, range: {min: 1}}
-    lotatc_export_port: {type: int, range: {min: 80, max: 65535}, nullable: false}
+    lotatc_export_port: {type: int, nullable: false, func: unique_port} # default 10712
+    http_server_enabled: {type: bool, nullable: false}
+    http_server_port: {type: int, nullable: false, func: unique_port} # default 8080

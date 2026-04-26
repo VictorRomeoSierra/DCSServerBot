@@ -7,6 +7,7 @@ import discord
 import json
 import luadata
 import os
+import platform
 import re
 import shutil
 import ssl
@@ -14,27 +15,31 @@ import subprocess
 import sys
 import xml.etree.ElementTree as ET
 
-from core import Extension, utils, Server, ServiceRegistry, get_translation, InstallException
+from core import (utils, Server, ServiceRegistry, get_translation, InstallException, PortType, Port,
+                  InstallableExtension)
 from discord.ext import tasks
 from extensions.srs import SRS
-from packaging import version as ver
+from packaging.version import parse
 from services.bot import BotService
 from services.servicebus import ServiceBus
-from typing import Optional, cast
+from typing import cast
+from typing_extensions import override
 from watchdog.events import FileSystemEventHandler, FileSystemEvent
 from watchdog.observers import Observer
 
 _ = get_translation(__name__.split('.')[1])
 
-ports: dict[int, str] = dict()
 UPDATER_CODE = '4dctdtna'
+MISSION_SCRIPTING = 'dofile(lfs.writedir().."Mods\\services\\LotAtc\\lua utils\\lotatcMissionServer.lua")'
 
 __all__ = [
     "LotAtc"
 ]
 
 
-class LotAtc(Extension, FileSystemEventHandler):
+class LotAtc(InstallableExtension, FileSystemEventHandler):
+    _ports: dict[int, str] = {}
+    _json_ports: dict[int, str] = {}
 
     CONFIG_DICT = {
         "port": {
@@ -43,13 +48,42 @@ class LotAtc(Extension, FileSystemEventHandler):
             "placeholder": _("Unique port number for LotAtc"),
             "required": True,
             "default": 10310
+        },
+        "jsonserver_port": {
+            "type": int,
+            "label": _("JSON Server Port"),
+            "placeholder": _("Unique port number for LotAtc"),
+            "required": False,
+            "default": 8081
+        },
+        "host": {
+            "type": str,
+            "label": _("Hostname Override"),
+            "placeholder": _("Put your DNS name in here, if you have one"),
+            "required": False,
+        },
+        "autoupdate": {
+            "type": bool,
+            "label": _("Auto-update LotAtc"),
+            "default": True
+        },
+        "show_passwords": {
+            "type": bool,
+            "label": _("Show passwords"),
+            "default": True
         }
     }
 
     def __init__(self, server: Server, config: dict):
         self.home = os.path.join(server.instance.home, 'Mods', 'Services', 'LotAtc')
         super().__init__(server, config)
-        self.observer: Optional[Observer] = None
+        # check version incompatibility
+        if self.version and parse(self.version) >= parse('2.5.0') and sys.platform == 'win32':
+            winver = platform.win32_ver()
+            if winver[1] == '10.0.14393' and 'Server' in winver[3]:
+                raise InstallException("LotAtc 2.5+ does not run on Windows Server 2016 anymore!")
+
+        self.observer: Observer | None = None
         self.bus = ServiceRegistry.get(ServiceBus)
         self.gcis = {
             "blue": {},
@@ -57,7 +91,8 @@ class LotAtc(Extension, FileSystemEventHandler):
         }
         atexit.register(self.stop_observer)
 
-    def load_config(self) -> Optional[dict]:
+    @override
+    def load_config(self) -> dict:
         cfg = {}
         for path in [os.path.join(self.home, 'config.lua'), os.path.join(self.home, 'config.custom.lua')]:
             try:
@@ -74,14 +109,12 @@ class LotAtc(Extension, FileSystemEventHandler):
     def get_inst_path(self) -> str:
         inst_path = os.path.join(
             os.path.expandvars(self.config.get('installation', os.path.join('%ProgramFiles%', 'LotAtc'))))
-        if os.path.exists(inst_path):
-            return inst_path
-        else:
-            raise InstallException(f"Can't find the {self.name} installation dir, "
-                                   "please specify it manually in your nodes.yaml!")
+        return inst_path
 
+    @override
     async def prepare(self) -> bool:
-        global ports
+        if not await super().prepare():
+            return False
 
         await self.update_instance(False)
         config = self.config.copy()
@@ -115,13 +148,42 @@ class LotAtc(Extension, FileSystemEventHandler):
                 outfile.write((f"lotatc_inst.options = " + luadata.serialize(self.locals, indent='\t',
                                                                              indent_level=0)).encode('utf-8'))
             self.log.debug(f"  => New {path} written.")
+
         port = self.locals.get('port', 10310)
-        if port in ports and ports[port] != self.server.name:
-            self.log.error(f"  => {self.server.name}: {self.name} port {port} already in use by server {ports[port]}!")
+        if type(self)._ports.get(port, self.server.name) != self.server.name:
+            self.log.error(
+                f"  => {self.server.name}: {self.name} port {port} already in use by server {type(self)._ports[port]}!")
             return False
         else:
-            ports[port] = self.server.name
-        return await super().prepare()
+            type(self)._ports[port] = self.server.name
+
+        if self.locals.get('use_jsonserver', False):
+            json_port = self.locals.get('jsonserver_port', 8081)
+            if type(self)._json_ports.get(json_port, self.server.name) != self.server.name:
+                self.log.error(
+                    f"  => {self.server.name}: {self.name} jsonserver_port {json_port} already in use by "
+                    f"server {type(self)._json_ports[json_port]}!")
+                return False
+
+            type(self)._json_ports[json_port] = self.server.name
+            filename = os.path.join(self.node.installation, 'Scripts', 'MissionScripting.lua')
+            with open(filename, mode='r', encoding='utf-8') as infile:
+                orig = infile.readlines()
+            update_needed = True
+            start = -1
+            for idx, line in enumerate(orig):
+                if "dofile('Scripts/ScriptingSystem.lua')" in line:
+                    start = idx
+                elif MISSION_SCRIPTING in line:
+                    update_needed = False
+
+            if update_needed:
+                orig.insert(start + 1, MISSION_SCRIPTING + "\n")
+                with open(filename, mode='w', encoding='utf-8') as outfile:
+                    outfile.writelines(orig)
+                self.log.info(f"  => {self.name}: MissionScripting.lua amended.")
+
+        return True
 
     # File Event Handlers
     def process_stats_file(self, path: str):
@@ -159,40 +221,43 @@ class LotAtc(Extension, FileSystemEventHandler):
             self.log.exception(ex)
             pass
 
+    @override
     def on_moved(self, event: FileSystemEvent):
         self.process_stats_file(event.dest_path)
 
+    @override
     @property
     def version(self) -> str:
         return utils.get_windows_version(os.path.join(self.home, r'bin', 'lotatc.dll'))
 
-    async def render(self, param: Optional[dict] = None) -> dict:
-        if self.locals:
-            host = self.config.get('host', self.node.public_ip)
-            value = f"{host}:{self.locals.get('port', 10310)}"
-            show_passwords = self.config.get('show_passwords', True)
-            blue = self.locals.get('blue_password', '')
-            red = self.locals.get('red_password', '')
-            if show_passwords and (blue or red):
-                value += f"\n🔹 Pass: {blue}\n🔸 Pass: {red}"
-            return {
-                "name": "LotAtc",
-                "version": self.version,
-                "value": value
-            }
-        else:
-            return {}
+    @override
+    async def render(self, param: dict | None = None) -> dict:
+        if not self.locals:
+            raise NotImplementedError()
 
+        host = self.config.get('host', self.node.public_ip)
+        value = f"{host}:{self.locals.get('port', 10310)}"
+        show_passwords = self.config.get('show_passwords', True)
+        blue = self.locals.get('blue_password', '')
+        red = self.locals.get('red_password', '')
+        if show_passwords and (blue or red):
+            value += f"\n🔹 Pass: {blue}\n🔸 Pass: {red}"
+        return {
+            "name": self.name,
+            "version": self.version,
+            "value": value
+        }
+
+    @override
     def is_installed(self) -> bool:
-        if not super().is_installed():
-            return False
         if (not os.path.exists(os.path.join(self.home, 'bin', 'lotatc.dll')) or
                 not os.path.exists(os.path.join(self.home, 'config.lua'))):
             self.log.error(f"  => {self.server.name}: Can't load extension, LotAtc not correctly installed.")
             return False
         return True
 
-    async def startup(self) -> bool:
+    @override
+    async def startup(self, *, quiet: bool = False) -> bool:
         path = os.path.join(self.home, 'stats.json')
         if os.path.exists(path):
             self.process_stats_file(path)
@@ -207,46 +272,46 @@ class LotAtc(Extension, FileSystemEventHandler):
             self.observer.join(timeout=10)
             self.observer = None
 
-    def shutdown(self) -> bool:
+    @override
+    def shutdown(self, *, quiet: bool = False) -> bool:
         super().shutdown()
         self.stop_observer()
         return True
 
+    @override
     def is_running(self) -> bool:
         return self.observer is not None
 
     def get_inst_version(self) -> tuple[str, str]:
         path = os.path.join(self.get_inst_path(), 'server')
         versions = os.listdir(path)
-        major_version = max(versions, key=ver.parse)
+        major_version = max(versions, key=parse)
         path = os.path.join(path, major_version, 'Mods', 'services', 'LotAtc', 'bin')
         version = utils.get_windows_version(os.path.join(path, 'LotAtc.dll'))
         return major_version, version
 
-    async def check_for_updates(self) -> Optional[str]:
+    @override
+    async def get_latest_version(self) -> str | None:
         async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(
                 ssl=ssl.create_default_context(cafile=certifi.where()))) as session:
-            async with session.get(f"https://tinyurl.com/{UPDATER_CODE}") as response:
+            async with session.get(f"https://tinyurl.com/{UPDATER_CODE}", proxy=self.node.proxy,
+                                   proxy_auth=self.node.proxy_auth) as response:
                 if response.status in [200, 302]:
                     root = ET.fromstring(await response.text(encoding='utf-8'))
                     for package in root.findall('.//PackageUpdate'):
                         name = package.find('Name')
-                        if name is not None and name.text == 'com.lotatc.server':
+                        if name is not None and name.text == 'com.lotatc.server.server23':
                             version = package.find('Version')
                             if version is not None:
-                                break
-                    else:
-                        return None
-                    _, inst_version = self.get_inst_version()
-                    if version.text != inst_version:
-                        return version.text
-                    return None
+                                return version.text
+        return self.get_inst_version()[1]
 
     def do_update(self):
         cwd = self.get_inst_path()
         exe_path = os.path.join(cwd, 'LotAtc_updater.exe')
         args = ['-c', 'up']
         if sys.platform == 'win32':
+            # noinspection PyUnresolvedReferences
             ctypes.windll.shell32.ShellExecuteW(
                 None, "runas", exe_path, ' '.join(args), None, 1)
         else:
@@ -257,21 +322,42 @@ class LotAtc(Extension, FileSystemEventHandler):
         major_version, version = self.get_inst_version()
         if version != self.version:
             if force or self.config.get('autoupdate', False):
-                await self.uninstall()
-                await self.install()
-                return True
+                if await self.uninstall():
+                    return await self.install(version)
+                return False
             else:
-                self.log.info(f"  => {self.name}: Instance {self.server.instance.name} is running version "
-                              f"{self.version}, where {version} is available!")
+                self.log.warning(f"  => {self.name}: Instance {self.server.instance.name} is running version "
+                                 f"{self.version}, where {version} is available!")
         return False
 
-    async def install(self):
+    @override
+    async def update(self, version: str | None = None) -> bool:
+        available = await self.get_latest_version()
+        if available != version:
+            raise InstallException(f"LotAtc {version} is not available!")
+
+        installed = self.get_inst_version()[1]
+        # update the base installation of LotAtc
+        if available != installed:
+            await asyncio.to_thread(self.do_update)
+            installed = self.get_inst_version()[1]
+        # update the mod
+        if installed != self.version:
+            return await self.update_instance(True)
+        self.log.debug(f"  => {self.name}: Instance {self.server.instance.name} is already up to date.")
+        return False
+
+    @override
+    async def install(self, version: str | None = None) -> bool:
         major_version, _ = self.get_inst_version()
         from_path = os.path.join(self.get_inst_path(), 'server', major_version)
         shutil.copytree(from_path, self.server.instance.home, dirs_exist_ok=True)
+        self.locals = self.load_config()
         self.log.info(f"  => {self.name} {self.version} installed into instance {self.server.instance.name}.")
+        return True
 
-    async def uninstall(self):
+    @override
+    async def uninstall(self) -> bool:
         major_version, _ = self.get_inst_version()
         version = self.version
         from_path = os.path.join(self.get_inst_path(), 'server', major_version)
@@ -288,16 +374,17 @@ class LotAtc(Extension, FileSystemEventHandler):
                     try:
                         os.rmdir(dir_y)  # only removes empty directories
                     except OSError:
-                        pass  # directory not empty
+                        pass  # directory is not empty
         self.log.info(f"  => {self.name} {version} uninstalled from instance {self.server.instance.name}.")
+        return True
 
     @tasks.loop(minutes=30)
     async def schedule(self):
         if not self.config.get('autoupdate', False):
             return
         try:
-            version = await self.check_for_updates()
-            if version:
+            version = await self.get_latest_version()
+            if version != self.version:
                 self.log.info(f"A new LotAtc update is available. Updating to version {version} ...")
                 await asyncio.to_thread(self.do_update)
                 self.log.info("LotAtc updated.")
@@ -310,10 +397,10 @@ class LotAtc(Extension, FileSystemEventHandler):
                         "message": f"{self.name} updated to version {version} on node {self.node.name}."
                     }
                 })
-                if isinstance(self.config.get('autoupdate'), dict):
-                    config = self.config.get('autoupdate')
+                config = self.config.get('announce')
+                if config:
                     servers = []
-                    for instance in self.node.instances:
+                    for instance in self.node.instances.values():
                         if (instance.locals.get('extensions', {}).get(self.name) and
                                 instance.locals['extensions'][self.name].get('autoupdate', True)):
                             servers.append(instance.server.display_name)
@@ -342,9 +429,15 @@ class LotAtc(Extension, FileSystemEventHandler):
                         "params": params
                     })
         except Exception as ex:
-            self.log.exception(ex)
+            self.log.error(f"LotAtc update failed: {ex}")
 
-    async def get_ports(self) -> dict:
+    @override
+    def get_ports(self) -> dict[str, Port]:
         return {
-            "LotAtc": self.locals.get('port', 10310)
-        }
+            "LotAtc": Port(self.locals.get('port', 10310), PortType.TCP, public=True),
+            "LotAtc JSON Server Port": Port(self.locals.get('lotatc_inst.options', {}).get('jsonserver_port', 8081), PortType.TCP)
+        } if self.enabled else {}
+
+    @override
+    def is_available(self) -> bool:
+        return os.path.exists(self.get_inst_path())

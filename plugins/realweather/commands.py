@@ -1,45 +1,16 @@
 import discord
-import os
 
-from core import Plugin, command, utils, Status, Server, PluginInstallationError, UnsupportedMizFileException
+from core import Plugin, command, utils, Status, Server, UnsupportedMizFileException
 from discord import app_commands
 from services.bot import DCSServerBot
-from typing import Optional, Type
 
 from .listener import RealWeatherEventListener
 
 
 class RealWeather(Plugin[RealWeatherEventListener]):
-    def __init__(self, bot: DCSServerBot, listener: Type[RealWeatherEventListener] = None):
-        super().__init__(bot, listener)
-        self.installation = self.node.locals.get('extensions', {}).get('RealWeather', {}).get('installation')
-        if not self.installation:
-            raise PluginInstallationError(
-                plugin='RealWeather',
-                reason=f"No configuration found for RealWeather for node {self.node.name} in nodes.yaml"
-            )
-        self.version = utils.get_windows_version(os.path.join(os.path.expandvars(self.installation), 'realweather.exe'))
 
     @staticmethod
-    def generate_config_1_0(airbase: dict, config: dict) -> dict:
-        return {
-            "metar": {
-                "icao": airbase['code']
-            },
-            "options": {
-                "update-weather": True,
-                "update-time": config['time'],
-                "fog": {
-                    "enable": config['fog']
-                },
-                "dust": {
-                    "enable": config['dust']
-                }
-            }
-        }
-
-    @staticmethod
-    def generate_config_2_0(airbase: dict, config: dict) -> dict:
+    def generate_config(airbase: dict, config: dict) -> dict:
         return {
             "options": {
                 "weather": {
@@ -70,12 +41,6 @@ class RealWeather(Plugin[RealWeatherEventListener]):
             }
         }
 
-    def generate_config(self, airbase: dict, config: dict) -> dict:
-        if self.version.split('.')[0] == '1':
-            return self.generate_config_1_0(airbase, config)
-        else:
-            return self.generate_config_2_0(airbase, config)
-
     @command(description='Modify mission with a preset')
     @app_commands.guild_only()
     @app_commands.describe(idx='Select airport as reference')
@@ -85,10 +50,11 @@ class RealWeather(Plugin[RealWeatherEventListener]):
     async def realweather(self, interaction: discord.Interaction,
                           server: app_commands.Transform[Server, utils.ServerTransformer(
                               status=[Status.RUNNING, Status.PAUSED, Status.STOPPED])],
-                          idx: int, wind: Optional[bool] = False, clouds: Optional[bool] = False,
-                          fog: Optional[bool] = False, dust: Optional[bool] = False,
-                          temperature: Optional[bool] = False, pressure: Optional[bool] = False,
-                          time: Optional[bool] = False):
+                          idx: int, use_orig: bool | None = True, wind: bool | None = False,
+                          clouds: bool | None = False,
+                          fog: bool | None = False, dust: bool | None = False,
+                          temperature: bool | None = False, pressure: bool | None = False,
+                          time: bool | None = False):
         ephemeral = utils.get_ephemeral(interaction)
         airbase = server.current_mission.airbases[idx]
         # noinspection PyUnresolvedReferences
@@ -123,7 +89,10 @@ class RealWeather(Plugin[RealWeatherEventListener]):
             try:
                 filename = await server.get_current_mission_file()
                 new_filename = await server.run_on_extension('RealWeather', 'apply_realweather',
-                                                             filename=filename, config=config)
+                                                             filename=filename, config=config, use_orig=use_orig)
+            except ValueError:
+                await msg.edit(content='Could not apply weather, RealWeather extension not loaded.')
+                return
             except (FileNotFoundError, UnsupportedMizFileException):
                 await msg.edit(content='Could not apply weather due to an error in RealWeather.')
                 return
@@ -138,7 +107,11 @@ class RealWeather(Plugin[RealWeatherEventListener]):
                 await server.restart(modify_mission=False)
                 message += '\nMission reloaded.'
             elif result == 'later':
-                server.on_empty = {"command": "load", "mission_file": new_filename, "user": interaction.user}
+                server.on_empty = {
+                    "method": "load",
+                    "mission_file": new_filename,
+                    "user": interaction.user
+                }
                 msg += 'Mission will restart, when server is empty.'
 
             await self.bot.audit("changed weather", server=server, user=interaction.user)

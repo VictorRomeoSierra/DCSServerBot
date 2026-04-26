@@ -1,9 +1,10 @@
 import asyncio
+import inspect
 
 from core import ServiceRegistry, Service, DEFAULT_TAG, utils, Server, Status
 from datetime import datetime
 from discord.ext import tasks
-from typing import Optional
+from zoneinfo import ZoneInfo
 
 from . import actions
 from ..bot import BotService
@@ -28,7 +29,7 @@ class CronService(Service):
             self.schedule.cancel()
             await super().stop()
 
-    def get_config(self, server: Optional[Server] = None) -> dict:
+    def get_config(self, server: Server | None = None, **kwargs) -> dict:
         if not server:
             return self.locals.get(DEFAULT_TAG, {})
         else:
@@ -37,15 +38,18 @@ class CronService(Service):
             else:
                 return self.locals.get(server.instance.name, {})
 
-    async def do_actions(self, config: dict, server: Optional[Server] = None):
-        action = config['action']
+    async def do_actions(self, config: dict, server: Server | None = None):
+        action = config.get('action')
+        if not action:
+            self.log.error("Cron: No action specified.")
+            return
         try:
             func = getattr(actions, action['type'])
             kwargs = action.get("params", {})
             kwargs['node'] = self.node
             if server:
                 kwargs['server'] = server
-            if asyncio.iscoroutinefunction(func):
+            if inspect.iscoroutinefunction(func):
                 await func(**kwargs)
             else:
                 async def _aux_func():
@@ -53,20 +57,26 @@ class CronService(Service):
                 await asyncio.to_thread(_aux_func)
         except AttributeError:
             self.log.error(f"Cron: Action {action} needs to be defined in the DFAULT section.")
+        except TypeError:
+            if not server:
+                self.log.error(f"Cron: Action {action} needs to be defined in an instance-specific section.")
+            else:
+                self.log.error(f"Cron: Action {action} is missing a parameter.")
         except Exception as ex:
-            self.log.error(f"Cron: error while processing action {action}", exc_info=ex)
+            self.log.error(f"Cron: Error while processing action {action}", exc_info=ex)
 
     @tasks.loop(minutes=1)
     async def schedule(self):
-        async def check_run(config: dict, server: Optional[Server] = None):
-            now = datetime.now().replace(second=0, microsecond=0)
+        async def check_run(config: dict, server: Server | None = None):
+            timezone = config.get("timezone")
+            tz = ZoneInfo(timezone) if timezone else None
+            now = datetime.now(tz=tz).replace(second=0, microsecond=0)
             for cfg in config['actions']:
                 if 'cron' in cfg and not utils.matches_cron(now, cfg['cron']):
                     continue
                 elif (server and 'mission_time' in cfg and
                       server.current_mission.mission_time < cfg['mission_time'] * 60):
                     continue
-                # noinspection PyAsyncCall
                 asyncio.create_task(self.do_actions(cfg, server))
 
         try:

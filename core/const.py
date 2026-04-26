@@ -1,5 +1,6 @@
 import os
 import sys
+
 if sys.platform == 'win32':
     import winreg
 
@@ -10,10 +11,16 @@ __all__ = [
     "MMHG_IN_HPA",
     "QFE_TO_QNH_INHG",
     "QFE_TO_QNH_MB",
+    "MAX_SAFE_INTEGER",
     "WEEKDAYS",
     "MONTH",
+    "TRAFFIC_LIGHTS",
     "SAVED_GAMES",
-    "DEFAULT_TAG"
+    "DEFAULT_TAG",
+    "SEND_ONLY_CHANNEL_PERMISSIONS",
+    "SEND_ONLY_WITH_EMBEDS_PERMISSIONS",
+    "DEFAULT_CHANNEL_PERMISSIONS",
+    "FULL_MANAGE_CHANNEL_PERMISSIONS",
 ]
 
 METER_IN_FEET = 3.28084
@@ -23,7 +30,7 @@ MMHG_IN_INHG = 0.0393701
 MMHG_IN_HPA = 1.333224
 QFE_TO_QNH_INHG = 0.00107777777777778
 QFE_TO_QNH_MB = 0.03662667
-
+MAX_SAFE_INTEGER = 9007199254740991 # Lua 5.1 max integer representation, 2^253 - 1
 
 WEEKDAYS = {
     0: 'Mon',
@@ -50,6 +57,12 @@ MONTH = {
     12: 'December'
 }
 
+TRAFFIC_LIGHTS = {
+    "red": "https://assets.digital.cabinet-office.gov.uk/media/559fbe1940f0b6156700004d/traffic-light-red.jpg",
+    "amber": "https://assets.digital.cabinet-office.gov.uk/media/559fbe48ed915d1592000048/traffic-light-amber.jpg",
+    "green": "https://assets.digital.cabinet-office.gov.uk/media/559fbe3e40f0b6156700004f/traffic-light-green.jpg"
+}
+
 SAVED_GAMES = os.path.expandvars(os.path.join('%USERPROFILE%', 'Saved Games'))
 if not os.path.exists(SAVED_GAMES) and sys.platform == 'win32':
     SAVED_GAMES = winreg.QueryValueEx(
@@ -59,3 +72,24 @@ if not os.path.exists(SAVED_GAMES) and sys.platform == 'win32':
     )[0]
 
 DEFAULT_TAG = 'DEFAULT'
+
+SEND_ONLY_CHANNEL_PERMISSIONS = {
+    "view_channel",
+    "send_messages",
+    "read_messages",
+    "read_message_history",
+    "add_reactions",
+}
+
+SEND_ONLY_WITH_EMBEDS_PERMISSIONS = SEND_ONLY_CHANNEL_PERMISSIONS | {
+    "attach_files",
+    "embed_links",
+}
+
+DEFAULT_CHANNEL_PERMISSIONS = SEND_ONLY_WITH_EMBEDS_PERMISSIONS | {
+    "manage_messages",
+}
+
+FULL_MANAGE_CHANNEL_PERMISSIONS = DEFAULT_CHANNEL_PERMISSIONS | {
+    "manage_channel",
+}

@@ -10,11 +10,12 @@ import psycopg
 import sys
 
 from abc import ABC, abstractmethod
+from contextlib import suppress
 from core import utils, Channel
-from discord import Interaction, SelectOption
+from discord import Interaction, SelectOption, ButtonStyle
 from discord.ui import View, Button, Select, Item
 from discord.utils import MISSING
-from typing import Optional, TYPE_CHECKING, Any, cast, Union
+from typing import TYPE_CHECKING, Any, cast
 
 from .elements import ReportElement
 from .env import ReportEnv
@@ -41,6 +42,7 @@ class Report:
         self.apool = bot.apool
         self.env = ReportEnv(bot)
         self.filename, self.report_def = self.load_report_def(plugin, filename)
+        self.env.report = self.filename
 
     def load_report_def(self, plugin: str, filename: str):
         default = f'./plugins/{plugin}/reports/{filename}'
@@ -79,13 +81,23 @@ class Report:
         env.params['bot'] = self.bot
 
         # Create an embed with optional color
-        embed_color = getattr(discord.Color, report_def.get('color', 'blue'), discord.Color.blue)()
+        embed_color = getattr(discord.Color, utils.format_string(report_def.get('color', 'blue'), **env.params),
+                              discord.Color.blue)()
         env.embed = discord.Embed(color=embed_color)
 
         # Predefine keys that need formatting and apply transformations
         formatted_keys = {
             'title': {'max_length': 256, 'setter': lambda val: setattr(env.embed, 'title', val)},
             'description': {'max_length': 4096, 'setter': lambda val: setattr(env.embed, 'description', val)},
+            'author': {'max_length': 256, 'setter': lambda val: env.embed.set_author(
+                name=val, url=env.embed.author.url, icon_url=env.embed.author.icon_url)
+            },
+            'author_url': {'setter': lambda val: env.embed.set_author(
+                name=env.embed.author.name, url=val, icon_url=env.embed.author.icon_url)
+            },
+            'author_icon': {'setter': lambda val: env.embed.set_author(
+                name=env.embed.author.name, url=env.embed.author.url, icon_url=val)
+            },
             'url': {'setter': lambda val: setattr(env.embed, 'url', val)},
             'img': {'setter': lambda val: env.embed.set_thumbnail(url=val)},
             'footer': {
@@ -148,7 +160,8 @@ class Report:
                            exc_info=True)
             raise
 
-    def _resolve_element_class_and_args(self, element, params):
+    @staticmethod
+    def _resolve_element_class_and_args(element, params):
         """
         Resolves the class and arguments for a given element.
         """
@@ -175,12 +188,31 @@ class Report:
 
         return element_class, element_args
 
-    def _filter_args(self, args, method):
+    @staticmethod
+    def _filter_args(args: dict, method):
         """
-        Filters arguments based on a method's signature, ensuring compatibility.
+        Return a dictionary of arguments that can safely be passed to *method*.
+
+        * If *method* declares a ``**kwargs`` parameter, **every** key in *args*
+          is passed through – the method is willing to accept arbitrary
+          keyword arguments.
+        * Otherwise only the names that appear in the method’s signature are
+          kept.  Everything else is discarded (or, if you prefer, you could
+          raise an exception instead of silently dropping it).
         """
-        signature = inspect.signature(method).parameters
-        return {name: value for name, value in args.items() if name in signature}
+        # Grab the signature once; we only need the mapping of names → Parameter.
+        sig = inspect.signature(method)
+        params = sig.parameters  # dict: name → Parameter
+
+        # Look for a VAR_KEYWORD (**kwargs) parameter.
+        has_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+        if has_kwargs:
+            # The function can swallow any keyword arguments.
+            return args
+
+        # No **kwargs – filter out anything not explicitly named.
+        return {k: v for k, v in args.items() if k in params}
 
 
 class Pagination(ABC):
@@ -198,7 +230,7 @@ class PaginationReport(Report):
         ...
 
     def __init__(self, interaction: discord.Interaction, plugin: str, filename: str,
-                 pagination: Optional[list] = None, keep_image: bool = False):
+                 pagination: list | None = None, keep_image: bool = False):
         super().__init__(interaction.client, plugin, filename)
         self.interaction = interaction
         self.pagination = pagination
@@ -206,7 +238,7 @@ class PaginationReport(Report):
         if 'pagination' not in self.report_def:
             raise PaginationReport.NoPaginationInformation
 
-    async def read_param(self, param: dict, **kwargs) -> tuple[str, list]:
+    async def read_param(self, param: dict, **kwargs) -> tuple[str, list[str]]:
         name = param['name']
         values = None
         if 'sql' in param:
@@ -229,7 +261,7 @@ class PaginationReport(Report):
     class PaginationReportView(View):
         def __init__(self, name, values, index, func, keep_image: bool, *args, **kwargs):
             super().__init__()
-            self.log = logging.getLogger(__name__)
+            self.log = logging.getLogger(f"{self.__class__.__module__}.{self.__class__.__name__}")
             self.name = name
             self.values = values
             self.index = index
@@ -261,11 +293,11 @@ class PaginationReport(Report):
             for child, new_state in zip(target_children, new_states):
                 child.disabled = new_state
 
-        async def render(self, value) -> ReportEnv:
+        async def render(self, value: str) -> ReportEnv:
             self.kwargs[self.name] = value if value != 'All' else None
             return await self.func(*self.args, **self.kwargs)
 
-        async def paginate(self, value, interaction: discord.Interaction):
+        async def paginate(self, value: str, interaction: discord.Interaction):
             # noinspection PyUnresolvedReferences
             await interaction.response.defer()
             env = await self.render(value)
@@ -297,27 +329,32 @@ class PaginationReport(Report):
             self.index = int(select.values[0])
             await self.paginate(self.values[self.index], interaction)
 
-        @discord.ui.button(label="<<", style=discord.ButtonStyle.secondary)
+        # noinspection PyTypeChecker
+        @discord.ui.button(label="<<", style=ButtonStyle.secondary)
         async def on_start(self, interaction: Interaction, _: Button):
             self.index = 0
             await self.paginate(self.values[self.index], interaction)
 
-        @discord.ui.button(label="Back", style=discord.ButtonStyle.primary)
+        # noinspection PyTypeChecker
+        @discord.ui.button(label="Back", style=ButtonStyle.primary)
         async def on_left(self, interaction: Interaction, _: Button):
             self.index -= 1
             await self.paginate(self.values[self.index], interaction)
 
-        @discord.ui.button(label="Next", style=discord.ButtonStyle.primary)
+        # noinspection PyTypeChecker
+        @discord.ui.button(label="Next", style=ButtonStyle.primary)
         async def on_right(self, interaction: Interaction, _: Button):
             self.index += 1
             await self.paginate(self.values[self.index], interaction)
 
-        @discord.ui.button(label=">>", style=discord.ButtonStyle.secondary)
+        # noinspection PyTypeChecker
+        @discord.ui.button(label=">>", style=ButtonStyle.secondary)
         async def on_end(self, interaction: Interaction, _: Button):
             self.index = len(self.values) - 1
             await self.paginate(self.values[self.index], interaction)
 
-        @discord.ui.button(label="Quit", style=discord.ButtonStyle.red)
+        # noinspection PyTypeChecker
+        @discord.ui.button(label="Quit", style=ButtonStyle.red)
         async def on_cancel(self, interaction: Interaction, _: Button):
             self.index = -1
             # noinspection PyUnresolvedReferences
@@ -372,26 +409,23 @@ class PaginationReport(Report):
                 await view.wait()
             else:
                 message = None
+            return self.env
         except Exception:
             self.log.error(f"Exception while processing report {self.filename}!")
             raise
         finally:
-            try:
-                if message:
+            if message:
+                with suppress(discord.NotFound):
                     await message.delete()
-            except discord.NotFound:
-                pass
-        return self.env
-
 
 class PersistentReport(Report):
 
     def __init__(self, bot: DCSServerBot, plugin: str, filename: str, *, embed_name: str,
-                 channel_id: Optional[Union[Channel, int]] = Channel.STATUS, server: Optional[Server] = None):
+                 channel_id: Channel | int | None = Channel.STATUS, server: Server | None = None):
         super().__init__(bot, plugin, filename)
         self.server = server
         self.embed_name: str = embed_name
-        self.channel_id: Union[Channel, int] = channel_id
+        self.channel_id: Channel | int = channel_id
 
     async def render(self, *args, **kwargs) -> ReportEnv:
         env = None
@@ -406,7 +440,7 @@ class PersistentReport(Report):
             msg = f"Exception while processing report {self.filename}!"
             if self.server:
                 msg += f' for server {self.server.name}'
-            self.log.error(msg)
+            self.log.error(msg, exc_info=True)
             raise
         finally:
             if env and env.filename:

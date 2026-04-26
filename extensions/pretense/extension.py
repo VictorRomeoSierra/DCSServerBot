@@ -3,8 +3,9 @@ import glob
 import os
 import re
 
+from typing_extensions import override
+
 from core import Extension, Server
-from typing import Optional
 
 __all__ = [
     "Pretense"
@@ -12,6 +13,15 @@ __all__ = [
 
 
 class Pretense(Extension):
+
+    CONFIG_DICT = {
+        "randomize": {
+            "type": bool,
+            "label": "Randomize",
+            "default": False,
+            "required": False
+        }
+    }
 
     def __init__(self, server: Server, config: dict):
         super().__init__(server, config)
@@ -22,15 +32,17 @@ class Pretense(Extension):
     async def _set_missions_dir(self):
         self.missions_dir = await self.server.get_missions_dir()
 
+    @override
     async def prepare(self) -> bool:
         if self.locals.get('randomize', False):
             path = os.path.join(self.missions_dir, 'Saves')
             os.makedirs(path)
             open(os.path.join(path, 'randomize.lua'), 'w').close()
-        return True
+        return await super().prepare()
 
+    @override
     @property
-    def version(self) -> Optional[str]:
+    def version(self) -> str | None:
         if not self._version:
             if not self.missions_dir:
                 return None
@@ -43,9 +55,18 @@ class Pretense(Extension):
             self._version = _version[0] if _version else None
         return self._version
 
-    async def render(self, param: Optional[dict] = None) -> dict:
+    @override
+    async def render(self, param: dict | None = None) -> dict:
         return {
-            "name": self.__class__.__name__,
+            "name": self.name,
             "version": self.version,
             "value": "enabled"
         }
+
+    @override
+    async def startup(self, *, quiet: bool = False) -> bool:
+        return await super().startup(quiet=True)
+
+    @override
+    def shutdown(self, *, quiet: bool = False) -> bool:
+        return super().shutdown(quiet=True)

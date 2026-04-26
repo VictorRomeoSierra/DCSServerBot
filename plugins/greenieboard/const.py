@@ -1,17 +1,13 @@
 GRADES = {
-    "_OK_": "Perfect pass",
-    "OK": "Reasonable deviations with good corrections",
-    "(OK)": "Fair. Reasonable deviations",
-    "--": "No grade. Below average but safe pass",
-    "B": "Bolter",
-    "WO": "Wave-off",
-    "WOP": "Pattern wave-off",
-    "WOFD": "Wave-off, foul deck",
-    "OWO": "Own wave-off",
-    "TWO": "Technique wave-off",
-    "LIG": "Long in the groove",
-    "NC": "No count",
-    "C": "Cut. Unsafe, gross deviations inside wave-off window"
+    "_OK_": {"rating": 5, "grade": "Perfect pass", "legend": "PERFECT"},
+    "OK": {"rating": 4, "grade": "Minimum deviation with good correction", "color": "#29C248", "legend": "OK"},
+    "(OK)": {"rating": 3, "grade": "Reasonable deviation with avg. correction", "color": "#F2C038", "legend": "FAIR"},
+    "B": {"rating": 2.5, "grade": "No wire-catch, go-around needed", "color": '#088199', "legend": "BOLTER"},
+    "--": {"rating": 2, "grade": "No grade. Below average corrections but safe pass", "color": "#73481d", "legend": "NO GRADE"},
+    "WO": {"rating": 1, "grade": "Wave-off", "color": "#000000", "legend": "WAVE OFF"},
+    "C": {"rating": 0, "grade": "Cut. Unsafe, gross deviations inside the wave-off window", "color": "#CC0000", "legend": "CUT"},
+    "NC": {"rating": 0, "grade": "No count", "color": "#FFFFFF", "legend": "NO COUNT"},
+    "_n": {"color": "#000000", "legend": "Night pass"}
 }
 
 ERRORS = {
@@ -112,38 +108,4 @@ DISTANCE_MARKS = {
     "LC": "Level crossing (V/STOL)",
     "IW": "In the wires",
     "AW": "All the way"
-}
-
-DAY_EMOJIS = {
-    "_OK_": "🦄",
-    "OK": "🟩",
-    "(OK)": "🟨",
-    "--": "🟫",
-    "NC": "⬜",
-    "B": "🟦",
-    "TWO": "🟥",
-    "WOP": "🟥",
-    "WOFD": "🟥",
-    "OWO": "🟥",
-    "WO": "🟥",
-    "LIG": "🟥",
-    "C":  "⬛",
-    None: "⬛"
-}
-
-NIGHT_EMOJIS = {
-    "_OK_": "🦄",
-    "OK": "🟢",
-    "(OK)": "🟡",
-    "--": "🟤",
-    "NC": "⚪",
-    "B": "🔵",
-    "TWO": "🔴",
-    "WOP": "🔴",
-    "WOFD": "🔴",
-    "OWO": "🔴",
-    "WO": "🔴",
-    "LIG": "🔴",
-    "C": "⚫",
-    None: "⚫"
 }

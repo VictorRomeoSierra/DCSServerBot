@@ -7,7 +7,6 @@ from core import Plugin, utils, command, get_translation
 from discord import app_commands
 from discord.ext import tasks
 from services.bot import DCSServerBot
-from typing import Type
 
 _ = get_translation(__name__.split('.')[1])
 
@@ -56,4 +55,5 @@ class DBExporter(Plugin):
 
 
 async def setup(bot: DCSServerBot):
+    bot.log.warning(_("The DBExporter plugin is deprecated. Please use Backup or RestAPI instead."))
     await bot.add_cog(DBExporter(bot))

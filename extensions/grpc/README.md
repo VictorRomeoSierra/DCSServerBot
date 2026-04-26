@@ -4,16 +4,25 @@ already. It has some differences though and comes with some other tools. This sa
 without issues.
 
 ## Configuration
-The extension itself allows you to configure your DCS-gRPC server from your instance configurations like with any other
-extension:
+You can use `/extension enable <gRPC>` to enable the extension.
+This will add an entry in your `nodes.yaml` like so:
 ```yaml
 MyNode:
   # [...]
   instances:
-    DCS.release_server:
+    DCS.dcs_serverrelease:
       # [...]
       extensions:
         gRPC:
           enabled: true
-          port: 50051     # you can set any configuration parameter here, that will be replaced in your dcs-grpc.lua file.
+          autoupdate: true  # auto-update DCS-gRPC to the latest version from GitHub
+          port: 50051       # you can set any configuration parameter here, that will be replaced in your dcs-grpc.lua file.
 ```
+
+> [!TIP]
+> You can rename the gRPC extension in your server status embed by setting a "name" in the configuration like so:
+> ```yaml
+> extension:
+>   gRPC:
+>     name: MyFancyName  # Optional: default is "DCS-gRPC"
+> ```

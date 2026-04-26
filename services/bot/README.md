@@ -11,7 +11,7 @@ requirements:
 token: SECRET DISCORD TOKEN COMES HERE          # Your TOKEN, as received from the discord developer portal.
 owner: 1122334455667788                         # The ID of your bot user. Right click, select "Copy User ID".
 command_prefix: .                               # Optional: only used for the commands plugin       
-automatch: true                                 # Use the bots auto-matching functionality (see below), default is true.
+automatch: true                                 # Use the bots auto-matching functionality (see below), default is false.
 autoban: false                                  # Use the bots auto-ban functionality (see below), default is false.
 autorole:                                       # Automatically give roles to people, depending on conditions (see below). The roles need to be set up in your Discord server.
   on_join: Member                               # Give anyone the "Member" role, if they join your Discord.
@@ -46,7 +46,7 @@ roles:                                          # Roles mapping. The bot uses in
 
 > [!TIP]
 > The bot will remove the Discord token on the first startup from your bot.yaml.<br>
-> If you want to replace the token later, just re-add the line into your bot.yaml and DCSServerBot will replace the 
+> If you want to replace the token later, re-add the line into your bot.yaml and DCSServerBot will replace the 
 > internal token with this one.
 
 ## Non-Discord Installations
@@ -72,4 +72,4 @@ respective commands that are allowed for this role.
 
 > [!IMPORTANT]
 > You might get some warnings and errors because of missing information like channels etc. in your bot.
-> And you can not use any plugin that is only meant to display data in Discord like FunkMan or Greenieboard.
+> You also cannot use any plugin only meant to display data in Discord like FunkMan or Greenieboard.

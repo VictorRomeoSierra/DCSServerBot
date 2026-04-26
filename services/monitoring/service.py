@@ -5,6 +5,7 @@ import ctypes
 import logging
 import os
 import psutil
+import psycopg
 import shutil
 import sys
 
@@ -15,12 +16,12 @@ if sys.platform == 'win32':
     import win32process
     from minidump.utils.createminidump import create_dump, MINIDUMP_TYPE
 
-from datetime import datetime, timezone
-from discord.ext import tasks
-
-from core import Status, Server, ServerImpl, Autoexec, utils
+from core import Status, Server, ServerImpl, Autoexec, utils, InstanceImpl
 from core.services.base import Service
 from core.services.registry import ServiceRegistry
+from datetime import datetime, timezone
+from discord.ext import tasks
+from typing import cast
 
 from ..servicebus import ServiceBus
 from ..bot import BotService
@@ -29,11 +30,10 @@ __all__ = [
     "MonitoringService"
 ]
 
-last_wait_time = 0
-
 
 @ServiceRegistry.register(depends_on=[ServiceBus])
 class MonitoringService(Service):
+
     def __init__(self, node):
         super().__init__(node, name="Monitoring")
         self.bus = ServiceRegistry.get(ServiceBus)
@@ -44,19 +44,22 @@ class MonitoringService(Service):
 
     async def start(self):
         await super().start()
-        install_drive = os.path.splitdrive(os.path.expandvars(self.node.locals['DCS']['installation']))[0]
-        self.space_warning_sent[install_drive] = False
-        self.space_alert_sent[install_drive] = False
-        if install_drive != 'C:':
-            self.space_warning_sent['C:'] = False
-            self.space_alert_sent['C:'] = False
+        if sys.platform == 'win32' and 'DCS' in self.node.locals:
+            install_drive = os.path.splitdrive(os.path.expandvars(self.node.locals['DCS']['installation']))[0]
+            self.space_warning_sent[install_drive] = False
+            self.space_alert_sent[install_drive] = False
+            if install_drive != 'C:':
+                self.space_warning_sent['C:'] = False
+                self.space_alert_sent['C:'] = False
         self.check_autoexec()
+        self.monitoring.add_exception_type(psycopg.DatabaseError)
         self.monitoring.start()
         if self.get_config().get('time_sync', False):
             time_server = self.get_config().get('time_server', None)
             if time_server:
                 if sys.platform == 'win32':
                     try:
+                        # noinspection PyUnresolvedReferences
                         retval = ctypes.windll.shell32.ShellExecuteW(
                             None,
                             "runas", 'w32tm', f'/config /manualpeerlist:{time_server} /syncfromflags:MANUAL',
@@ -84,9 +87,9 @@ class MonitoringService(Service):
         await super().stop()
 
     def check_autoexec(self):
-        for instance in self.node.instances:
+        for instance in self.node.instances.values():
             try:
-                cfg = Autoexec(instance)
+                cfg = Autoexec(cast(InstanceImpl, instance))
                 if cfg.crash_report_mode is None:
                     self.log.info('  => Adding crash_report_mode = "silent" to autoexec.cfg')
                     cfg.crash_report_mode = 'silent'
@@ -104,8 +107,7 @@ class MonitoringService(Service):
         }
         if 'server' in kwargs:
             params['server'] = kwargs['server'].name
-        else:
-            params['node'] = self.node.name
+
         await self.bus.send_to_node({
             "command": "rpc",
             "service": BotService.__name__,
@@ -141,12 +143,17 @@ class MonitoringService(Service):
                     if child_windows:
                         # Press the OK button
                         ok_button_handle = child_windows[0]
+                        # noinspection PyUnresolvedReferences
                         win32api.SendMessage(ok_button_handle, win32con.BM_CLICK, 0, 0)
                         return
 
                 _, pid = win32process.GetWindowThreadProcessId(handle)
                 for server in [x for x in self.bus.servers.values() if not x.is_remote]:
                     if server.process and server.process.pid == pid:
+                        if server.maintenance:
+                            self.log.warning(f"Popup with title \"{title}\" ignored on server {server.name} due to "
+                                             f"maintenance mode.")
+                            return
                         await server.shutdown(force=True)
                         await self.node.audit(f'Server killed due to a popup with title "{title}".',
                                               server=server)
@@ -161,12 +168,16 @@ class MonitoringService(Service):
                 try:
                     filename = os.path.join(server.instance.home, 'Logs',
                                             f"{now.strftime('dcs-%Y%m%d-%H%M%S')}.dmp")
+
+                    # Save all handlers before create_dump
+                    root = logging.getLogger()
+                    saved_handlers = root.handlers[:]
+
                     await asyncio.to_thread(create_dump, server.process.pid, filename,
                                             MINIDUMP_TYPE.MiniDumpNormal, True)
 
-                    root = logging.getLogger()
-                    if root.handlers:
-                        root.removeHandler(root.handlers[0])
+                    # Restore the original loggers
+                    root.handlers = saved_handlers
                 except OSError:
                     self.log.debug("No minidump created due to an error (Linux?).")
             shutil.copy2(os.path.join(server.instance.home, 'Logs', 'dcs.log'),
@@ -185,12 +196,12 @@ class MonitoringService(Service):
             # don't test remote servers or servers that are not initialized or shutdown
             if server.is_remote or server.status in [Status.UNREGISTERED, Status.SHUTTING_DOWN, Status.SHUTDOWN]:
                 continue
-            # check if the process is dead (on load it might take some seconds for the process to appear)
+            # check if the process is dead (on loading it might take some seconds for the process to appear)
             if server.process and not await server.is_running():
-                # we do not need to warn, if the server was just launched manually
+                # we do not need to warn if the server was just launched manually
                 if server.maintenance and server.status == Status.LOADING:
                     return
-                # only escalate, if the server was not stopped (maybe the process was manually shut down)
+                # only escalate if the server was not stopped (maybe the process was manually shut down)
                 if server.status != Status.STOPPED:
                     logfile = os.path.join(server.instance.home, 'Logs', 'dcs.log')
                     if os.path.exists(logfile):
@@ -208,7 +219,7 @@ class MonitoringService(Service):
             # No, check if the process is still doing something
             try:
                 await server.keep_alive()
-                # check if server is alive
+                # check if the server is alive
                 if server.status == Status.LOADING:
                     max_hung = int(server.instance.locals.get('max_hung_minutes', 3)) * 2
                 else:
@@ -223,6 +234,9 @@ class MonitoringService(Service):
                         if x.enabled and not await asyncio.to_thread(x.is_running)
                     ]:
                         try:
+                            # double-check as we might have been in the restart phase
+                            if server.status not in [Status.RUNNING, Status.PAUSED]:
+                                break
                             self.log.warning(f"{ext.name} died - restarting ...")
                             await ext.startup()
                         except Exception as ex:
@@ -231,20 +245,17 @@ class MonitoringService(Service):
                 self.log.exception(ex)
 
     async def nodestats(self):
-        global last_wait_time
-
         bus = ServiceRegistry.get(ServiceBus)
         pstats: dict = self.apool.get_stats()
         async with self.apool.connection() as conn:
-            async with conn.transaction():
-                await conn.execute("""
-                    INSERT INTO nodestats (
-                        node, pool_available, requests_queued, requests_wait_ms, dcs_queue, asyncio_queue
-                    )
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                """, (self.node.name, pstats.get('pool_available', 0), pstats.get('requests_queued', 0),
-                      pstats.get('requests_wait_ms', 0), sum(x.qsize() for x in bus.udp_server.message_queue.values()),
-                      len(asyncio.all_tasks(self.bus.loop))))
+            await conn.execute("""
+                INSERT INTO nodestats (
+                    node, pool_available, requests_queued, requests_wait_ms, dcs_queue, asyncio_queue
+                )
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (self.node.name, pstats.get('pool_available', 0), pstats.get('requests_queued', 0),
+                  pstats.get('requests_wait_ms', 0), sum(x.qsize() for x in bus.udp_server.message_queue.values()),
+                  len(asyncio.all_tasks(self.bus.loop))))
         self.apool.pop_stats()
 
     def _pull_load_params(self, server: Server) -> dict:
@@ -315,53 +326,69 @@ class MonitoringService(Service):
                 )
 
         tasks = [process_server(server) for server in self.bus.servers.values()]
-        await asyncio.gather(*tasks)
+        # run in parallel but ignore the exceptions
+        await utils.run_parallel_nofail(*tasks)
 
     @staticmethod
     def convert_bytes(size_bytes: int) -> str:
         scales = ('B', 'KB', 'MB', 'GB', 'TB')
         if size_bytes == 0:
-            return "0B"
+            return "0 B"
         idx = 0
         while size_bytes >= 1024 and idx < len(scales) - 1:
             size_bytes /= 1024.0
             idx += 1
-        return f"{size_bytes:.2f}{scales[idx]}"
+        return f"{size_bytes:.2f} {scales[idx]}"
 
     async def drive_check(self):
+        config = {
+            "warn": 10,
+            "alert": 5,
+            "message": "Available space on drive {drive} has dropped below {pct}%!\n"
+                       "Only {bytes_free} out of {bytes_total} free."
+        } | self.get_config().get('thresholds', {}).get('Drive', {})
         for drive in self.space_warning_sent.keys():
             total, free = utils.get_drive_space(drive)
-            warn_pct = (self.get_config().get('drive_warn_threshold', 10)) / 100
-            alert_pct = (self.get_config().get('drive_alert_threshold', 5)) / 100
-            if (free < total * warn_pct) and not self.space_warning_sent[drive]:
-                message = (f"Your freespace on {drive} is below {warn_pct * 100}%!\n{self.convert_bytes(free)} of "
-                           f"{self.convert_bytes(total)} bytes free.")
-                self.log.warning(message)
-                await self.node.audit(message)
-                self.space_warning_sent[drive] = True
-            if (free < total * alert_pct) and not self.space_alert_sent[drive]:
-                message = (f"Your freespace on {drive} is below {alert_pct * 100}%!\n{self.convert_bytes(free)} of "
-                           f"{self.convert_bytes(total)} bytes free.")
-                self.log.error(message)
-                await self.send_alert(title=f"Your DCS drive on node {self.node.name} is running out of space!",
-                                      message=message)
-                self.space_alert_sent[drive] = True
+            warn_pct = config['warn'] / 100
+            alert_pct = config['alert'] / 100
+            if free < total * alert_pct:
+                if not self.space_alert_sent[drive]:
+                    message = config['message'].format(
+                        drive=drive,
+                        pct=config['alert'],
+                        bytes_free=self.convert_bytes(free),
+                        bytes_total=self.convert_bytes(total)
+                    )
+                    self.log.error(message)
+                    await self.send_alert(title=f"Your DCS drive on node {self.node.name} is running out of space!",
+                                          message=message)
+                    self.space_alert_sent[drive] = True
+            elif free < total * warn_pct:
+                if not self.space_warning_sent[drive]:
+                    message = config['message'].format(
+                        drive=drive,
+                        pct=config['warn'],
+                        bytes_free=self.convert_bytes(free),
+                        bytes_total=self.convert_bytes(total)
+                    )
+                    self.log.warning(message)
+                    await self.node.audit(f"**Your DCS drive on node {self.node.name} is running out of space!**\n"
+                                          f"{message}")
+                    self.space_warning_sent[drive] = True
 
     @tasks.loop(minutes=1.0)
     async def monitoring(self):
         try:
-            tasks = []
-
             # Run `check_popups` only on Windows
             if sys.platform == 'win32':
-                tasks.append(self.check_popups())
+                await self.check_popups()
 
-            tasks.extend([
+            tasks = [
                 self.heartbeat(),
-                self.drive_check(),
-            ])
+                self.drive_check()
+            ]
 
-            if 'serverstats' in self.node.config.get('opt_plugins', []):
+            if 'monitoring' in self.node.plugins:
                 tasks.append(self.serverload())
 
             if self.node.locals.get('nodestats', True):
@@ -382,6 +409,7 @@ class MonitoringService(Service):
     async def time_sync(self):
         if sys.platform == 'win32':
             try:
+                # noinspection PyUnresolvedReferences
                 retval = ctypes.windll.shell32.ShellExecuteW(None, "runas", 'w32tm', '/resync', None, 1)
                 if retval > 31:
                     self.log.info("- Windows time synced.")

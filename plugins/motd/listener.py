@@ -2,7 +2,7 @@ import asyncio
 import random
 
 from core import EventListener, utils, Server, Report, Player, event
-from typing import Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .commands import MOTD
@@ -10,7 +10,7 @@ if TYPE_CHECKING:
 
 class MOTDListener(EventListener["MOTD"]):
 
-    async def on_join(self, config: dict, server: Server, player: Player) -> Optional[str]:
+    async def on_join(self, config: dict, server: Server, player: Player) -> str | None:
         if 'messages' in config:
             if config.get('random', False):
                 cfg = random.choice(config['messages'])
@@ -28,7 +28,7 @@ class MOTDListener(EventListener["MOTD"]):
                     return None
             return utils.format_string(config['message'], server=server, player=player)
 
-    async def on_birth(self, config: dict, server: Server, player: Player) -> tuple[Optional[str], Optional[dict]]:
+    async def on_birth(self, config: dict, server: Server, player: Player) -> tuple[str | None, dict | None]:
         if 'messages' in config:
             if config.get('random', False):
                 cfg = random.choice(config['messages'])
@@ -62,28 +62,34 @@ class MOTDListener(EventListener["MOTD"]):
     @event(name="onPlayerStart")
     async def onPlayerStart(self, server: Server, data: dict) -> None:
         async def _send_message(config: dict, server: Server, player: Player) -> None:
-            await player.sendChatMessage(await self.on_join(config['on_join'], server, player))
+            msg = await self.on_join(config['on_join'], server, player)
+            if msg:
+                await player.sendChatMessage(msg)
 
         if data['id'] == 1 or 'ucid' not in data:
             return
         config = self.plugin.get_config(server)
         if config and 'on_join' in config:
-            player: Player = server.get_player(ucid=data['ucid'])
+            player = server.get_player(ucid=data['ucid'])
             if player:
-                # noinspection PyAsyncCall
                 asyncio.create_task(_send_message(config, server, player))
 
     @event(name="onMissionEvent")
     async def onMissionEvent(self, server: Server, data: dict) -> None:
+        def _send_message(message: str, server: Server, cfg: dict, player: Player) -> None:
+            asyncio.create_task(self.plugin.send_message(message, server, cfg, player))
+
         config = self.plugin.get_config(server)
         if not config:
             return
         if data['eventName'] == 'S_EVENT_BIRTH' and 'name' in data['initiator'] and 'on_birth' in config:
-            player: Player = server.get_player(name=data['initiator']['name'], active=True)
+            player = server.get_player(name=data['initiator']['name'], active=True)
             if not player:
                 # should never happen, just in case
                 return
             message, cfg = await self.on_birth(config['on_birth'], server, player)
-            if message:
-                # noinspection PyAsyncCall
-                asyncio.create_task(self.plugin.send_message(message, server, cfg, player))
+            if message and cfg:
+                if 'delay' in cfg:
+                    self.loop.call_later(cfg['delay'], _send_message, message, server, cfg, player)
+                else:
+                    _send_message(message, server, cfg, player)

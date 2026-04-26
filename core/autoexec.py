@@ -17,7 +17,7 @@ __all__ = ["Autoexec"]
 
 @dataclass
 class Autoexec:
-    instance: "InstanceImpl"
+    instance: InstanceImpl
     values: dict = field(init=False, default_factory=dict)
 
     def __post_init__(self):
@@ -58,12 +58,10 @@ class Autoexec:
                     mydict['table'].append(line[6:])
         self.values = mydict
 
-    def __getattribute__(self, item):
-        return super(Autoexec, self).__getattribute__(item)
-
     def __getattr__(self, item):
         if item not in self.values:
-            return super(Autoexec, self).__setattr__(item, None)
+            super(Autoexec, self).__setattr__(item, None)
+            return None
         else:
             return self.values[item]
 
@@ -94,6 +92,8 @@ class Autoexec:
             return value.__repr__().lower()
         elif isinstance(value, str):
             return '"' + value + '"'
+        elif isinstance(value, list):
+            return repr(set(value))
         else:
             return value
 

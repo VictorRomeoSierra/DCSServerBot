@@ -1,5 +1,4 @@
 import asyncio
-from typing import Optional
 
 from core import utils, Coalition, Status, Server
 from plugins.voting.base import VotableItem
@@ -7,8 +6,11 @@ from plugins.voting.base import VotableItem
 
 class Preset(VotableItem):
 
-    def __init__(self, server: Server, config: dict, params: Optional[list[str]] = None):
+    def __init__(self, server: Server, config: dict, params: list[str] | None = None):
         super().__init__('preset', server, config, params)
+
+    def __repr__(self) -> str:
+        return f"Vote to change preset"
 
     async def print(self) -> str:
         return "You can now vote to change the preset of this server."
@@ -29,6 +31,8 @@ class Preset(VotableItem):
         new_filename = await self.server.modifyMission(filename, utils.get_preset(self.server.node, winner))
         if new_filename != filename:
             await self.server.replaceMission(int(self.server.settings['listStartIndex']), new_filename)
-        await self.server.restart(modify_mission=False)
+            await self.server.loadMission(new_filename, modify_mission=False, use_orig=False)
+        else:
+            await self.server.restart(modify_mission=False)
         if self.server.status == Status.STOPPED:
             await self.server.start()

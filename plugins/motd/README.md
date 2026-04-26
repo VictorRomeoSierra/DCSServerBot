@@ -19,16 +19,18 @@ DEFAULT:
     report: greeting.json     # the respective report will be used (see Reporting Framework)
     display_type: popup       # the message will generate a popup ..
     display_time: 20          # .. which lasts for 20 seconds
+    delay: 10                 # Optional: wait 10s before displaying the message
   nudge:
     - delay: 3600             # the following message will be displayed every 3600 seconds (1h)
       message: "All members, be aware of our weekly mission, every Sunday at 1700 UTC!"
       recipients: 'Members'   # the message only goes to specific recipients (see below)
+      coalition: blue         # Optional: send the messages to the blue coalition
       display_type: chat      # the message will be displayed in the in-game chat
     - delay: 120              # this message will be displayed every 2 mins
       message: "To see your stats, you can link your user by using /linkme in your discord!"
       recipients: '!@everyone' # and will be sent to anybody that is not linked yet (has not the discord role @everyone)
       display_type: popup     # Message will be a popup
-DCS.release_server:
+DCS.dcs_serverrelease:
   on_join:                    # The message will be displayed in the in-game chat on join of the server.
     message: Welcome to our public server! Teamkills will be punished.
 ```
@@ -46,8 +48,16 @@ If you want to play sounds, make sure that you loaded them into the mission firs
           recipients": "!@everyone"
           display_type: popup
           display_time: 20
-        - message": Glad to have you guys here!
+        - message: Glad to have you guys here!
           recipients: DCS Admin
+          display_type: popup
+          display_time: 20
+        - message: Red is better than blue!
+          coalition: red
+          display_type: popup
+          display_time: 20
+        - message: Blue is better than red!
+          coalition: blue
           display_type: popup
           display_time: 20
 ```
@@ -61,7 +71,7 @@ If you want to play sounds, make sure that you loaded them into the mission firs
       display_type: chat      # the message will be displayed in the in-game chat
     - delay: 120              # this message will be displayed every 2 mins
       message: "To see your stats, you can link your user by using /linkme in your discord!"
-      receipients: '!@everyone' # and will be sent to anybody that is not linked yet (has not the discord role @everyone)
+      recipients: '!@everyone' # and will be sent to anybody that is not linked yet (has not the discord role @everyone)
       display_type: popup     # Message will be a popup
 ```
 

@@ -1,23 +1,35 @@
 import os
 import shutil
 
-from core import Extension, DISCORD_FILE_SIZE_LIMIT, ServiceRegistry, Server, get_translation, utils, Autoexec
+from core import Extension, DISCORD_FILE_SIZE_LIMIT, ServiceRegistry, Server, get_translation, utils, Autoexec, \
+    InstanceImpl
 from pathlib import Path
 from services.bot import BotService
 from services.servicebus import ServiceBus
+from typing import cast
+from typing_extensions import override
 
 _ = get_translation(__name__.split('.')[1])
 
 
 class Trackfile(Extension):
 
+    CONFIG_DICT = {
+        "target": {
+            "type": str,
+            "label": _("Target"),
+            "required": True
+        },
+    }
+
     def __init__(self, server: Server, config: dict):
         super().__init__(server, config)
         self.bus = ServiceRegistry.get(ServiceBus)
 
-    async def startup(self) -> bool:
+    @override
+    async def startup(self, *, quiet: bool = False) -> bool:
         if self.config.get('enabled', True):
-            cfg = Autoexec(self.server.instance)
+            cfg = Autoexec(cast(InstanceImpl, self.server.instance))
             if cfg.disable_write_track:
                 self.log.warning(
                     f"Server {self.server.name} has disable_write_track set and will not write any track file!")
@@ -58,7 +70,8 @@ class Trackfile(Extension):
             except Exception:
                 self.log.warning(f"Can't upload track file {filename} to {target}: ", exc_info=True)
 
-    def shutdown(self) -> bool:
+    @override
+    def shutdown(self, *, quiet: bool = False) -> bool:
         if self.config.get('enabled', True):
             self.loop.create_task(self.upload_trackfile())
         return super().shutdown()

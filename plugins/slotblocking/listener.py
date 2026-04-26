@@ -1,15 +1,16 @@
 import asyncio
 import re
 
-from core import EventListener, Plugin, Server, Status, utils, event, Side
+from core import EventListener, Server, Status, utils, event, Side
 from plugins.creditsystem.player import CreditPlayer
-from typing import Union, cast, Optional, TYPE_CHECKING
+from typing import cast, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .commands import SlotBlocking
 
 
 class SlotBlockingListener(EventListener["SlotBlocking"]):
+
     def __init__(self, plugin: "SlotBlocking"):
         super().__init__(plugin)
         self.lock = asyncio.Lock()
@@ -30,6 +31,7 @@ class SlotBlockingListener(EventListener["SlotBlocking"]):
                 'plugin': self.plugin_name,
                 'params': config
             })
+            # find all VIP roles
             roles = []
             for role in config.get('VIP', {}).get('discord', []):
                 roles.append(self.bot.get_role(role))
@@ -50,26 +52,32 @@ class SlotBlockingListener(EventListener["SlotBlocking"]):
                     if any(role in roles for role in member.roles):
                         batch.append({
                             'ucid': row[0],
+                            'discord_id': row[1],
                             'roles': [x.id for x in member.roles]
                         })
+                    # upload the VIP users in batches of 25
                     if len(batch) >= 25:
-                        await server.send_to_dcs({'command': 'uploadUserRoles', 'batch': batch})
+                        await server.send_to_dcs({
+                            'command': 'uploadUserRoles',
+                            'batch': batch
+                        })
                         batch = []
 
-                # Send remaining users, if any
+                # Send remaining VIP users, if any
                 if batch:
-                    await server.send_to_dcs({'command': 'uploadUserRoles', 'batch': batch})
+                    await server.send_to_dcs({
+                        'command': 'uploadUserRoles',
+                        'batch': batch
+                    })
 
     @event(name="registerDCSServer")
     async def registerDCSServer(self, server: Server, data: dict) -> None:
         # the server is running already
         if data['channel'].startswith('sync-'):
-            # noinspection PyAsyncCall
             asyncio.create_task(self._load_params_into_mission(server))
 
     @event(name="onMissionLoadEnd")
     async def onMissionLoadEnd(self, server: Server, _: dict) -> None:
-        # noinspection PyAsyncCall
         asyncio.create_task(self._load_params_into_mission(server))
 
     def _get_points(self, server: Server, player: CreditPlayer) -> int:
@@ -91,8 +99,8 @@ class SlotBlockingListener(EventListener["SlotBlocking"]):
                     return unit['crew']
         return 0
 
-    def _get_costs(self, server: Server, data: Union[CreditPlayer, dict]) -> int:
-        def _get_data(data: Union[CreditPlayer, dict], attribute_name: str):
+    def _get_costs(self, server: Server, data: CreditPlayer | dict) -> int:
+        def _get_data(data: CreditPlayer | dict, attribute_name: str):
             return getattr(data, attribute_name) if isinstance(data, CreditPlayer) else data[attribute_name]
 
         def _is_unit_match(unit: dict, attribute_name: str, attribute_value: str) -> bool:
@@ -133,11 +141,10 @@ class SlotBlockingListener(EventListener["SlotBlocking"]):
                 message = "VIP member {} joined".format(utils.escape_string(member.display_name))
             else:
                 message = "VIP user {}(ucid={} joined".format(utils.escape_string(data['name']), data['ucid'])
-            # noinspection PyAsyncCall
             asyncio.create_task(self.bot.audit(message, server=server))
 
-    async def _pay_for_plane(self, server: Server, player: CreditPlayer, data: Optional[dict] = None,
-                             payback: Optional[bool] = True):
+    async def _pay_for_plane(self, server: Server, player: CreditPlayer, data: dict | None = None,
+                             payback: bool | None = True):
         async with self.lock:
             if player.deposit != 0:
                 return
@@ -159,6 +166,9 @@ class SlotBlockingListener(EventListener["SlotBlocking"]):
         async with self.lock:
             if player.deposit == 0:
                 return
+            # avoid squadron payback
+            squadron = player.squadron
+            player.squadron = None
             old_points = player.points
             plane_costs = self._get_costs(server, player)
             if plane_only:
@@ -167,6 +177,7 @@ class SlotBlockingListener(EventListener["SlotBlocking"]):
                 player.points += player.deposit
             player.audit('payback', old_points, reason)
             player.deposit = 0
+            player.squadron = squadron
             message = self.get_config(server).get('messages', {}).get(
                 'payback', '').format(
                 deposit=plane_costs, old_points=old_points, new_points=player.points)
@@ -175,8 +186,10 @@ class SlotBlockingListener(EventListener["SlotBlocking"]):
 
     @event(name="onPlayerChangeSlot")
     async def onPlayerChangeSlot(self, server: Server, data: dict) -> None:
+        if 'side' not in data or data['id'] == 1:
+            return
         config = self.plugin.get_config(server)
-        if not config or 'side' not in data:
+        if not config:
             return
         player: CreditPlayer = cast(CreditPlayer, server.get_player(ucid=data['ucid'], active=True))
         if not player:
@@ -184,9 +197,8 @@ class SlotBlockingListener(EventListener["SlotBlocking"]):
         # if payback is enabled, we need to clear the deposit on any slot change
         if config.get('payback', False):
             player.deposit = 0
-        elif (Side(data['side']) != Side.SPECTATOR and data['sub_slot'] == 0
+        elif (Side(data['side']) != Side.NEUTRAL and data['sub_slot'] == 0
               and not self.get_config(server, plugin_name='missionstats').get('enabled', True)):
-            # noinspection PyAsyncCall
             asyncio.create_task(self._pay_for_plane(server, player, data, payback=False))
 
     @event(name="onMissionEvent")
@@ -196,13 +208,12 @@ class SlotBlockingListener(EventListener["SlotBlocking"]):
             return
         if data['eventName'] == 'S_EVENT_BIRTH':
             initiator = data['initiator']
-            # check, if they are a human player
+            # check if they are a human player
             if 'name' not in initiator:
                 return
             player: CreditPlayer = cast(CreditPlayer, server.get_player(name=initiator['name'], active=True))
             # only pilots have to "pay" for their plane
             if player and player.sub_slot == 0:
-                # noinspection PyAsyncCall
                 asyncio.create_task(self._pay_for_plane(server, player, payback=False))
 
     @event(name="onGameEvent")
@@ -216,35 +227,29 @@ class SlotBlockingListener(EventListener["SlotBlocking"]):
                 return
             # give points back on team-kill
             if data['arg3'] == data['arg6']:
-                # noinspection PyAsyncCall
                 asyncio.create_task(self._payback(server, player, 'Credits refund for being team-killed'))
             else:
                 player.deposit = 0
                 if player.points < self._get_costs(server, player):
-                    # noinspection PyAsyncCall
                     asyncio.create_task(server.move_to_spectators(
                         player, reason="You do not have enough credits to use this slot anymore."))
         elif data['eventName'] == 'landing':
             # payback on landing
             player: CreditPlayer = cast(CreditPlayer, server.get_player(id=data['arg1']))
             if player and player.deposit > 0:
-                # noinspection PyAsyncCall
                 asyncio.create_task(self._payback(server, player, 'Credits for RTB'))
         elif data['eventName'] == 'takeoff':
             # take deposit on takeoff
             player: CreditPlayer = cast(CreditPlayer, server.get_player(id=data['arg1']))
             if player and player.deposit == 0 and int(player.sub_slot) == 0:
-                # noinspection PyAsyncCall
                 asyncio.create_task(self._pay_for_plane(server, player, payback=True))
         elif data['eventName'] == 'mission_end':
-            # give all players their credit back, if the mission ends, and they are still airborne
+            # give all players their credits back if the mission ends, and they are still airborne
             for player in server.players.values():
-                # noinspection PyAsyncCall
                 asyncio.create_task(self._payback(server, player, 'Refund on mission end', plane_only=True))
         elif data['eventName'] == 'crash':
             player: CreditPlayer = cast(CreditPlayer, server.get_player(id=data['arg1']))
             player.deposit = 0
             if player.points < self._get_costs(server, player):
-                # noinspection PyAsyncCall
                 asyncio.create_task(server.move_to_spectators(
                     player, reason="You do not have enough credits to use this slot anymore."))

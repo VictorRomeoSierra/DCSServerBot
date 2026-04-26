@@ -10,9 +10,9 @@ from core import EventListener, Server, Player, Channel, Side, PersistentReport,
 from matplotlib import pyplot as plt
 from pathlib import Path
 from plugins.creditsystem.player import CreditPlayer
-from plugins.greenieboard import get_element
+from plugins.greenieboard import get_element, GRADES
 from contextlib import suppress
-from typing import Optional, cast, TYPE_CHECKING
+from typing import cast, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .commands import GreenieBoard
@@ -57,39 +57,49 @@ class GreenieBoardEventListener(EventListener["GreenieBoard"]):
             if config.get('persistent_board', False):
                 channel_id = int(config.get('persistent_channel', server.channels[Channel.STATUS]))
                 num_rows = config.get('num_rows', 10)
+                num_landings = config.get('num_landings', 30)
+                theme = config.get('theme', 'dark')
+                landings_rtl = config.get('landings_rtl', True)
                 report = PersistentReport(self.bot, self.plugin_name, 'greenieboard.json',
                                           embed_name='greenieboard', server=server, channel_id=channel_id)
-                await report.render(server_name=server.name, num_rows=num_rows)
+                await report.render(server_name=server.name, num_rows=num_rows, num_landings=num_landings, theme=theme,
+                                    landings_rtl=landings_rtl)
                 squadrons = config.get('squadrons', [])
                 if squadrons:
                     for squadron in squadrons:
-                        row = await utils.get_squadron(self.bot, name=squadron['name'])
+                        row = utils.get_squadron(self.node, name=squadron['name'])
                         if not row:
                             self.log.warning(f"Squadron {squadron['name']} not found!")
                             continue
                         report = PersistentReport(self.bot, self.plugin_name, 'greenieboard.json',
                                                   embed_name=f"greenieboard_s{row['id']}", server=server,
                                                   channel_id=squadron.get('channel', channel_id))
-                        await report.render(server_name=server.name, num_rows=num_rows, squadron=row)
+                        await report.render(server_name=server.name, num_rows=num_rows, num_landings=num_landings,
+                                            theme=theme, landings_rtl=landings_rtl, squadron=row)
             # update the global board
             config = self.get_config()
             if 'persistent_channel' in config and config.get('persistent_board', False):
                 channel_id = int(config.get('persistent_channel'))
                 num_rows = config.get('num_rows', 10)
+                num_landings = config.get('num_landings', 30)
+                theme = config.get('theme', 'dark')
+                landings_rtl = config.get('landings_rtl', True)
                 report = PersistentReport(self.bot, self.plugin_name, 'greenieboard.json',
                                           embed_name='greenieboard', channel_id=channel_id)
-                await report.render(server_name=None, num_rows=num_rows)
+                await report.render(server_name=None, num_rows=num_rows, num_landings=num_landings, theme=theme,
+                                    landings_rtl=landings_rtl)
                 squadrons = config.get('squadrons', [])
                 if squadrons:
                     for squadron in squadrons:
-                        row = await utils.get_squadron(self.bot, name=squadron['name'])
+                        row = utils.get_squadron(self.node, name=squadron['name'])
                         if not row:
                             self.log.warning(f"Squadron {squadron['name']} not found!")
                             continue
                         report = PersistentReport(self.bot, self.plugin_name, 'greenieboard.json',
                                                   embed_name=f"greenieboard_s{row['id']}",
                                                   channel_id=squadron.get('channel', channel_id))
-                        await report.render(server_name=None, num_rows=num_rows, squadron=row)
+                        await report.render(server_name=None, num_rows=num_rows, num_landings=num_landings,
+                                            theme=theme, landings_rtl=landings_rtl, squadron=row)
         except FileNotFoundError as ex:
             self.log.error(f'  => File not found: {ex}')
         except Exception as ex:
@@ -113,7 +123,12 @@ class GreenieBoardEventListener(EventListener["GreenieBoard"]):
 
     @event(name="registerDCSServer")
     async def registerDCSServer(self, server: Server, _: dict) -> None:
-        # noinspection PyAsyncCall
+        config = self.get_config(server)
+        if 'persistent_channel' in config:
+            self.bot.check_channel(int(config.get('persistent_channel')))
+        for squadron in config.get('squadrons', []):
+            if 'channel' in squadron:
+                self.bot.check_channel(int(squadron['channel']))
         asyncio.create_task(self.update_greenieboard(server))
 
     @event(name="onMissionLoadEnd")
@@ -124,11 +139,17 @@ class GreenieBoardEventListener(EventListener["GreenieBoard"]):
     async def process_lso_event(self, config: dict, server: Server, player: Player, data: dict):
         time = (int(server.current_mission.start_time) + int(data['time'])) % 86400
         night = time > 20 * 3600 or time < 6 * 3600
-        points = int(data.get('points', config['ratings'][data['grade']]))
+        grades = GRADES | config.get('grades', {})
+        points = int(data.get('points', grades.get(data['grade'], {}).get('rating', 0)))
+        # map some events to NC
+        if data['grade'] in ['WOP', 'OWO', 'TWO', 'TLU']:
+            data['grade'] = 'NC'
+        elif data['grade'] == 'WOFD':
+            data['grade'] = 'WO'
         # Moose.AIRBOSS sometimes gives negative points for WO. That is not according to any standard.
-        # After SME consultation, any WO will give 1 point.
-        if points < 0 and 'WO' in data['grade']:
-            points = 1
+        # After SME consultation, any WO will give the WO points (typically 1.0).
+        if points < 0 and data['grade'] == 'WO':
+            points = grades['WO']['rating']
         if config.get('credits', False):
             cp: CreditPlayer = cast(CreditPlayer, player)
             cp.audit(_('Carrier Landing'), cp.points,
@@ -137,16 +158,29 @@ class GreenieBoardEventListener(EventListener["GreenieBoard"]):
         case = data.get('case', 1 if not night else 3)
         wire = data.get('wire')
         async with self.apool.connection() as conn:
-            async with conn.transaction():
-                await conn.execute("""
-                    INSERT INTO traps (mission_id, player_ucid, unit_type, grade, comment, place, trapcase, wire, 
-                                       night, points, trapsheet) 
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """, (server.mission_id, player.ucid, player.unit_type, data['grade'].strip(), data['details'],
-                      data['place']['name'], case, wire, night, points, psycopg.Binary(data.get('trapsheet'))))
+            min_flight_time = self.get_config(server).get('min_flight_time')
+            if min_flight_time:
+                cursor = await conn.execute("""
+                    SELECT EXTRACT(EPOCH FROM (NOW() AT TIME ZONE 'utc' - MAX(time))) FROM missionstats 
+                    WHERE mission_id = %s 
+                    AND init_id = %s 
+                    AND event = 'S_EVENT_TAKEOFF'
+                """, (server.mission_id, player.ucid))
+                flight_time = await cursor.fetchone()
+                if flight_time and flight_time[0] < min_flight_time:
+                    # ignore this event, as the player has not flown for the minimum flight time
+                    self.log.debug(f"Greenieboard: Player {player.name} has not flown for the minimum flight time.")
+                    return
+
+            await conn.execute("""
+                INSERT INTO traps (mission_id, player_ucid, unit_type, grade, comment, place, trapcase, wire, 
+                                   night, points, trapsheet) 
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (server.mission_id, player.ucid, player.unit_type, data['grade'].strip(), data['details'],
+                  data['place']['name'], case, wire, night, points, psycopg.Binary(data.get('trapsheet'))))
 
     @staticmethod
-    def normalize_airboss_lso_rating(grade: str) -> Optional[str]:
+    def normalize_airboss_lso_rating(grade: str) -> str | None:
         if '<SH>' in grade:
             grade = grade[:-4]
         if grade == 'CUT':
@@ -157,7 +191,7 @@ class GreenieBoardEventListener(EventListener["GreenieBoard"]):
             grade = 'WO'
         return grade
 
-    def get_trapsheet(self, config: dict, server: Server, player: Player, data: dict) -> Optional[str]:
+    def get_trapsheet(self, config: dict, server: Server, player: Player, data: dict) -> str | None:
         dirname = os.path.join(server.instance.home, config['Moose.AIRBOSS']['basedir'])
         carrier = data['place']['name'].split()[0]
         if 'trapsheet' not in data:
@@ -239,9 +273,7 @@ class GreenieBoardEventListener(EventListener["GreenieBoard"]):
                 await self.process_sc_event(config, server, player, data)
                 update = True
             if update:
-                # noinspection PyAsyncCall
                 asyncio.create_task(self.send_chat_message(player, data))
-                # noinspection PyAsyncCall
                 asyncio.create_task(self.update_greenieboard(server))
 
     @event(name="moose_lso_grade")
@@ -253,7 +285,5 @@ class GreenieBoardEventListener(EventListener["GreenieBoard"]):
                 self.log.error(f"Your FunkMan path is not set in your {self.plugin_name}.yaml! FunkMan event ignored.")
                 return
             await self.process_funkman_event(config, server, player, data)
-            # noinspection PyAsyncCall
             asyncio.create_task(self.send_chat_message(player, data))
-            # noinspection PyAsyncCall
             asyncio.create_task(self.update_greenieboard(server))

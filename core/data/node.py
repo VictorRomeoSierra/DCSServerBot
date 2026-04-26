@@ -1,14 +1,17 @@
+from __future__ import annotations
+
+import aiohttp
 import logging
 import os
 
+from abc import ABC, abstractmethod
 from core import utils
 from core.translations import get_translation
+from core.utils.helper import YAMLError
 from enum import Enum, auto
 from pathlib import Path
-from typing import Union, Optional, TYPE_CHECKING
-from urllib.parse import urlparse
-
-from ..utils.helper import YAMLError
+from typing import TYPE_CHECKING
+from urllib.parse import urlparse, unquote
 
 # ruamel YAML support
 from ruamel.yaml import YAML
@@ -22,6 +25,7 @@ __all__ = [
     "Node",
     "UploadStatus",
     "SortOrder",
+    "InstallationException",
     "FatalException"
 ]
 
@@ -43,19 +47,27 @@ class SortOrder(Enum):
 
 
 class FatalException(Exception):
-    def __init__(self, message: Optional[str] = None):
+    def __init__(self, message: str | None = None):
         super().__init__(message)
 
 
-class Node:
+class InstallationException(FatalException):
+    def __init__(self, message: str | None = None):
+        super().__init__(message)
 
-    def __init__(self, name: str, config_dir: Optional[str] = 'config'):
+
+class Node(ABC):
+
+    def __init__(self, name: str, config_dir: str = 'config', restarted: bool = False):
         self.name = name
-        self.log = logging.getLogger(__name__)
-        self.config_dir = config_dir
-        self.instances: list["Instance"] = list()
+        self.log = logging.getLogger(f"{self.__class__.__module__}.{self.__class__.__name__}")
+        self.config_dir : str = config_dir
+        self.instances: dict[str, Instance] = {}
         self.locals = None
         self.config = self.read_config(os.path.join(config_dir, 'main.yaml'))
+        # (temporarily) disable validation on restarts (due to updates)
+        if restarted:
+            self.config['validation'] = 'none'
         self.guild_id: int = int(self.config['guild_id'])
         self.dcs_version = None
         self.slow_system: bool = False
@@ -65,20 +77,43 @@ class Node:
         return self.name
 
     @property
+    @abstractmethod
     def master(self) -> bool:
-        raise NotImplemented()
+        raise NotImplementedError()
 
     @master.setter
+    @abstractmethod
     def master(self, value: bool):
-        raise NotImplemented()
+        raise NotImplementedError()
 
     @property
+    @abstractmethod
     def public_ip(self) -> str:
-        raise NotImplemented()
+        raise NotImplementedError()
 
     @property
+    @abstractmethod
     def installation(self) -> str:
-        raise NotImplemented()
+        raise NotImplementedError()
+
+    @property
+    def proxy(self) -> str | None:
+        if 'proxy' not in self.locals:
+            config = yaml.load(Path(os.path.join(self.config_dir, 'services', 'bot.yaml')).read_text(encoding='utf-8'))
+            self.locals['proxy'] = config.get('proxy', {}).get('url')
+        return self.locals['proxy']
+
+    @property
+    def proxy_auth(self) -> aiohttp.BasicAuth | None:
+        if 'proxy_auth' not in self.locals:
+            config = yaml.load(Path(os.path.join(self.config_dir, 'services', 'bot.yaml')).read_text(encoding='utf-8'))
+            username = config.get('proxy', {}).get('username')
+            try:
+                password = utils.get_password('proxy', self.config_dir)
+                self.locals['proxy_auth'] = aiohttp.BasicAuth(username, password)
+            except ValueError:
+                self.locals['proxy_auth'] = None
+        return self.locals['proxy_auth']
 
     @property
     def extensions(self) -> dict:
@@ -97,7 +132,7 @@ class Node:
             if database_url:
                 url = urlparse(database_url)
                 if url.password != 'SECRET':
-                    utils.set_password('database', url.password, self.config_dir)
+                    utils.set_password('clusterdb', unquote(url.password), self.config_dir)
                     port = url.port or 5432
                     config['database']['url'] = \
                         f"{url.scheme}://{url.username}:SECRET@{url.hostname}:{port}{url.path}?sslmode=prefer"
@@ -115,93 +150,143 @@ class Node:
             config['chat_command_prefix'] = config.get('chat_command_prefix', '-')
             return config
         except FileNotFoundError:
-            raise FatalException()
+            raise InstallationException("No main.yaml found.")
         except MarkedYAMLError as ex:
             raise YAMLError(file, ex)
 
+    @abstractmethod
     def read_locals(self) -> dict:
-        raise NotImplemented()
+        raise NotImplementedError()
 
+    @abstractmethod
     async def shutdown(self, rc: int = -2):
-        raise NotImplemented()
+        raise NotImplementedError()
 
+    @abstractmethod
     async def restart(self):
-        raise NotImplemented()
+        raise NotImplementedError()
 
+    @abstractmethod
     async def upgrade_pending(self) -> bool:
-        raise NotImplemented()
+        raise NotImplementedError()
 
+    @abstractmethod
     async def upgrade(self):
-        raise NotImplemented()
+        raise NotImplementedError()
 
-    async def update(self, warn_times: list[int], branch: Optional[str] = None, version: Optional[str] = None) -> int:
-        raise NotImplemented()
+    @abstractmethod
+    async def dcs_update(self, branch: str | None = None, version: str | None = None,
+                         warn_times: list[int] = None, announce: bool | None = True):
+        raise NotImplementedError()
 
+    @abstractmethod
+    async def dcs_repair(self, warn_times: list[int] = None, slow: bool | None = False,
+                         check_extra_files: bool | None = False):
+        raise NotImplementedError()
+
+    @abstractmethod
     async def get_dcs_branch_and_version(self) -> tuple[str, str]:
-        raise NotImplemented()
+        raise NotImplementedError()
 
+    @abstractmethod
     async def handle_module(self, what: str, module: str) -> None:
-        raise NotImplemented()
+        raise NotImplementedError()
 
+    @abstractmethod
     async def get_installed_modules(self) -> list[str]:
-        raise NotImplemented()
+        raise NotImplementedError()
 
+    @abstractmethod
     async def get_available_modules(self) -> list[str]:
-        raise NotImplemented()
+        raise NotImplementedError()
 
-    async def get_available_dcs_versions(self, branch: str) -> Optional[list[str]]:
-        raise NotImplemented()
+    @abstractmethod
+    async def get_available_dcs_versions(self, branch: str) -> list[str] | None:
+        raise NotImplementedError()
 
-    async def get_latest_version(self, branch: str) -> Optional[str]:
-        raise NotImplemented()
+    @abstractmethod
+    async def get_latest_version(self, branch: str) -> str | None:
+        raise NotImplementedError()
 
-    async def shell_command(self, cmd: str, timeout: int = 60) -> Optional[tuple[str, str]]:
-        raise NotImplemented()
+    @abstractmethod
+    async def shell_command(self, cmd: str, timeout: int = 60) -> tuple[str, str] | None:
+        raise NotImplementedError()
 
-    async def read_file(self, path: str) -> Union[bytes, int]:
-        raise NotImplemented()
+    @abstractmethod
+    async def read_file(self, path: str) -> bytes | int:
+        raise NotImplementedError()
 
+    @abstractmethod
     async def write_file(self, filename: str, url: str, overwrite: bool = False) -> UploadStatus:
-        raise NotImplemented()
+        raise NotImplementedError()
 
-    async def list_directory(self, path: str, *, pattern: Union[str, list[str]] = '*',
+    @abstractmethod
+    async def list_directory(self, path: str, *, pattern: str | list[str] = '*',
                              order: SortOrder = SortOrder.DATE,
                              is_dir: bool = False, ignore: list[str] = None, traverse: bool = False
                              ) -> tuple[str, list[str]]:
-        raise NotImplemented()
+        raise NotImplementedError()
 
+    @abstractmethod
     async def create_directory(self, path: str):
-        raise NotImplemented()
+        raise NotImplementedError()
 
+    @abstractmethod
     async def remove_file(self, path: str):
-        raise NotImplemented()
+        raise NotImplementedError()
 
-    async def rename_file(self, old_name: str, new_name: str, *, force: Optional[bool] = False):
-        raise NotImplemented()
+    @abstractmethod
+    async def rename_file(self, old_name: str, new_name: str, *, force: bool | None = False):
+        raise NotImplementedError()
 
-    async def rename_server(self, server: "Server", new_name: str):
-        raise NotImplemented()
+    @abstractmethod
+    async def rename_server(self, server: Server, new_name: str):
+        raise NotImplementedError()
 
-    async def add_instance(self, name: str, *, template: str = "") -> "Instance":
-        raise NotImplemented()
+    @abstractmethod
+    async def add_instance(self, name: str, *, template: str = "") -> Instance:
+        raise NotImplementedError()
 
-    async def delete_instance(self, instance: "Instance", remove_files: bool) -> None:
-        raise NotImplemented()
+    @abstractmethod
+    async def delete_instance(self, instance: Instance, remove_files: bool) -> None:
+        raise NotImplementedError()
 
-    async def rename_instance(self, instance: "Instance", new_name: str) -> None:
-        raise NotImplemented()
+    @abstractmethod
+    async def rename_instance(self, instance: Instance, new_name: str) -> None:
+        raise NotImplementedError()
 
+    @abstractmethod
     async def find_all_instances(self) -> list[tuple[str, str]]:
-        raise NotImplemented()
+        raise NotImplementedError()
 
-    async def migrate_server(self, server: "Server", instance: "Instance") -> None:
-        raise NotImplemented()
+    @abstractmethod
+    async def migrate_server(self, server: Server, instance: Instance) -> None:
+        raise NotImplementedError()
 
-    async def unregister_server(self, server: "Server") -> None:
-        raise NotImplemented()
+    @abstractmethod
+    async def unregister_server(self, server: Server) -> None:
+        raise NotImplementedError()
 
+    @abstractmethod
     async def install_plugin(self, plugin: str) -> bool:
-        raise NotImplemented()
+        raise NotImplementedError()
 
+    @abstractmethod
     async def uninstall_plugin(self, plugin: str) -> bool:
-        raise NotImplemented()
+        raise NotImplementedError()
+
+    @abstractmethod
+    async def get_cpu_info(self, used: bool = True) -> bytes | int:
+        raise NotImplementedError()
+
+    @abstractmethod
+    async def info(self) -> dict:
+        raise NotImplementedError()
+
+    @abstractmethod
+    async def get_config(self) -> dict:
+        raise NotImplementedError()
+
+    @abstractmethod
+    async def is_alive(self, timeout: int = 30) -> bool:
+        raise NotImplementedError()

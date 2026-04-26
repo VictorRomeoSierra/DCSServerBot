@@ -4,11 +4,11 @@
   "input": [
     {
       "name": "ruler_length",
-      "value": 32
+      "value": 33
     },
     {
       "name": "limit",
-      "default": 10
+      "default": 15
     }
   ],
   "elements":
@@ -34,7 +34,7 @@
     {
       "type": "SQLField",
       "params": {
-        "sql": "SELECT SUM(points) AS \"Penalty Points\" FROM pu_events WHERE init_id = '{ucid}'",
+        "sql": "SELECT COALESCE(SUM(points), 0) AS \"Penalty Points\" FROM pu_events WHERE init_id = '{ucid}'",
         "inline": false,
         "on_error": {
           "Penalty Points": 0
@@ -59,7 +59,7 @@
     {
       "type": "SQLTable",
       "params": {
-        "sql": "SELECT TO_CHAR(banned_at, 'YY-MM-DD') || ' - ' || TO_CHAR(banned_until, 'YY-MM-DD') as \"Timeframe\", reason as \"Reason\", status as \"Status\"  FROM (SELECT ucid, TRUE as active, reason, banned_at, banned_until, 'Active' as status FROM bans UNION SELECT ucid, FALSE as active, reason, banned_at, banned_until, CASE WHEN auto_unban IS FALSE THEN 'Forgiven' ELSE 'Auto-Unbanned' END FROM bans_hist) x where x.ucid = '{ucid}'",
+        "sql": "SELECT TO_CHAR(banned_at, 'YY-MM-DD') || ' - ' || TO_CHAR(banned_until, 'YY-MM-DD') as \"Timeframe\", reason as \"Reason\", status as \"Status\"  FROM (SELECT ucid, TRUE as active, reason, banned_at, banned_until, 'Active' as status FROM bans WHERE banned_until > NOW() AT TIME ZONE 'utc' UNION SELECT ucid, FALSE as active, reason, banned_at, banned_until, CASE WHEN auto_unban IS FALSE THEN 'Forgiven' ELSE 'Auto-Unbanned' END FROM bans_hist) x WHERE x.ucid = '{ucid}' ORDER BY banned_at DESC",
         "inline": true,
         "no_data": "There are no bans logged for this user."
       }

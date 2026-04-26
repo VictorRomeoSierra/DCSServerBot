@@ -2,12 +2,13 @@
 Simple extension to upload a trackfile on mission change to either Discord or a path (e.g. cloud drive).
 
 ## Configuration
-To enable track file upload, a change in nodes.yaml is needed:
+You can use `/extension enable <Trackfile>` to enable the extension.
+This will add an entry in your `nodes.yaml` like so:
 ```yaml
 MyNode:
   # [...]
   instances:
-    DCS.release_server:
+    DCS.dcs_serverrelease:
       # [...]
       extensions:
         Trackfile:

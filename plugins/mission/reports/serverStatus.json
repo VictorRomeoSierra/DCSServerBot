@@ -7,10 +7,13 @@
     },
     {
       "class": "plugins.mission.status.ServerInfo",
-      "params": { "show_password":  true }
+      "params": { "show_password": true }
     },
     {
       "class": "plugins.mission.status.WeatherInfo"
+    },
+    {
+      "class": "plugins.mission.status.IntegrityCheck"
     },
     {
       "class": "plugins.mission.status.ExtensionsInfo"

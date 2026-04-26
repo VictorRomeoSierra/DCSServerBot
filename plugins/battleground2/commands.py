@@ -1,12 +1,10 @@
 import discord
-import psycopg
 import json
 
 from core import Plugin, utils, Channel, Coalition, Server, get_translation
 from discord import app_commands
 from discord.app_commands import Group
 from services.bot import DCSServerBot
-from typing import Optional
 
 from .listener import BattlegroundEventListener
 
@@ -15,22 +13,17 @@ _ = get_translation(__name__.split('.')[1])
 
 class Battleground(Plugin[BattlegroundEventListener]):
 
-    async def rename(self, conn: psycopg.AsyncConnection, old_name: str, new_name: str) -> None:
-        await conn.execute("UPDATE bg_geometry2 SET server_name = %s WHERE server_name = %s", (new_name, old_name))
-        await conn.execute("UPDATE bg_missions SET server_name = %s WHERE server_name = %s", (new_name, old_name))
-        await conn.execute("UPDATE bg_task SET server_name = %s WHERE server_name = %s", (new_name, old_name))
-
     battleground = Group(name="battleground", description=_("DCSBattleground commands"))
 
     @battleground.command(description=_('Push MGRS coordinates with screenshots to DCS Battleground'))
     @app_commands.guild_only()
     @utils.app_has_role('DCS')
     async def recon(self, interaction: discord.Interaction, name: str, mgrs: str, screenshot1: discord.Attachment,
-                    screenshot2: Optional[discord.Attachment], screenshot3: Optional[discord.Attachment],
-                    screenshot4: Optional[discord.Attachment], screenshot5: Optional[discord.Attachment],
-                    screenshot6: Optional[discord.Attachment], screenshot7: Optional[discord.Attachment],
-                    screenshot8: Optional[discord.Attachment], screenshot9: Optional[discord.Attachment],
-                    screenshot10: Optional[discord.Attachment]):
+                    screenshot2: discord.Attachment | None, screenshot3: discord.Attachment | None,
+                    screenshot4: discord.Attachment | None, screenshot5: discord.Attachment | None,
+                    screenshot6: discord.Attachment | None, screenshot7: discord.Attachment | None,
+                    screenshot8: discord.Attachment | None, screenshot9: discord.Attachment | None,
+                    screenshot10:discord.Attachment | None):
         mgrs = mgrs.replace(' ', '')
         if len(mgrs) != 15 or not mgrs[:2].isnumeric() or not mgrs[5:].isnumeric():
             # noinspection PyUnresolvedReferences
@@ -78,9 +71,8 @@ class Battleground(Plugin[BattlegroundEventListener]):
                 "fields": fields
             }
             async with self.apool.connection() as conn:
-                async with conn.transaction():
-                    await conn.execute("INSERT INTO bg_geometry2(server_name, data) VALUES (%s, %s)",
-                                       (server.name, json.dumps(data)))
+                await conn.execute("INSERT INTO bg_geometry2(server_name, data) VALUES (%s, %s)",
+                                   (server.name, json.dumps(data)))
             # noinspection PyUnresolvedReferences
             await interaction.response.send_message(
                 _("Recon data added - {side} side - {server}").format(side=side, server=server.name))
@@ -96,13 +88,12 @@ class Battleground(Plugin[BattlegroundEventListener]):
     async def reset(self, interaction: discord.Interaction,
                     server: app_commands.Transform[Server, utils.ServerTransformer]):
         async with self.apool.connection() as conn:
-            async with conn.transaction():
-                await conn.execute("DELETE FROM bg_geometry2 WHERE server_name = %s", (server.name, ))
-                await conn.execute("DELETE FROM bg_missions WHERE server_name = %s", (server.name,))
-                await conn.execute("DELETE FROM bg_task WHERE server_name = %s", (server.name,))
+            await conn.execute("DELETE FROM bg_geometry2 WHERE server_name = %s", (server.name, ))
+            await conn.execute("DELETE FROM bg_missions WHERE server_name = %s", (server.name,))
+            await conn.execute("DELETE FROM bg_task WHERE server_name = %s", (server.name,))
         # noinspection PyUnresolvedReferences
         await interaction.response.send_message(_("Recon data deleted for server {}.").format(server.name),
-                                                ephemeral=True)
+                                                ephemeral=utils.get_ephemeral(interaction))
 
 
 async def setup(bot: DCSServerBot):

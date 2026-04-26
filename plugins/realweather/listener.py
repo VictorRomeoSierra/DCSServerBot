@@ -6,22 +6,13 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .commands import RealWeather
 
-
 _ = get_translation(__name__.split('.')[1])
 
 
 class RealWeatherEventListener(EventListener["RealWeather"]):
 
     @staticmethod
-    def generate_config_1_0(icao: str) -> dict:
-        return {
-            "metar": {
-                "icao": icao
-            }
-        }
-
-    @staticmethod
-    def generate_config_2_0(icao: str) -> dict:
+    def generate_config(icao: str) -> dict:
         return {
             "options": {
                 "weather": {
@@ -31,14 +22,12 @@ class RealWeatherEventListener(EventListener["RealWeather"]):
             }
         }
 
-    def generate_config(self, icao: str) -> dict:
-        if self.plugin.version.split('.')[0] == '1':
-            return self.generate_config_1_0(icao)
-        else:
-            return self.generate_config_2_0(icao)
-
     @chat_command(name="realweather", help=_("applies real weather"), roles=['DCS Admin'], usage="<icao|airport>")
-    async def penalty(self, server: Server, player: Player, params: list[str]):
+    async def realweather(self, server: Server, player: Player, params: list[str]):
+        if 'RealWeather' not in await server.list_extensions():
+            await player.sendChatMessage("RealWeather is not enabled in this server.")
+            return
+
         if len(params):
             icao = next(
                 (

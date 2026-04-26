@@ -8,7 +8,7 @@ from discord import app_commands
 from discord.ext import tasks
 from functools import partial
 from services.bot import DCSServerBot
-from typing import Optional, Type, Literal, AsyncGenerator
+from typing import Type, Literal, AsyncGenerator
 from .listener import MOTDListener
 
 
@@ -19,6 +19,9 @@ class MOTD(Plugin[MOTDListener]):
         if not self.locals:
             raise PluginInstallationError(reason=f"No {self.plugin_name}.yaml file found!", plugin=self.plugin_name)
         self.nudge_active: dict[str, dict[int, asyncio.TimerHandle]] = {}
+
+    async def cog_load(self) -> None:
+        await super().cog_load()
         self.nudge.start()
 
     async def cog_unload(self):
@@ -28,7 +31,7 @@ class MOTD(Plugin[MOTDListener]):
         await super().cog_unload()
 
     @staticmethod
-    async def send_message(message: str, server: Server, config: dict, player: Optional[Player] = None):
+    async def send_message(message: str, server: Server, config: dict, player: Player | None = None):
         if config['display_type'].lower() == 'chat':
             if player:
                 await player.sendChatMessage(message)
@@ -41,9 +44,10 @@ class MOTD(Plugin[MOTDListener]):
                 if 'sound' in config:
                     await player.playSound(config['sound'])
             else:
-                await server.sendPopupMessage(Coalition.ALL, message, timeout)
+                coalition = Coalition(config.get('coalition', 'all').lower())
+                await server.sendPopupMessage(coalition, message, timeout)
                 if 'sound' in config:
-                    await server.playSound(Coalition.ALL, config['sound'])
+                    await server.playSound(coalition, config['sound'])
 
     @staticmethod
     async def get_recipients(server: Server, config: dict) -> AsyncGenerator[Player, None]:
@@ -55,6 +59,7 @@ class MOTD(Plugin[MOTDListener]):
                 in_roles.append(role)
             else:
                 out_roles.append(role[1:])
+        coalition = Coalition(config.get('coalition', 'all').lower())
         for player in players:
             if len(in_roles):
                 if not player.member or not utils.check_roles(in_roles, player.member):
@@ -62,7 +67,8 @@ class MOTD(Plugin[MOTDListener]):
             if len(out_roles):
                 if player.member and utils.check_roles(out_roles, player.member):
                     continue
-            yield player
+            if coalition == Coalition.ALL or player.coalition == coalition:
+                yield player
 
     @command(description='Test MOTD')
     @app_commands.guild_only()
@@ -146,17 +152,17 @@ class MOTD(Plugin[MOTDListener]):
                 if server.status != Status.RUNNING:
                     if handles:
                         await self._cancel_handles(server)
-                    return
+                    continue
                 elif handles:
-                    return
-                config = config['nudge']
+                    continue
+                config: dict = config['nudge']
                 self.nudge_active[server_name] = {}
                 if isinstance(config, list):
                     for c in config:
-                        t = self.loop.call_later(c['delay'], partial(process_nudge, server, c))
+                        t = self.loop.call_later(int(c['delay']), partial(process_nudge, server, c))
                         self.nudge_active[server_name][c['delay']] = t
                 else:
-                    t = self.loop.call_later(config['delay'], partial(process_nudge, server, config))
+                    t = self.loop.call_later(int(config['delay']), partial(process_nudge, server, config))
                     self.nudge_active[server_name][config['delay']] = t
         except Exception as ex:
             self.log.exception(ex)

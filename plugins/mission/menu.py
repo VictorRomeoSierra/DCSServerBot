@@ -3,7 +3,6 @@ import os
 
 from core import EventListener, Server, DEFAULT_TAG, Player, utils
 from pathlib import Path
-from typing import Optional
 
 # ruamel YAML support
 from pykwalify.errors import PyKwalifyException
@@ -14,7 +13,7 @@ yaml = YAML()
 logger = logging.getLogger(__name__)
 
 
-def read_menu_config(listener: EventListener, server: Server) -> Optional[list]:
+def read_menu_config(listener: EventListener, server: Server) -> list | None:
     menu_file = os.path.join(listener.node.config_dir, 'menus.yaml')
     if os.path.exists(menu_file):
         try:
@@ -28,6 +27,7 @@ def read_menu_config(listener: EventListener, server: Server) -> Optional[list]:
             raise YAMLError(menu_file, ex)
         except PyKwalifyException as ex:
             logger.error(f"Schema validation failed for file menus.yaml:\n{ex}")
+    return None
 
 
 def filter_menu_items(menu: list, usable_commands: list[str], player: Player) -> list:
@@ -55,7 +55,7 @@ def filter_menu_items(menu: list, usable_commands: list[str], player: Player) ->
     return filtered_menu
 
 
-async def filter_menu(listener: EventListener, menu: list, server: Server, player: Player) -> Optional[list]:
+async def filter_menu(listener: EventListener, menu: list | None, server: Server, player: Player) -> list | None:
     if not menu:
         return None
     usable_commands = []

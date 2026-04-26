@@ -54,6 +54,7 @@ schema;settings_schema:
         event_Takeoff: {type: bool, nullable: false}
         bluePasswordHash: {type: str, nullable: false, range: {min: 1}}
         redPasswordHash: {type: str, nullable: false, range: {min: 1}}
+        sav_autosave: {type: bool, nullable: false}
 
 type: map
 mapping:
@@ -69,19 +70,29 @@ mapping:
           greeting_message_unmatched: {type: str, nullable: false, range: {min: 1}}
           message_player_username: {type: str, nullable: false, range: {min: 1}}
           message_player_default_username: {type: str, nullable: false, range: {min: 1}}
+          message_player_inappropriate_username: {type: str, nullable: false, range: {min: 1}}
           message_ban: {type: str, nullable: false, range: {min: 1}}
           message_reserved: {type: str, nullable: false, range: {min: 1}}
           message_no_voice: {type: str, nullable: false, range: {min: 1}}
+          message_seat_locked: {type: str, nullable: false, range: {min: 1}}
       message_timeout: {type: int, range: {min: 5, max: 60}, nullable: false}
       display_ai_chat: {type: bool, nullable: false}
       profanity_filter: {type: bool, nullable: false}
+      no_join_with_cursename: {type: bool, nullable: false}
       server_user: {type: str, nullable: false, range: {min: 1}}
       show_passwords: {type: bool, nullable: false}
+      show_atis: {type: bool, nullable: false}
+      mission_rewrite: {type: bool, nullable: false}
       afk:
         type: map
         nullable: false
         mapping:
           afk_time: {type: int, range: {min: -1}, nullable: false}
+          punish: {type: bool, nullable: false}
+          threshold: {type: int, range: {min: 0, max: 100}, nullable: false}
+          check_on_join: {type: bool, nullable: false}
+          check_on_spawn: {type: bool, nullable: false}
+          check_after_landing: {type: bool, nullable: false}
           message: {type: str, nullable: false, range: {min: 1}}
           exemptions:
             nullable: false
@@ -130,6 +141,7 @@ mapping:
       validate_missions: {type: bool, nullable: false}
       autorole: {type: text, nullable: false}
       smooth_pause: {type: int, nullable: false}
+      lock_on_load: {type: int, nullable: false}
       force_voice: {type: bool, nullable: false}
       rules: {type: str, nullable: false, range: {min: 1}}
       accept_rules_on_join: {type: bool, nullable: false}
@@ -137,6 +149,13 @@ mapping:
       serverSettings:
         include: 'settings_schema'
       discord:
+        type: seq
+        nullable: false
+        sequence:
+          - type: text
+            nullable: false
+            unique: true
+      managed_by:
         type: seq
         nullable: false
         sequence:
@@ -152,6 +171,7 @@ mapping:
           events: {type: int, range: {min: -1}, nullable: false}
           admin: {type: int, range: {min: -1}, nullable: false}
           voice: {type: int, range: {min: -1}, nullable: false}
+          audit: {type: int, range: {min: -1}, nullable: false}
           blue: {type: int, range: {min: -1}, nullable: false}
           blue_events: {type: int, range: {min: -1}, nullable: false}
           red: {type: int, range: {min: -1}, nullable: false}

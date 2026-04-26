@@ -13,19 +13,30 @@ MyNode:
     LotAtc:
       installation: '%ProgramFiles%\LotAtc' # the installation path to your LotAtc installation
       autoupdate: true                      # auto update LotAtc, if a new version is available online (default: false)
-#      autoupdate:           # alternative configuration with a message being posted to Discord after every update
-#        title: LotAtc has been updated to version {}!
-#        description: 'The following servers will be updated on the next restart:'
-#        footer: Please make sure you update your LotAtc client also!
-#        mention:            # Optional mentioning
-#          - DCS
+      announce:             # Optional: post a message to Discord after every update
+        title: LotAtc has been updated to version {}!
+        description: 'The following servers will be updated on the next restart:'
+        footer: Please make sure you update your LotAtc client also!
+        mention:            # Optional mentioning
+          - DCS
   instances:
-    DCS.release_server:
+    DCS.dcs_serverrelease:
       # [...]
       extensions:
         LotAtc:
           autoupdate: true          # auto update LotAtc in this instance, if a new version is available (default: false)
           show_passwords: false     # show passwords in the server status embed (default = true)
-          host: "myfancyhost.com"   # Show a different hostname instead of your servers external IP
-          port: 10310               # you can specify any parameter from LotAtc's config.lua in here to overwrite it
+          host: "myfancyhost.com"   # Optional: Show a different hostname instead of your servers external IP
+          port: 10310               # Optional: your LotAtc port (default: 10310)
+          use_jsonserver: true      # Optional: enable LotAtc Link
+          jsonserver_port: 8081     # Optional: you can specify any parameter from LotAtc's config.lua in here to overwrite it
+          # ...
 ```
+
+> [!TIP]
+> You can rename the LotAtc extension in your server status embed by setting a "name" in the configuration like so:
+> ```yaml
+> extension:
+>   LotAtc:
+>     name: MyFancyName  # Optional: default is "LotAtc"
+> ```

@@ -16,19 +16,18 @@ class HelpListener(EventListener["Help"]):
     async def onPlayerStart(self, server: Server, data: dict) -> None:
         if data['id'] == 1 or 'ucid' not in data:
             return
-        player: Player = server.get_player(ucid=data['ucid'])
+        player: Player | None = server.get_player(ucid=data['ucid'])
         if player:
-            # noinspection PyAsyncCall
             asyncio.create_task(player.sendChatMessage(f"Use \"{self.prefix}help\" for commands."))
 
     @chat_command(name="help", help="The help command")
-    async def help(self, server: Server, player: Player, params: list[str]):
+    async def help(self, server: Server, player: Player, _params: list[str]):
         messages = [
             f'You can use the following commands:\n'
         ]
         for listener in self.bot.eventListeners:
             for command in listener.chat_commands:
-                if not await listener.can_run(command, server, player):
+                if not await listener.can_run(command, server, player) or command.hidden:
                     continue
                 cmd = f"{self.prefix}{command.name}"
                 if command.usage:

@@ -5,20 +5,33 @@ miz-file with the state of the mission at the time of saving. This is perfect fo
 want to follow up on the next campaign day with the exact state of the mission it had at the end of the current day.</br>
 
 ## Configuration
-To use DSMC, you need to install it, according to the documentation linked above. In DCSServerBot, you activate the 
-extension like with all others:
+To use DSMC, you need to install it, according to the documentation linked above. 
+You can use `/extension enable <DSMC>` to enable the extension.
+This will add an entry in your `nodes.yaml` like so:
 ```yaml
 MyNode:
   # [...]
   instances:
-    DCS.release_server:
+    DCS.dcs_serverrelease:
       # [...]
       extensions:
         DSMC:
           enabled: true
+          autoupdate: false # auto-update DSMC to the latest version from GitHub
 ```
 DCSServerBot will detect if DSMC is enabled and - if yes - change the settings in your DSMC_Dedicated_Server_options.lua
 to fit to its needs. DSMC will write out a new miz-file with a new extension (001, 002, ...) after each run. The bot
 will take care, that this generated mission will be the next to launch. Other extensions like RealWeather work together
 with these generated missions, so you can use a DSMC generated mission but apply a preset or any real time weather to
 it.
+
+> [!TIP]
+> You can rename the DSMC extension in your server status embed by setting a "name" in the configuration like so:
+> ```yaml
+> extension:
+>   DSMC:
+>     name: MyFancyName  # Optional: default is "DSMC"
+> ```
+
+> [!WARNING]
+> Autoupdating DSMC is currently not supported due to naming conflicts in the respective GitHub repository.

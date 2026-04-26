@@ -1,10 +1,11 @@
 from __future__ import annotations
+
+import asyncio
 import logging
 import os
 import sys
 
 from core import ServiceRegistry, Service, Server, proxy
-from typing import Optional
 
 from .radios import Radio, Mode
 from ..servicebus import ServiceBus
@@ -21,7 +22,7 @@ class MusicService(Service):
         self.bus = ServiceRegistry.get(ServiceBus)
         self.radios: dict[str, dict[str, Radio]] = dict()
 
-    def get_config(self, server: Optional[Server] = None, radio_name: Optional[str] = None) -> dict:
+    def get_config(self, server: Server | None = None, radio_name: str | None = None) -> dict:
         if not radio_name:
             return super().get_config(server)
         else:
@@ -44,7 +45,7 @@ class MusicService(Service):
         await super().stop()
 
     @proxy
-    async def init_radios(self, server: Server, radio_name: Optional[str] = None) -> None:
+    async def init_radios(self, server: Server, radio_name: str | None = None) -> None:
         if not self.get_config(server):
             self.log.debug(
                 f"No config/services/music.yaml found or no entry for server {server.name} configured.")
@@ -59,7 +60,7 @@ class MusicService(Service):
                 self.radios[server.name][name] = radio
 
     @proxy
-    async def start_radios(self, server: Server, radio_name: Optional[str] = None) -> None:
+    async def start_radios(self, server: Server, radio_name: str | None = None) -> None:
         if server.name in self.radios:
             for name, radio in self.radios[server.name].items():
                 if radio_name and name != radio_name:
@@ -68,27 +69,44 @@ class MusicService(Service):
                     await radio.start()
 
     @proxy
-    async def stop_radios(self, server: Server, radio_name: Optional[str] = None) -> None:
-        if server.name in self.radios:
-            for name, radio in self.radios[server.name].items():
-                if radio_name and name != radio_name:
-                    continue
-                await radio.stop()
+    async def stop_radios(
+            self,
+            server: Server,
+            radio_name: str | None = None,
+    ) -> None:
+        """
+        Stop one or more radios belonging to *server*.
+
+        If *radio_name* is supplied only that radio is stopped;
+        otherwise all radios for the server are stopped.
+        """
+        # No radios for this server → nothing to do
+        if server.name not in self.radios:
+            return
+
+        stop_tasks = [
+            radio.stop()
+            for name, radio in self.radios[server.name].items()
+            if not radio_name or name == radio_name
+        ]
+
+        if stop_tasks:
+            await asyncio.gather(*stop_tasks)
 
     @proxy
     async def play_song(self, server: Server, radio_name: str, song: str) -> None:
         radio = self.radios.get(server.name, {}).get(radio_name)
         if radio:
-            await radio.play(song)
+            asyncio.create_task(radio.play(song))
 
     @proxy
     async def skip_song(self, server: Server, radio_name: str) -> None:
         radio = self.radios.get(server.name, {}).get(radio_name)
         if radio:
-            await radio.skip()
+            asyncio.create_task(radio.skip())
 
     @proxy
-    async def get_current_song(self, server: Server, radio_name: str) -> Optional[str]:
+    async def get_current_song(self, server: Server, radio_name: str) -> str | None:
         radio = self.radios.get(server.name, {}).get(radio_name)
         return radio.current if radio else None
 
@@ -104,19 +122,28 @@ class MusicService(Service):
         return radio.songs if radio else []
 
     @proxy
-    async def get_mode(self, server: Server, radio_name: str) -> Mode:
+    async def get_mode(self, server: Server, radio_name: str) -> Mode | None:
         radio = self.radios.get(server.name, {}).get(radio_name)
         if radio:
             return radio.mode
+        return None
 
     @proxy
     async def set_mode(self, server: Server, radio_name: str, mode: Mode) -> None:
         radio = self.radios.get(server.name, {}).get(radio_name)
         if radio:
             radio.mode = mode
+        return None
 
     @proxy
     async def set_config(self, server: Server, radio_name: str, config: dict) -> None:
         radio = self.radios.get(server.name, {}).get(radio_name)
         if radio:
             radio.config = config
+        return None
+
+    @proxy
+    async def reset_playlist(self, server: Server, radio_name: str) -> None:
+        radio = self.radios.get(server.name, {}).get(radio_name)
+        if radio:
+            radio.reset()

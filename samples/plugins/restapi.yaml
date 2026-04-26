@@ -1,3 +1,9 @@
 DEFAULT:
-  listen: 0.0.0.0   # the interface to bind the internal webserver to
-  port: 9876        # the port the internal webserver is listening on
+  prefix: stats # Optional: add a prefix for the WebService / REST API
+  api_key: 23n<2z23irgqwdgnqw7r2djhck # some sample API key (you can use any that you like to secure your API)
+  endpoints:
+    servers:
+      include_weather: true  # Include weather information in /servers endpoint (default: true)
+    server_attendance:
+      # Configuration options for the /server_attendance endpoint if needed in the future
+      enabled: true

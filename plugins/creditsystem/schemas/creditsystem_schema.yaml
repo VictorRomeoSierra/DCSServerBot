@@ -25,6 +25,19 @@ schema;element_schema:
     initial_points: {type: any, nullable: false, func: int_or_list, enum: ['initiator']}
     max_points: {type: int, range: {min: 1}, nullable: false}
     multiplier: {type: float, nullable: false}
+    points_on_rtb: {type: bool, nullable: false}
+    squadron_credits: {type: bool, nullable: false}
+    squadron:
+      type: map
+      nullable: false
+      mapping:
+        initial_points: {type: int, nullable: false, range: {min: 0}}
+        max_points: {type: int, nullable: false, range: {min: 0}}
+    messages:
+      type: map
+      nullable: false
+      mapping:
+        message_kill: {type: str, nullable: false, range: {min: 1}}
     points_per_kill:
       type: seq
       nullable: false
@@ -53,6 +66,12 @@ schema;element_schema:
             playtime: {type: int, range: {min: 0}, nullable: false}
             combined: {type: bool, nullable: false}
             role: {type: text, nullable: false}
+            badge:
+              type: map
+              nullable: true
+              mapping:
+                name: {type: str, nullable: false, range: {min: 1}}
+                img: {type: url, nullable: false}
     leaderboard:
       type: map
       nullable: false

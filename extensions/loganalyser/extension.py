@@ -1,22 +1,32 @@
 import aiofiles
 import asyncio
+import inspect
 import os
 import re
 
+from aiohttp import ClientSession, ClientResponseError
 from contextlib import suppress
-from core import Extension, Server, ServiceRegistry, Status, Coalition, utils, get_translation, Autoexec
+from core import Extension, Server, ServiceRegistry, Status, Coalition, utils, get_translation, Autoexec, InstanceImpl, \
+    async_cache
 from datetime import datetime
+from dateutil.parser import isoparse
+from packaging.version import parse
 from services.bot import BotService
 from services.servicebus import ServiceBus
-from typing import Callable
+from typing import Callable, cast
+from typing_extensions import override
 
 _ = get_translation(__name__.split('.')[1])
 
-ERROR_UNLISTED = r"ERROR\s+ASYNCNET\s+\(Main\):\s+Server update failed with code -?\d+\.\s+The server will be unlisted."
-ERROR_SCRIPT = r'SCRIPTING.*\[string "(.*)"\]:(\d+): (.*)'
-MOOSE_COMMIT_LOG = r"\*\*\* MOOSE GITHUB Commit Hash ID: (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+\d{2}:\d{2})-\w+ \*\*\*"
-NO_UPNP = r"\s+\(Main\):\s+No UPNP devices found."
-NO_TERRAIN = r"INFO\s+Dispatcher\s+\(Main\):\s+Terrain theatre\s*$"
+ERROR_DETECTIONS = {
+    "script errors": r'SCRIPTING.*\[string "(.*)"\]:(\d+): (.*)',
+    "upnp": r"\s+\(Main\):\s+No UPNP devices found.",
+    "missing terrain": r"INFO\s+Dispatcher\s+\(Main\):\s+Terrain theatre\s*$",
+    "regmapstorage": r"RegMapStorage has no more IDs",
+    "unlisted": r"ERROR\s+ASYNCNET\s+\(Main\):\s+Server update failed with code -?\d+\.\s+The server will be unlisted.",
+    "moose version": r"\*\*\* MOOSE GITHUB Commit Hash ID: (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+\-]\d{2}:\d{2}))-[0-9A-Fa-f]+ \*\*\*",
+    "mist version": r'\bINFO\s+SCRIPTING\s+\(Main\):\s+Mist version\s+(?P<version>\d+(?:\.\d+)+)\s+loaded\.'
+}
 
 __all__ = [
     "LogAnalyser"
@@ -24,6 +34,30 @@ __all__ = [
 
 
 class LogAnalyser(Extension):
+
+    CONFIG_DICT = {
+        "restart_on_unlist": {
+            "type": bool,
+            "label": _("Restart server on unlisting"),
+            "default": False,
+            "required": False
+        },
+        "disable_detections": {
+            "type": list,
+            "label": _("Disable detections"),
+            "options": [
+                "script errors",
+                "upnp",
+                "missing terrain",
+                "regmapstorage",
+                "unlisted",
+                "moose version",
+                "mist version"
+            ],
+            "min_values": 0,
+            "max_values": 7
+        }
+    }
 
     def __init__(self, server: Server, config: dict):
         super().__init__(server, config)
@@ -46,31 +80,47 @@ class LogAnalyser(Extension):
         self.stop_event.clear()
         self.stopped.clear()
         self.errors.clear()
-        #self.register_callback(ERROR_UNLISTED, self.unlisted)
-        self.register_callback(ERROR_SCRIPT, self.script_error)
-        self.register_callback(MOOSE_COMMIT_LOG, self.moose_log)
-        self.register_callback(NO_UPNP, self.disable_upnp)
-        self.register_callback(NO_TERRAIN, self.terrain_missing)
-        # noinspection PyAsyncCall
+        disabled = self.config.get('disable_detections', ['unlisted', 'regmapstorage'])
+        detections = ERROR_DETECTIONS.keys() - set(disabled)
+        if 'unlisted' in detections:
+            self.register_callback(ERROR_DETECTIONS['unlisted'], self.unlisted)
+        if 'script errors' in detections:
+            self.register_callback(ERROR_DETECTIONS['script errors'], self.script_error)
+        if 'upnp' in detections:
+            self.register_callback(ERROR_DETECTIONS['upnp'], self.disable_upnp)
+        if 'terrain' in detections:
+            self.register_callback(ERROR_DETECTIONS['missing terrain'], self.terrain_missing)
+        if 'regmapstorage' in detections:
+            self.register_callback(ERROR_DETECTIONS['regmapstorage'], self.restart_server)
+        if 'moose version' in detections:
+            self.register_callback(ERROR_DETECTIONS['moose version'], self.moose_check)
+        if 'mist version' in detections:
+            self.register_callback(ERROR_DETECTIONS['mist version'], self.mist_check)
         asyncio.create_task(self.check_log())
 
+    @override
     async def prepare(self) -> bool:
         with suppress(Exception):
             if os.path.exists(self.logfile):
                 os.remove(self.logfile)
         await self.do_startup()
         self.running = True
+        await super().prepare()
         return await super().startup()
 
-    async def startup(self) -> bool:
-        await self.do_startup()
-        return await super().startup()
+    @override
+    async def startup(self, *, quiet: bool = False) -> bool:
+        if not self.is_running():
+            await self.do_startup()
+            return await super().startup()
+        return False
 
     async def _shutdown(self):
         await self.stopped.wait()
         self.pattern.clear()
 
-    def shutdown(self) -> bool:
+    @override
+    def shutdown(self, *, quiet: bool = False) -> bool:
         self.loop.create_task(self._shutdown())
         self.stop_event.set()
         return super().shutdown()
@@ -80,6 +130,28 @@ class LogAnalyser(Extension):
         return os.path.expandvars(
             self.config.get('log', os.path.join(self.server.instance.home, 'Logs', 'dcs.log'))
         )
+
+    async def process_lines(self, lines: list[str]):
+        for idx, line in enumerate(lines):
+            if '=== Log closed.' in line:
+                self.log_pos = -1
+                return
+
+            for pattern, callback in self.pattern.items():
+                match = pattern.search(line)
+                if not match:
+                    continue
+
+                if inspect.iscoroutinefunction(callback):
+                    asyncio.create_task(
+                        callback(self.log_pos + idx, line, match),
+                        name=f"callback_{callback.__name__}_{self.log_pos + idx}"
+                    )
+                else:
+                    asyncio.create_task(
+                        asyncio.to_thread(callback, self.log_pos + idx, line, match),
+                        name=f"executor_{callback.__name__}_{self.log_pos + idx}"
+                    )
 
     async def check_log(self):
         try:
@@ -104,19 +176,9 @@ class LogAnalyser(Extension):
 
                         self.log_pos = await file.seek(self.log_pos, 0)
                         lines = await file.readlines()
-                        for idx, line in enumerate(lines):
-                            if '=== Log closed.' in line:
-                                self.log_pos = -1
-                                return
-                            for pattern, callback in self.pattern.items():
-                                match = pattern.search(line)
-                                if match:
-                                    if asyncio.iscoroutinefunction(callback):
-                                        asyncio.create_task(callback(self.log_pos + idx, line, match))
-                                    else:
-                                        self.loop.run_in_executor(None, callback, self.log_pos + idx, line, match)
+                        await self.process_lines(lines)
                         self.log_pos = await file.tell()
-                except FileNotFoundError:
+                except (PermissionError, FileNotFoundError):
                     pass
                 finally:
                     await asyncio.sleep(1)
@@ -144,7 +206,7 @@ class LogAnalyser(Extension):
             "params": params
         })
 
-    async def unlisted(self, idx: int, line: str, match: re.Match):
+    async def unlisted(self, _idx: int, _line: str, _match: re.Match):
         if not self.config.get('restart_on_unlist', False):
             return
         self.log.error(f"Server {self.server.name} got unlisted from the ED server list. Restarting ...")
@@ -154,7 +216,7 @@ class LogAnalyser(Extension):
             wait_times = [max(warn_times) - t for t in warn_times]
             warn_tasks = [self._send_warning(self.server, t) for t in wait_times if t > 0]
             # Gather tasks then wait
-            await asyncio.gather(*warn_tasks)
+            await utils.run_parallel_nofail(*warn_tasks)
         await self.node.audit("restart due to unlisting from the ED server list", server=self.server)
         await self.server.restart(modify_mission=False)
 
@@ -180,27 +242,52 @@ class LogAnalyser(Extension):
                     else:
                         marked_lines.append(f"{i}: {line.rstrip()}")
                 code_content = "\n".join(marked_lines)
+                # make sure we do not exceed 1024 characters
+                code_content = code_content[:1013]
                 kwargs['code'] = f"```lua\n{code_content}\n```"
             except PermissionError:
                 self.log.debug(f"Can't open file {filename} for reading!")
         kwargs['error'] = f"Line {target_line}: {error_message}"
         await self.node.audit("A LUA error occurred!", server=self.server, **kwargs)
 
-    async def script_error(self, idx: int, line: str, match: re.Match):
+    async def script_error(self, _idx: int, _line: str, match: re.Match):
         filename, line_number, error_message = match.groups()
-        if (filename, int(line_number)) in self.errors:
+        basename = os.path.basename(filename)
+
+        # Get the ignore-pattern from config. Defaults to an empty list if not present.
+        ignore_patterns = self.config.get('ignore_files', [])
+
+        # Check if the filename matches any of the regex patterns
+        if (any(re.match(pattern, basename) for pattern in ignore_patterns) or
+                (filename, int(line_number)) in self.errors):
             return
+
         await self._send_audit_msg(filename, int(line_number), error_message)
         self.errors.add((filename, int(line_number)))
 
-    async def moose_log(self, idx: int, line: str, match: re.Match):
+    @async_cache
+    async def get_latest_moose_version(self) -> tuple[str, datetime]:
+        url = "https://api.github.com/repos/FlightControl-Master/MOOSE/releases/latest"
+        async with ClientSession() as session:
+            async with session.get(url, proxy=self.node.proxy, proxy_auth=self.node.proxy_auth) as response:
+                response.raise_for_status()
+                data = await response.json()
+        return data['tag_name'], datetime.fromisoformat(data['created_at'].replace("Z", "+00:00"))
+
+    async def moose_check(self, _idx: int, _line: str, match: re.Match):
+        try:
+            moose_version, moose_timestamp = await self.get_latest_moose_version()
+        except ClientResponseError:
+            return
         timestamp_str = match.group(1)
-        timestamp = datetime.fromisoformat(timestamp_str)
-        if timestamp < datetime.fromisoformat('2024-09-03T16:47:17+02:00'):
+        # we need to use isoparse here
+        timestamp = isoparse(timestamp_str)
+        if timestamp < moose_timestamp:
+            mission_name = self.server.current_mission.name if self.server.current_mission else f"on server {self.server.name}"
             embed = utils.create_warning_embed(
                 title='Outdated Moose version found!',
-                text=f"Mission {self.server.current_mission.name} is using an old Moose version. "
-                     f"You will probably see performance issues!")
+                text=f"Mission {mission_name} is using an outdated Moose version. "
+                     f"Please upgrade to the latest version {moose_version}.")
             try:
                 await self.bus.send_to_node_sync({
                     "command": "rpc",
@@ -213,18 +300,55 @@ class LogAnalyser(Extension):
             except Exception as ex:
                 self.log.exception(ex)
 
-    async def disable_upnp(self, idx: int, line: str, match: re.Match):
-        autoexec = Autoexec(self.server.instance)
+    @async_cache
+    async def get_latest_mist_version(self) -> str:
+        url = "https://api.github.com/repos/mrSkortch/MissionScriptingTools/releases/latest"
+        async with ClientSession() as session:
+            async with session.get(url, proxy=self.node.proxy, proxy_auth=self.node.proxy_auth) as response:
+                response.raise_for_status()
+                data = await response.json()
+        return data['tag_name']
+
+    async def mist_check(self, _idx: int, _line: str, match: re.Match):
+        try:
+            mist_version = await self.get_latest_mist_version()
+        except ClientResponseError:
+            return
+        version = match.group(1)
+        if parse(version) < parse(mist_version):
+            mission_name = self.server.current_mission.name if self.server.current_mission else f"on server {self.server.name}"
+            embed = utils.create_warning_embed(
+                title='Outdated MIST version found!',
+                text=f"Mission {mission_name} is using MIST version {version}, which is outdated. "
+                     f"Please upgrade to the latest version {mist_version}.")
+            try:
+                await self.bus.send_to_node_sync({
+                    "command": "rpc",
+                    "service": BotService.__name__,
+                    "method": "send_message",
+                    "params": {
+                        "embed": embed.to_dict()
+                    }
+                })
+            except Exception as ex:
+                self.log.exception(ex)
+
+    async def disable_upnp(self, _idx: int, _line: str, _match: re.Match):
+        autoexec = Autoexec(cast(InstanceImpl, self.server.instance))
         net = autoexec.net or {}
         net |= {
             "use_upnp": False
         }
         autoexec.net = net
 
-    async def terrain_missing(self, idx: int, line: str, match: re.Match):
+    async def terrain_missing(self, _idx: int, _line: str, _match: re.Match):
         filename = await self.server.get_current_mission_file()
         theatre = await self.server.get_current_mission_theatre()
         if theatre:
             await self.send_alert(title="Terrain Missing!",
                                   message=f"Terrain {theatre} is not installed on this server!\n"
                                           f"You can't run mission {filename}.")
+
+    async def restart_server(self, _idx: int, line: str, _match: re.Match):
+        self.log.warning(f"Server restarting due to critical error: {line.rstrip()}")
+        asyncio.create_task(self.server.restart(modify_mission=False))

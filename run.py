@@ -1,30 +1,52 @@
 from __future__ import annotations
 
+# Default imports
 import asyncio
 import certifi
 import discord
+import faulthandler
 import logging
 import os
-import pathlib
-import platform
+import psutil
 import psycopg
 import sys
 import time
+import traceback
 
-from core import (
-    NodeImpl, ServiceRegistry, ServiceInstallationError, utils, YAMLError, FatalException, COMMAND_LINE_ARGS,
-    CloudRotatingFileHandler
-)
 from datetime import datetime
-from pid import PidFile, PidFileError
-from rich import print
-from rich.console import Console
-from rich.logging import RichHandler
-from rich.text import Text
+from pathlib import Path
+from psycopg import OperationalError
+from pykwalify.errors import SchemaError
+from typing import Any, Coroutine
 
-# ruamel YAML support
-from ruamel.yaml import YAML
-yaml = YAML()
+# DCSServerBot imports
+try:
+    from core import (
+        NodeImpl, ServiceRegistry, ServiceInstallationError, utils, YAMLError, FatalException, COMMAND_LINE_ARGS,
+        CloudRotatingFileHandler, wait_for_internet, ProcessManager, InstallationException
+)
+    from pid import PidFile, PidFileError
+    from rich import print
+    from rich.console import Console
+    from rich.logging import RichHandler
+    from rich.text import Text
+    from services.bot import IgnoreUnknownInteraction
+
+    # ruamel YAML support
+    from ruamel.yaml import YAML
+    yaml = YAML()
+except ModuleNotFoundError as ex:
+    import subprocess
+
+    print(f"Module {ex.name} is not installed, fixing ...")
+    cmd = [
+        sys.executable,
+        '-m', 'piptools', 'sync', 'requirements.txt'
+    ]
+    if os.path.exists("requirements.local"):
+        cmd.append('requirements.local')
+    subprocess.run(cmd)
+    exit(-1)
 
 LOGLEVEL = {
     'DEBUG': logging.DEBUG,
@@ -42,7 +64,6 @@ class Main:
         self.node = node
         self.log = logging.getLogger(__name__)
         self.no_autoupdate = no_autoupdate
-        utils.dynamic_import('services')
 
     @staticmethod
     def setup_logging(node: str, config_dir: str):
@@ -55,7 +76,7 @@ class Main:
 
         # Setup file logging
         try:
-            config = yaml.load(pathlib.Path(os.path.join(config_dir, 'main.yaml')).read_text(encoding='utf-8'))['logging']
+            config = yaml.load(Path(os.path.join(config_dir, 'main.yaml')).read_text(encoding='utf-8'))['logging']
         except (FileNotFoundError, KeyError, YAMLError):
             config = {}
         os.makedirs('logs', exist_ok=True)
@@ -76,10 +97,15 @@ class Main:
         # Change 3rd-party logging
         logging.getLogger(name='asyncio').setLevel(logging.WARNING)
         logging.getLogger(name='discord').setLevel(logging.ERROR)
+        logging.getLogger(name='discord.app_commands.tree').addFilter(
+            IgnoreUnknownInteraction()
+        )
         logging.getLogger(name="eye3d").setLevel(logging.ERROR)
         logging.getLogger(name='git').setLevel(logging.WARNING)
         logging.getLogger(name='matplotlib').setLevel(logging.ERROR)
+        logging.getLogger(name="multipart").setLevel(logging.ERROR)
         logging.getLogger(name='PidFile').setLevel(logging.ERROR)
+        logging.getLogger(name='PIL').setLevel(logging.INFO)
         logging.getLogger(name='psycopg.pool').setLevel(logging.WARNING)
         logging.getLogger(name='pykwalify').setLevel(logging.CRITICAL)
 
@@ -107,12 +133,18 @@ class Main:
             print(f"{key}: {utils.get_password(key, config_dir)}")
         print("\n[red]DO NOT SHARE THESE SECRET KEYS![/]")
 
+    async def start_service(self, registry: ServiceRegistry, cls: Any) -> None:
+        try:
+            await registry.new(cls).start()
+        except Exception as ex:
+            self.log.error(f"  - {ex.__str__()}")
+            self.log.error(f"  => {cls.__name__} NOT loaded.")
+
     async def run(self):
-        await self.node.post_init()
         # check for updates
         if self.no_autoupdate:
             autoupdate = False
-            # remove the exec parameter, to allow restart/update of the node
+            # remove the exec parameter to allow restart/update of the node
             if '--x' in sys.argv:
                 sys.argv.remove('--x')
             elif '--noupdate' in sys.argv:
@@ -121,7 +153,7 @@ class Main:
             autoupdate = self.node.locals.get('autoupdate', self.node.config.get('autoupdate', False))
 
         if autoupdate:
-            cloud_drive = self.node.locals.get('cloud_drive', True)
+            cloud_drive = self.node.locals.get('cluster', {}).get('cloud_drive', True)
             if (cloud_drive and self.node.master) or not cloud_drive:
                 await self.node.upgrade()
                 if self.node.is_shutdown.is_set():
@@ -130,54 +162,135 @@ class Main:
             self.log.warning(
                 "New update for DCSServerBot available!\nUse /node upgrade or enable autoupdate to apply it.")
 
+        me = psutil.Process(os.getpid())
+        ProcessManager(
+            auto_affinity=self.node.locals.get('auto_affinity', {}).get('enabled', False),
+            excluded_cores=self.node.locals.get('auto_affinity', {}).get('excluded_cores', [])
+        ).assign_process(
+            me,
+            min_cores=self.node.locals.get('auto_affinity', {}).get('min_cores', 1),
+            max_cores=self.node.locals.get('auto_affinity', {}).get('max_cores', 2),
+            quality=self.node.locals.get('auto_affinity', {}).get('quality', 1),
+            instance='DCSServerBot'
+        )
         await self.node.register()
+        db_available = True
         async with ServiceRegistry(node=self.node) as registry:
             self.log.info("DCSServerBot {} started.".format("MASTER" if self.node.master else "AGENT"))
             try:
-                while True:
-                    # wait until the master changes
-                    while self.node.master == await self.node.heartbeat():
-                        if self.node.is_shutdown.is_set():
-                            return
-                        await asyncio.sleep(5)
+                while not self.node.is_shutdown.is_set():
+                    if self.node.claimed_master == self.node.master:
+                        await asyncio.sleep(1)
+                        continue
+
                     # switch master
-                    self.node.master = not self.node.master
-                    if self.node.master:
+                    if self.node.claimed_master:
                         self.log.info("Taking over as the MASTER node ...")
-                        # start all master only services
+                        # start all the master-only services
+                        tasks = []
                         for cls in [x for x in registry.services().keys() if registry.master_only(x)]:
-                            try:
-                                await registry.new(cls).start()
-                            except ServiceInstallationError as ex:
-                                self.log.error(f"  - {ex.__str__()}")
-                                self.log.error(f"  => {cls.__name__} NOT loaded.")
-                        # now switch all others
+                            tasks.append(self.start_service(registry, cls))
+                        await asyncio.gather(*tasks)
+                        # now we are the real master
+                        self.node.commit_claimed_master()
+
+                        # switch all others services / register the agent nodes
+                        tasks = []
                         for cls in [x for x in registry.services().keys() if not registry.master_only(x)]:
                             service = registry.get(cls)
                             if service:
-                                await service.switch()
+                                tasks.append(service.switch(True))
+                        await asyncio.gather(*tasks)
                     else:
                         self.log.info("Second MASTER found, stepping back to AGENT configuration.")
+
+                        tasks = []
                         for cls in registry.services().keys():
                             if registry.master_only(cls):
-                                await registry.get(cls).stop()
-                            else:
+                                tasks.append(registry.get(cls).stop())
+                        await asyncio.gather(*tasks)
+                        self.node.commit_claimed_master()
+
+                        tasks = []
+                        for cls in registry.services().keys():
+                            if not registry.master_only(cls):
                                 service = registry.get(cls)
                                 if service:
-                                    await service.switch()
-                    self.log.info(f"I am the {'MASTER' if self.node.master else 'AGENT'} now.")
+                                    tasks.append(service.switch(False))
+                        await asyncio.gather(*tasks)
+            except OperationalError:
+                db_available = False
+                raise
             except Exception as ex:
                 self.log.exception(ex)
-                self.log.warning("Aborting the main loop.")
                 raise
             finally:
-                await self.node.unregister()
+                self.log.warning("Aborting the main loop ...")
+                if db_available:
+                    await self.node.unregister()
 
 
-async def run_node(name, config_dir=None, no_autoupdate=False) -> int:
-    async with NodeImpl(name=name, config_dir=config_dir) as node:
+def handle_exception(loop, context):
+    # Extract exception details from context
+    exception = context.get('exception')
+    message = context.get('message')
+
+    # Log detailed information
+    if exception:
+        log.error(f"Async error: {message}", exc_info=exception)
+    else:
+        log.error(f"Async error: {message}")
+
+    # Write to async_errors.log with task information
+    with open(os.path.join('logs', 'async_errors.log'), 'a', encoding='utf-8') as f:
+        f.write(f"\n{'=' * 50}\n{datetime.now().isoformat()}: {message}\n")
+
+        # Dump all running tasks
+        f.write("\nRunning tasks:\n")
+        for task in asyncio.all_tasks(loop):
+            f.write(f"Task {task.get_name()}: {str(task)}\n")
+            # Get task stack
+            stack = task.get_stack()
+            if stack:
+                f.write('Stack:\n')
+                f.write(''.join(traceback.format_stack(stack[-1])))
+            f.write('\n')
+
+        if exception:
+            f.write("\nException details:\n")
+            traceback.print_exception(type(exception), exception, exception.__traceback__, file=f)
+        f.write(f"{'=' * 50}\n")
+
+
+async def run_node(name, config_dir=None, no_autoupdate=False, restarted=False) -> int:
+    loop = asyncio.get_running_loop()
+    loop.set_exception_handler(handle_exception)
+
+    async with NodeImpl(name=name, config_dir=config_dir, restarted=restarted) as node:
         await Main(node, no_autoupdate=no_autoupdate).run()
         return node.rc
+
+async def restore_node(name: str, config_dir: str, restarted: bool) -> int:
+    from restore import Restore
+
+    print("[blink][red]"
+          "***********************\n"
+          "*** RESTORE PROCESS ***\n"
+          "***********************\n"
+          "[/red][/blink]")
+    print("")
+    print("Processing ...")
+    restore = Restore(name, config_dir, quiet=restarted)
+    return await restore.run(Path('restore'), delete=True)
+
+
+def myasyncio_run(func: Coroutine[Any, Any, Any]) -> Any:
+    if sys.platform == "win32" and sys.version_info >= (3, 14):
+        import selectors
+
+        return asyncio.run(func, loop_factory=lambda: asyncio.SelectorEventLoop(selectors.SelectSelector()))
+    else:
+        return asyncio.run(func)
 
 
 if __name__ == "__main__":
@@ -186,8 +299,9 @@ if __name__ == "__main__":
     if sys.platform == 'win32':
         # disable quick edit mode (thanks to Moots)
         utils.quick_edit_mode(False)
-        # set the asyncio event loop policy
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        if sys.version_info < (3, 14):
+            # set the asyncio event loop policy
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
     # get the command line args from core
     args = COMMAND_LINE_ARGS
@@ -195,16 +309,32 @@ if __name__ == "__main__":
     # Setup the logging
     Main.setup_logging(args.node, args.config)
     log = logging.getLogger("dcsserverbot")
+
+    # Waiting for the network connection to be active
+    if args.ping:
+        # wait for an internet connection to be available (after system reboots)
+        log.info("Waiting for the network ...")
+        if not myasyncio_run(wait_for_internet(host="8.8.8.8", timeout=300.0)):
+            print("Internet connection not available. Exiting.")
+            exit(-1)
+        log.info("Network connection available.\n")
+
     # check if we should reveal the passwords
     utils.create_secret_dir(args.config)
     if args.secret:
         Main.reveal_passwords(args.config)
         exit(-2)
 
-    # Check versions
-    if int(platform.python_version_tuple()[0]) < 3 or int(platform.python_version_tuple()[1]) < 10:
-        log.error("You need Python 3.10 or higher to run DCSServerBot!")
-        exit(-2)
+    # Require Python >= 3.10
+    if sys.version_info < (3,10):
+        print("ERROR: DCSServerBot requires Python >= 3.10.")
+        sys.exit(-2)
+    elif sys.version_info < (3,11):
+        print(
+"""
+WARNING: DCSServerBot will drop support for Pyton 3.10 soon.
+         Please upgrade to Python 3.11+
+""")
 
     # Add certificates
     os.environ["SSL_CERT_FILE"] = certifi.where()
@@ -214,47 +344,75 @@ if __name__ == "__main__":
         from migrate import migrate_3
 
         migrate_3(node=args.node)
+
+    # Call the restore process
+    if os.path.exists('restore'):
+        rc = myasyncio_run(restore_node(name=args.node, config_dir=args.config, restarted=args.restarted))
+        if rc:
+            exit(rc)
+        else:
+            print("")
+
+    fault_log = open(os.path.join('logs', 'fault.log'), 'w')
     try:
+        # enable faulthandler
+        faulthandler.enable(file=fault_log, all_threads=True)
+
         with PidFile(pidname=f"dcssb_{args.node}", piddir='.'):
             try:
-                rc = asyncio.run(run_node(name=args.node, config_dir=args.config, no_autoupdate=args.noupdate))
-            except FatalException:
+                rc = myasyncio_run(run_node(
+                    name=args.node,
+                    config_dir=args.config,
+                    no_autoupdate=args.noupdate,
+                    restarted=args.restarted
+                ))
+            except InstallationException:
                 from install import Install
 
                 Install(node=args.node).install(config_dir=args.config, user='dcsserverbot', database='dcsserverbot')
-                rc = asyncio.run(run_node(name=args.node, config_dir=args.config, no_autoupdate=args.noupdate))
-    except PermissionError:
+                rc = myasyncio_run(run_node(
+                    name=args.node,
+                    config_dir=args.config,
+                    no_autoupdate=args.noupdate,
+                    restarted=args.restarted
+                ))
+    except PermissionError as ex:
+        log.error(f"There is a permission error: {ex}", exc_info=True)
         # do not restart again
-        log.error("There is a permission error.")
-        log.error(f"Did you run DCSServerBot as Admin before? If yes, delete dcssb_{args.node}.pid and try again.")
-        exit(-2)
+        rc = -2
     except PidFileError:
         log.error(f"Process already running for node {args.node}!")
         log.error(f"If you are sure there is no 2nd process running, delete dcssb_{args.node}.pid and try again.")
         # do not restart again
-        exit(-2)
+        rc = -2
     except KeyboardInterrupt:
         # restart again (old handling)
-        exit(-1)
+        rc = -1
     except asyncio.CancelledError:
+        log.warning("Main loop cancelled.")
         # do not restart again
-        exit(-2)
+        rc = -2
     except (YAMLError, FatalException) as ex:
         log.exception(ex)
         input("Press any key to continue ...")
         # do not restart again
-        exit(-2)
+        rc = -2
     except psycopg.OperationalError as ex:
-        log.error(f"Database Error: {ex}", exc_info=True)
-        input("Press any key to continue ...")
-        # do not restart again
-        exit(-2)
+        log.exception(ex)
+        # try again on Database errors
+        rc = -1
+    except SchemaError as ex:
+        log.error(ex)
+        rc = -2
     except SystemExit as ex:
-        exit(ex.code)
+        rc = ex.code
+        if rc not in [0, -1, -2]:
+            log.exception(ex)
     except:
         console.print_exception(show_locals=True, max_frames=1)
-        # restart on unknown errors
-        exit(-1)
+        # do not restart on unknown errors
+        rc = -2
     finally:
         log.info("DCSServerBot stopped.")
+        fault_log.close()
     exit(rc)

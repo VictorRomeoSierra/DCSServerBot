@@ -1,10 +1,11 @@
 import asyncio
 import discord
 
-from core import EventListener, Server, Status, utils, event, chat_command, get_translation
-from typing import cast, Union, TYPE_CHECKING
+from core import EventListener, Server, Status, utils, event, chat_command, get_translation, DataObjectFactory
+from typing import cast, TYPE_CHECKING, Literal
 
 from .player import CreditPlayer
+from .squadron import Squadron
 
 if TYPE_CHECKING:
     from .commands import CreditSystem
@@ -14,12 +15,16 @@ _ = get_translation(__name__.split('.')[1])
 
 class CreditSystemListener(EventListener["CreditSystem"]):
 
+    def __init__(self, plugin: "CreditSystem"):
+        super().__init__(plugin)
+        self.squadrons: dict[str, Squadron] = {}
+
     @staticmethod
     def get_points_per_kill(config: dict, data: dict) -> int:
         default = 1
         if 'points_per_kill' in config:
             for unit in config['points_per_kill']:
-                if 'category' in unit and data['victimCategory'] != unit['category']:
+                if 'category' in unit and data.get('victimCategory', 'Planes') != unit['category']:
                     continue
                 if 'unit_type' in unit and unit['unit_type'] != data['arg5']:
                     continue
@@ -29,8 +34,8 @@ class CreditSystemListener(EventListener["CreditSystem"]):
                 if 'category' in unit or 'unit_type' in unit or 'type' in unit:
                     return unit['points']
                 elif 'default' in unit:
-                    default = unit['default'] if data['victimCategory'] != 'Structures' else 0
-        return default if data['victimCategory'] != 'Structures' else 0
+                    default = unit['default'] if data.get('victimCategory', 'Planes') != 'Structures' else 0
+        return default if data.get('victimCategory', 'Planes') != 'Structures' else 0
 
     def get_initial_points(self, player: CreditPlayer, config: dict) -> int:
         if not config or 'initial_points' not in config:
@@ -57,49 +62,78 @@ class CreditSystemListener(EventListener["CreditSystem"]):
         if not player:
             return
         if player.points == -1:
+            # do not add initial points to squadrons
+            squadron = player.squadron
+            player.squadron = None
             player.points = self.get_initial_points(player, config)
             player.audit('init', 0, _('Initial points received'))
+            player.squadron = squadron
         else:
-            # noinspection PyAsyncCall
             asyncio.create_task(server.send_to_dcs({
                 'command': 'updateUserPoints',
                 'ucid': player.ucid,
                 'points': player.points
             }))
         if config:
-            # noinspection PyAsyncCall
             asyncio.create_task(player.sendChatMessage(_("{name}, you currently have {credits} credit points.").format(
                 name=player.name, credits=player.points)))
 
     @event(name="addUserPoints")
     async def addUserPoints(self, server: Server, data: dict) -> None:
-        if data['points'] != 0:
-            player: CreditPlayer = cast(CreditPlayer, server.get_player(name=data['name']))
-            if not player:
-                return
-            old_points = player.points
-            multiplier = self.plugin.get_config(server).get('multiplier', 0)
-            points_to_add = int(data['points'])
-            if multiplier:
-                player.deposit += points_to_add * multiplier
+        if data.get('points', 0) == 0:
+            return
+        player: CreditPlayer = cast(CreditPlayer, server.get_player(name=data.get('name')))
+        if not player:
+            return
+
+        config = self.plugin.get_config(server)
+        old_points = player.points
+        points_to_add = int(data['points'])
+        player.deposit += points_to_add * config.get('multiplier', 1.0)
+        # only add the credit points directly if points_on_rtb is false
+        if not config.get('points_on_rtb', False):
             player.points += points_to_add
             if old_points != player.points:
                 player.audit('mission', old_points, data.get('reason', _('Unknown mission achievement')))
+
+    def _ensure_squadron(self, server: Server, squadron_name: str) -> Squadron | None:
+        squadron = self.squadrons.get(squadron_name)
+        if not squadron:
+            campaign_id, name = utils.get_running_campaign(self.node, server)
+            if not campaign_id:
+                self.log.warning("You need an active campaign to use squadron credits!")
+                return None
+            squadron = DataObjectFactory().new(Squadron, node=self.node, name=squadron_name, campaign_id=campaign_id)
+            self.squadrons[squadron_name] = squadron
+        return squadron
+
+    @event(name="addSquadronPoints")
+    async def addSquadronPoints(self, server: Server, data: dict) -> None:
+        if data['points'] != 0:
+            squadron = self._ensure_squadron(server, data['squadron'])
+            if not squadron:
+                return
+            old_points = squadron.points
+            squadron.points += int(data['points'])
+            if old_points != squadron.points:
+                squadron.audit('mission', old_points, data.get('reason', _('Unknown mission achievement')))
 
     async def get_flighttime(self, ucid: str, campaign_id: int) -> int:
         async with self.apool.connection() as conn:
             cursor = await conn.execute("""
                 SELECT COALESCE(ROUND(SUM(EXTRACT(EPOCH FROM (s.hop_off - s.hop_on)))), 0) AS playtime 
-                FROM statistics s, missions m, campaigns c, campaigns_servers cs 
-                WHERE s.player_ucid = %s AND c.id = %s AND s.mission_id = m.id AND cs.campaign_id = c.id 
+                FROM statistics s JOIN missions m ON m.id = s.mission_id 
+                JOIN campaigns c ON c.id = %(campaign_id)s
+                JOIN campaigns_servers cs ON cs.campaign_id = c.id
+                WHERE s.player_ucid = %(ucid)s 
                 AND m.server_name = cs.server_name 
                 AND tsrange(s.hop_on, s.hop_off) && tsrange(c.start, c.stop)
-            """, (ucid, campaign_id))
+            """, {"campaign_id": campaign_id, "ucid": ucid})
             return int((await cursor.fetchone())[0])
 
     async def process_achievements(self, server: Server, player: CreditPlayer):
 
-        async def manage_role(member: discord.Member, role: Union[str, int], action: str):
+        async def manage_role(role: str | int, action: Literal['add', 'remove']):
             _role = self.bot.get_role(role)
             if not _role:
                 self.log.error(f"Role {role} not found in your Discord!")
@@ -115,38 +149,72 @@ class CreditSystemListener(EventListener["CreditSystem"]):
                 self.log.error(
                     f'The bot needs the "Manage Roles" permission or needs to be placed higher than role {_role.name}!')
 
-        # only linked player can achieve roles
-        member = player.member
-        if not member:
-            return
+        async def manage_badge(badge: dict, action: Literal['add', 'remove']):
+            if action == "add":
+                async with self.apool.connection() as conn:
+                    await conn.execute("""
+                        INSERT INTO players_badges (campaign_id, player_ucid, badge_name, badge_url) 
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (campaign_id, player_ucid) DO NOTHING
+                    """, (campaign_id, player.ucid, badge['name'], badge['img']))
+                    await self.bot.audit(f"achieved the badge {badge['name']}", user=player.ucid)
+            elif action == "remove":
+                async with self.apool.connection() as conn:
+                    await conn.execute("""
+                        DELETE FROM players_badges WHERE campaign_id = %s AND player_ucid = %s
+                    """, (campaign_id, player.ucid))
+                    await self.bot.audit(f"lost the badge {badge['name']}", user=player.ucid)
+
         config: dict = self.plugin.get_config(server)
         if 'achievements' not in config:
             return
 
-        campaign_id, _ = utils.get_running_campaign(self.bot, server)
+        campaign_id, _ = utils.get_running_campaign(self.node, server)
+        # if no campaign is running - we can't do any achievements
+        if not campaign_id:
+            return
+        # only members can get roles
+        member = player.member
         playtime = (await self.get_flighttime(player.ucid, campaign_id)) / 3600.0
         sorted_achievements = sorted(config['achievements'],
                                      key=lambda x: x['credits'] if 'credits' in x else x['playtime'],
                                      reverse=True)
-        given = False
+        role_given = badge_given = False
         for achievement in sorted_achievements:
-            if given:
-                await manage_role(member, achievement['role'], 'remove')
+            if role_given or badge_given:
+                if role_given:
+                    await manage_role(achievement['role'], 'remove')
+                if badge_given:
+                    await manage_badge(achievement['badge'], 'remove')
                 continue
             if achievement.get('combined'):
                 if ('credits' in achievement and player.points >= achievement['credits']) and \
                         ('playtime' in achievement and playtime >= achievement['playtime']):
-                    await manage_role(member, achievement['role'], 'add')
-                    given = True
+                    if 'role' in achievement and member:
+                        await manage_role(achievement['role'], 'add')
+                        role_given = True
+                    if 'badge' in achievement:
+                        await manage_badge(achievement['badge'], 'add')
+                        badge_given = True
                 else:
-                    await manage_role(member, achievement['role'], 'remove')
+                    if 'role' in achievement and member:
+                        await manage_role(achievement['role'], 'remove')
+                    if 'badge' in achievement:
+                        await manage_badge(achievement['badge'], 'remove')
             else:
                 if ('credits' in achievement and player.points >= achievement['credits']) or \
                         ('playtime' in achievement and playtime >= achievement['playtime']):
-                    await manage_role(member, achievement['role'], 'add')
-                    given = True
+                    if 'role' in achievement and member:
+                        await manage_role(achievement['role'], 'add')
+                        role_given = True
+                    if 'badge' in achievement:
+                        await manage_badge(achievement['badge'], 'add')
+                        badge_given = True
                 else:
-                    await manage_role(member, achievement['role'], 'remove')
+                    if 'role' in achievement and member:
+                        await manage_role(achievement['role'], 'remove')
+                    if 'badge' in achievement:
+                        await manage_badge(achievement['badge'], 'remove')
 
     @event(name="onGameEvent")
     async def onGameEvent(self, server: Server, data: dict) -> None:
@@ -154,9 +222,8 @@ class CreditSystemListener(EventListener["CreditSystem"]):
         if not config or server.status != Status.RUNNING:
             return
         if data['eventName'] == 'kill':
-            # players gain points only, if they don't kill themselves and no teamkills
+            # players gain points only if they don't kill themselves and no teamkills
             if data['arg1'] != -1 and data['arg1'] != data['arg4'] and data['arg3'] != data['arg6']:
-                multiplier = config.get('multiplier', 0)
                 # Multicrew - pilot and all crew members gain points
                 for player in server.get_crew_members(server.get_player(id=data['arg1'])):  # type: CreditPlayer
                     ppk = self.get_points_per_kill(config, data)
@@ -164,28 +231,35 @@ class CreditSystemListener(EventListener["CreditSystem"]):
                         old_points = player.points
                         # We will add the PPK to the deposit to allow for multiplied paybacks
                         # (to be configured in Slotblocking)
-                        if multiplier:
-                            player.deposit += ppk * multiplier
+                        player.deposit += ppk * config.get('multiplier', 1.0)
                         player.points += ppk
                         player.audit('kill', old_points, _("for killing {}").format(data['arg5']))
+                        victim = server.get_player(id=data['arg4'])
+                        message_kill = config.get('messages', {}).get('message_kill')
+                        if message_kill:
+                            await player.sendUserMessage(message_kill.format(
+                                points=ppk, victim=victim.name if victim else f"AI in {data['arg5']}"))
 
         elif data['eventName'] == 'disconnect':
             server: Server = self.bot.servers[data['server_name']]
             player = cast(CreditPlayer, server.get_player(id=data['arg1']))
             if player:
-                # noinspection PyAsyncCall
                 asyncio.create_task(self.process_achievements(server, player))
 
     @event(name="onCampaignReset")
-    async def onCampaignReset(self, server: Server, data: dict) -> None:
+    async def onCampaignReset(self, server: Server, _data: dict) -> None:
         if server.status != Status.RUNNING:
             return
         config = self.plugin.get_config(server)
         for player in server.get_active_players():  # type: CreditPlayer
+            # do not add initial points to squadrons
+            squadron = player.squadron
+            player.squadron = None
             player.points = self.get_initial_points(player, config)
+            player.squadron = squadron
 
     @chat_command(name="credits", help=_("Shows your current credits"))
-    async def credits(self, server: Server, player: CreditPlayer, params: list[str]):
+    async def credits(self, _server: Server, player: CreditPlayer, _params: list[str]):
         message = _("You currently have {} credit points").format(player.points)
         if player.deposit > 0:
             message += f", {player.deposit} on deposit"
@@ -224,9 +298,16 @@ class CreditSystemListener(EventListener["CreditSystem"]):
             return
         old_points_player = player.points
         old_points_receiver = receiver.points
+        squadron = player.squadron
+        player.squadron = None
         player.points -= donation
+        player.squadron = squadron
         player.audit('donation', old_points_player, _("Donation to player {}").format(receiver.name))
+        # do not donate to a squadron
+        squadron = receiver.squadron
+        receiver.squadron = None
         receiver.points += donation
+        receiver.squadron = squadron
         receiver.audit('donation', old_points_receiver, _("Donation from player {}").format(player.name))
         await player.sendChatMessage(_("You've donated {donation} credit points to player {name}.").format(
             donation=donation, name=name))
@@ -235,8 +316,6 @@ class CreditSystemListener(EventListener["CreditSystem"]):
 
     @chat_command(name="tip", help=_("Tip a GCI with points"))
     async def tip(self, server: Server, player: CreditPlayer, params: list[str]):
-        player: CreditPlayer = cast(CreditPlayer, player)
-
         if not params:
             await player.sendChatMessage(_("Usage: {prefix}{command} points [gci_number]").format(
                 prefix=self.prefix, command=self.tip.name))

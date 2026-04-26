@@ -1,12 +1,15 @@
 from __future__ import annotations
 import inspect
+import logging
 
+from abc import ABCMeta
 from dataclasses import MISSING
-from typing import TypeVar, TYPE_CHECKING, Any, Type, Optional, Iterable, Callable, Union, Generic
+from typing import TypeVar, TYPE_CHECKING, Any, Type, Iterable, Callable, Generic
 
 if TYPE_CHECKING:
     from core import Plugin, Server, Player
     from services.bot import DCSServerBot
+    from services.servicebus import ServiceBus
 
 __all__ = [
     "Event",
@@ -55,13 +58,14 @@ def chat_command(name: str = MISSING, cls: Type[ChatCommand] = MISSING, **attrs)
 
 class ChatCommand:
     def __init__(self, func, **kwargs):
-        self.name: str = kwargs.get('name', func.__name__)
+        self.name: str = kwargs.get('name') or func.__name__
         self.help: str = inspect.cleandoc(kwargs.get('help', ''))
-        self.roles: list[[Union[str, int]]] = kwargs.get('roles', [])
-        self.usage: str = kwargs.get('usage')
+        self.roles: list[str | int] = kwargs.get('roles', [])
+        self.usage: str | None = kwargs.get('usage')
         self.aliases: list[str] = kwargs.get('aliases', [])
         self.callback = func
         self.enabled = kwargs.get('enabled', True)
+        self.hidden = kwargs.get('hidden', False)
 
     async def __call__(self, listener: EventListener, server: Server, player: Player, params: list[str]) -> None:
         await self.callback(listener, server, player, params)
@@ -91,7 +95,12 @@ class EventListenerMeta(type):
         return new_cls
 
 
-class EventListener(Generic[TPlugin], metaclass=EventListenerMeta):
+class EventListenerMetaABC(EventListenerMeta, ABCMeta):
+    """Metaclass to prevent instantiation of EventListener classes."""
+    pass
+
+
+class EventListener(Generic[TPlugin], metaclass=EventListenerMetaABC):
     __events__: dict[str, Event]
     __chat_commands__: dict[str, ChatCommand]
     __all_commands__: dict[str, ChatCommand]
@@ -111,8 +120,9 @@ class EventListener(Generic[TPlugin], metaclass=EventListenerMeta):
         self.plugin: TPlugin = plugin
         self.plugin_name = type(self).__module__.split('.')[-2]
         self.bot: DCSServerBot = plugin.bot
+        self.bus: ServiceBus = self.bot.bus
         self.node = plugin.node
-        self.log = plugin.log
+        self.log = logging.getLogger(f"{self.__class__.__module__}.{self.__class__.__name__}")
         self.pool = plugin.pool
         self.apool = plugin.apool
         self.locals: dict = plugin.locals
@@ -138,8 +148,8 @@ class EventListener(Generic[TPlugin], metaclass=EventListenerMeta):
         except Exception as ex:
             self.log.exception(ex)
 
-    def get_config(self, server: Optional[Server] = None, *, plugin_name: Optional[str] = None,
-                   use_cache: Optional[bool] = True) -> dict:
+    def get_config(self, server: Server | None = None, *, plugin_name: str | None = None,
+                   use_cache: bool | None = True) -> dict:
         return self.plugin.get_config(server, plugin_name=plugin_name, use_cache=use_cache)
 
     def change_commands(self, config: dict) -> None:
@@ -178,7 +188,7 @@ class EventListener(Generic[TPlugin], metaclass=EventListenerMeta):
         await command(self, server, player, data.get('params'))
 
     async def shutdown(self) -> None:
-        ...
+        pass
 
     async def can_run(self, command: ChatCommand, server: Server, player: Player) -> bool:
         if not command.enabled or (command.roles and not player.has_discord_roles(command.roles)):

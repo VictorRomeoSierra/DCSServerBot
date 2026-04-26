@@ -4,7 +4,6 @@ import psycopg
 from configparser import ConfigParser
 from core import Plugin, PluginInstallationError, PluginConfigurationError, DEFAULT_TAG, Server
 from services.bot import DCSServerBot
-from typing import Optional
 
 from .listener import FunkManEventListener
 
@@ -58,8 +57,8 @@ class FunkMan(Plugin[FunkManEventListener]):
             return True
         return False
 
-    def get_config(self, server: Optional[Server] = None, *, plugin_name: Optional[str] = None,
-                   use_cache: Optional[bool] = True) -> dict:
+    def get_config(self, server: Server | None = None, *, plugin_name: str | None = None,
+                   use_cache: bool | None = True) -> dict:
         # retrieve the config from another plugin
         if plugin_name:
             return super().get_config(server, plugin_name=plugin_name, use_cache=use_cache)
@@ -74,20 +73,14 @@ class FunkMan(Plugin[FunkManEventListener]):
             self._config[server.node.name][server.instance.name] = default | specific
         return self._config[server.node.name][server.instance.name]
 
-    async def prune(self, conn: psycopg.AsyncConnection, *, days: int = -1, ucids: list[str] = None,
-                    server: Optional[str] = None) -> None:
+    async def prune(self, conn: psycopg.AsyncConnection, days: int) -> None:
         self.log.debug('Pruning FunkMan ...')
-        if ucids:
-            for ucid in ucids:
-                await conn.execute('DELETE FROM bomb_runs WHERE player_ucid = %s', (ucid,))
-                await conn.execute('DELETE FROM strafe_runs WHERE player_ucid = %s', (ucid,))
-        elif days > -1:
-            await conn.execute(f"""
-                DELETE FROM bomb_runs WHERE time < (DATE(now() AT TIME ZONE 'utc') - %s::interval)
-            """, (f'{days} days', ))
-            await conn.execute("""
-                DELETE FROM strafe_runs WHERE time < (DATE(now() AT TIME ZONE 'utc') - %s::interval)
-            """, (f'{days} days', ))
+        await conn.execute(f"""
+            DELETE FROM bomb_runs WHERE time < (DATE(now() AT TIME ZONE 'utc') - %s::interval)
+        """, (f'{days} days', ))
+        await conn.execute("""
+            DELETE FROM strafe_runs WHERE time < (DATE(now() AT TIME ZONE 'utc') - %s::interval)
+        """, (f'{days} days', ))
         self.log.debug('FunkMan pruned.')
 
 

@@ -1,4 +1,3 @@
-import aiofiles
 import asyncio
 import os
 import re
@@ -7,14 +6,15 @@ import zipfile
 
 from aiohttp import ClientSession, ClientResponseError
 from contextlib import suppress
+
+from psycopg import sql
+
 from core import ServiceRegistry, Service, Server, Status, ServiceInstallationError, utils, proxy, Node
 from enum import Enum
 from filecmp import cmp
 from functools import total_ordering
 from packaging import version
-from pathlib import Path
-from psycopg.rows import dict_row
-from typing import Optional, Union
+from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
 
 from ..servicebus import ServiceBus
@@ -24,11 +24,11 @@ __all__ = [
     "ModManagerService"
 ]
 
-import sys
-if sys.platform == 'win32':
-    ENCODING = 'cp1252'
-else:
-    ENCODING = 'utf-8'
+#import sys
+#if sys.platform == 'win32':
+#    ENCODING = 'cp1252'
+#else:
+ENCODING = 'utf-8'
 
 @total_ordering
 class Folder(Enum):
@@ -58,7 +58,6 @@ class ModManagerService(Service):
             os.makedirs(os.path.expandvars(config[folder.value]), exist_ok=True)
         self.node.register_callback('before_dcs_update', self.name, self.before_dcs_update)
         self.node.register_callback('after_dcs_update', self.name, self.after_dcs_update)
-        # noinspection PyAsyncCall
         asyncio.create_task(self.install_packages())
 
     async def stop(self):
@@ -85,7 +84,7 @@ class ModManagerService(Service):
                 await asyncio.sleep(1)
             config = self.get_config(server)
             if 'packages' not in config:
-                return
+                continue
 
             for package in config.get('packages', []):
                 folder = Folder(package['source'])
@@ -93,10 +92,16 @@ class ModManagerService(Service):
                     _version = await self.get_latest_version(package)
                 else:
                     _version = package['version']
+                # check for valid versions
+                if _version is None:
+                    self.log.warning(f"{package['name']} without version in {folder.name}, skipped!")
+                    continue
+
                 installed = await self.get_installed_package(server, folder, package['name'])
                 if (not installed or installed != _version) and \
                         server.status != Status.SHUTDOWN:
-                    self.log.warning(f"  - Server {server.name} needs to be shutdown to install packages.")
+                    self.log.warning(
+                        f"  - Server {server.name} needs to be shutdown to auto-install package {package['name']}")
                     break
                 maintenance = server.maintenance
                 server.maintenance = True
@@ -113,19 +118,18 @@ class ModManagerService(Service):
                         if not await self.uninstall_package(server, folder, package['name'], installed):
                             self.log.warning(f"- Package {package['name']}_v{installed} could not be uninstalled on "
                                              f"server {server.name}!")
-                        elif not await self.install_package(server, folder, package['name'], _version):
+                        elif not await self.install_package(server, folder, package['name'], _version,
+                                                            package.get('repo')):
                             self.log.warning(f"- Package {package['name']}_v{_version} could not be installed on "
                                              f"server {server.name}!")
                         else:
                             self.log.info(f"- Package {package['name']}_v{installed} updated to v{_version}.")
                 finally:
-                    if maintenance:
-                        server.maintenance = maintenance
-                    else:
+                    if not maintenance:
                         server.maintenance = False
 
     @staticmethod
-    def parse_filename(filename: str) -> tuple[Optional[str], Optional[str]]:
+    def parse_filename(filename: str) -> tuple[str | None, str | None]:
         if filename.endswith('.zip'):
             filename = filename[:-4]
         exp = re.compile(r'(?P<package>.*?)(?:v)?(?P<version>[0-9]+(?:\.[A-Za-z0-9._-]+)?)$')
@@ -135,45 +139,64 @@ class ModManagerService(Service):
         else:
             return None, None
 
-    async def get_installed_packages(self, reference: Union[Server, Node], folder: Folder) -> list[tuple[str, str]]:
+    async def get_installed_packages(self, reference: Server | Node, folder: Folder) -> list[tuple[str, str]]:
+        if isinstance(reference, Server):
+            column = 'server_name'
+        else:
+            column = 'node'
         async with self.apool.connection() as conn:
-            async with conn.cursor(row_factory=dict_row) as cursor:
-                await cursor.execute(
-                    """
-                        SELECT * FROM mm_packages 
-                        WHERE server_name = %s AND folder = %s 
-                        ORDER BY package_name, version
-                    """, (reference.name, folder.value))
-                return [
-                    (x['package_name'], x['version']) async for x in cursor
-                ]
+            cursor = await conn.execute(f"""
+                SELECT package_name, version FROM mm_packages 
+                WHERE {column} = %s AND folder = %s 
+                ORDER BY package_name, version
+            """, (reference.name, folder.value))
+            return [
+                (x[0], x[1]) async for x in cursor
+            ]
 
     async def get_repo_versions(self, repo: str) -> set[str]:
-        versions: set[str] = set()
         url = f"https://api.github.com/repos/{self.extract_repo_name(repo)}/releases"
-        exp = re.compile(r'(\d+\.\d+(\.\d+)?)')
         async with ClientSession() as session:
-            async with session.get(url) as response:
+            async with session.get(url, proxy=self.node.proxy, proxy_auth=self.node.proxy_auth) as response:
                 response.raise_for_status()
                 data = await response.json()
-                for release in data:
-                    for asset in release['assets']:
-                        match = exp.search(asset['name'])
-                        if match:
-                            versions.add(match.group(1))
-        return versions
+        return set([x['tag_name'].strip('v') for x in data])
+
+    async def get_download_url(self, repo: str, package_name: str, version: str) -> str | list[str] | None:
+        url = f"https://api.github.com/repos/{self.extract_repo_name(repo)}/releases"
+        async with ClientSession() as session:
+            async with session.get(url, proxy=self.node.proxy, proxy_auth=self.node.proxy_auth) as response:
+                response.raise_for_status()
+                data = await response.json()
+        element = next((x for x in data if x['tag_name'].strip('v') == version), None)
+        if not element:
+            return None
+        for asset in element.get('assets', []):
+            if version in asset['name']:
+                _name, _ = self.parse_filename(asset['name'])
+                if _name == package_name:
+                    return asset['browser_download_url']
+            elif asset['name'] == f"{package_name}.zip":
+                return asset['browser_download_url']
+        else:
+            try:
+                assets = [asset['browser_download_url'] for asset in element.get('assets', [])]
+                return assets[0] if len(assets) == 1 else assets
+            except (KeyError, IndexError):
+                return None
 
     async def get_available_versions(self, server: Server, folder: Folder, package_name: str) -> list[str]:
         local_versions: set[str] = set()
         config = self.get_config(server)
         for x in Path(os.path.expandvars(config[folder.value])).glob(f"{package_name}*"):
             name, version = self.parse_filename(x.name)
-            local_versions.add(version)
+            if version:
+                local_versions.add(version)
         remote_versions: set[str] = set()
         with suppress(StopIteration):
             package = next(x for x in config.get('packages', []) if x['name'] == package_name and x['source'] == folder.value)
             if 'repo' in package:
-                remote_versions = await self.get_repo_versions(package['repo'])
+                remote_versions = {x for x in await self.get_repo_versions(package['repo'])}
         return sorted(local_versions | remote_versions)
 
     @staticmethod
@@ -181,40 +204,45 @@ class ModManagerService(Service):
         path = urlparse(url).path
         return path.lstrip('/')
 
-    async def download(self, url: str, folder: Folder, force: Optional[bool] = False) -> None:
+    async def download(self, url: str, folder: Folder, version: str, *, force: bool | None = False) -> None:
         config = self.get_config()
         path = os.path.expandvars(config[folder.value])
         filename = url.split('/')[-1]
-        self.log.info(f"  => ModManager: Downloading {folder.value}/{filename} ...")
+        outpath = os.path.join(path, filename)
+        if version not in outpath:
+            outpath = os.path.join(path, filename)[:-4] + f'_v{version}.zip'
+        self.log.info(f"  => ModManager: Downloading {folder.value}/{os.path.basename(outpath)} ...")
         async with ClientSession() as session:
-            async with session.get(url) as response:
+            async with session.get(url, proxy=self.node.proxy, proxy_auth=self.node.proxy_auth) as response:
                 response.raise_for_status()
-                outpath = os.path.join(path, filename)
                 if os.path.exists(outpath) and not force:
                     self.log.warning(f"  => ModManager: File {folder.value}/{filename} exists!")
                     raise FileExistsError(outpath)
                 with open(outpath, mode='wb') as outfile:
                     outfile.write(await response.read())
-        self.log.info(f"  => ModManager: {folder.value}/{filename} downloaded.")
+        self.log.info(f"  => ModManager: {folder.value}/{os.path.basename(outpath)} downloaded.")
 
-    async def download_from_repo(self, repo: str, folder: Folder, *, package_name: Optional[str] = None,
-                                 version: Optional[str] = None, force: Optional[bool] = False):
+    async def download_from_repo(self, repo: str, folder: Folder, *, package_name: str | None = None,
+                                 version: str | None = None, force: bool | None = False) -> list[str] | None:
         if not package_name:
             package_name = self.extract_repo_name(repo).split('/')[-1]
         if not version or version == 'latest':
             version = await self.get_latest_repo_version(repo)
-        url = f'{repo}/releases/download/v{version}/{package_name}_v{version}.zip'
+        url = await self.get_download_url(repo, package_name, version)
+        # if the download list is ambiguous, return the whole list for a selection
+        if isinstance(url, list):
+            return url
         try:
-            await self.download(url, folder, force)
+            await self.download(url, folder, version, force=force)
         except ClientResponseError:
             url = f'{repo}/releases/download/v{version}/{package_name}_{version}.zip'
-            await self.download(url, folder, force)
+            await self.download(url, folder, version, force=force)
 
     async def get_latest_repo_version(self, repo: str) -> str:
         url = f"https://api.github.com/repos/{self.extract_repo_name(repo)}/releases/latest"
 
         async with ClientSession() as session:
-            async with session.get(url) as response:
+            async with session.get(url, proxy=self.node.proxy, proxy_auth=self.node.proxy_auth) as response:
                 response.raise_for_status()
                 data = await response.json()
                 return data.get('tag_name', '').strip('v')
@@ -234,20 +262,31 @@ class ModManagerService(Service):
 
     async def get_latest_version(self, package: dict) -> str:
         if 'repo' in package:
-            return await self.get_latest_repo_version(package['repo'])
-        else:
-            return await self._get_latest_file_version(package)
+            try:
+                return await self.get_latest_repo_version(package['repo'])
+            except ClientResponseError as ex:
+                self.log.warning(
+                    f"Can't connect to {package['repo']}: {ex.message}. "
+                    f"Update-check skipped for package {package['name']}.")
+        return await self._get_latest_file_version(package)
 
-    async def get_installed_package(self, reference: Union[Server, Node], folder: Folder, package_name: str) -> Optional[str]:
+    async def get_installed_package(self, reference: Server | Node, folder: Folder, package_name: str) -> str | None:
+        if isinstance(reference, Server):
+            column = 'server_name'
+        else:
+            column = 'node'
         async with self.apool.connection() as conn:
-            cursor = await conn.execute("""
-                SELECT version FROM mm_packages WHERE server_name = %s AND package_name = %s AND folder = %s
-            """, (reference.name, package_name, folder.value))
+            query = sql.SQL("""
+                SELECT version FROM mm_packages 
+                WHERE {column} = %s AND package_name = %s AND folder = %s
+            """).format(column=sql.Identifier(column))
+            cursor = await conn.execute(query, (reference.name, package_name, folder.value))
             return (await cursor.fetchone())[0] if cursor.rowcount == 1 else None
 
-    async def recreate_install_log(self, reference: Union[Server, Node], folder: Folder, package_name: str, version: str) -> bool:
+    async def recreate_install_log(self, reference: Server | Node, folder: Folder, package_name: str, version: str,
+                                   repo: str | None = None) -> bool:
         config = self.get_config()
-        path = os.path.expandvars(config['SavedGames'])
+        path = os.path.expandvars(config[folder.value])
         if folder == Folder.SavedGames:
             packages_path = os.path.join(path, '.' + reference.instance.name, package_name + '_v' + version)
         else:
@@ -265,20 +304,32 @@ class ModManagerService(Service):
                                                                        package).replace('\\', '/')))
 
         def recreate_zip_package():
+            created_dirs = []
             with zipfile.ZipFile(package + '.zip', 'r') as zfile:
                 for name in zfile.namelist():
+                    if os.path.basename(name).lower() == 'thumbs.db':
+                        continue
+                    if name.endswith('/'):
+                        name.rstrip('/')
+                    else:
+                        dirname = os.path.dirname(name)
+                        if dirname not in created_dirs:
+                            log_entries.append(f"w {os.path.dirname(name)}\n")
+                            created_dirs.append(dirname)
                     log_entries.append(f"w {name}\n")
 
-        package = os.path.join(path, f"{package_name}_v{version}")
-        if os.path.isdir(package):
+        package = await self._ensure_package(folder, package_name, version, repo=repo)
+        if not package:
+            self.log.error(f"- Recreation of install log for package {package_name}_v{version} failed, "
+                           f"no source package available.")
+            return False
+        elif os.path.isdir(package):
             await asyncio.to_thread(recreate_normal_package)
         elif os.path.exists(package + '.zip'):
             await asyncio.to_thread(recreate_zip_package)
-        else:
-            return False
 
-        async with aiofiles.open(os.path.join(packages_path, 'install.log'), 'w', encoding=ENCODING) as log:
-            await log.writelines(log_entries)
+        with open(os.path.join(packages_path, 'install.log'), 'w', encoding=ENCODING) as log:
+            log.writelines(log_entries)
         return True
 
     @staticmethod
@@ -286,11 +337,11 @@ class ModManagerService(Service):
         for zip_path in zfile.namelist():
             parts = zip_path.split('/')
             if (len(parts) >= 2 and package_name in parts[0] and
-                    parts[1].lower() in ['mods', 'scripts', 'kneeboard', 'liveries']):
+                    parts[1].lower() in ['coremods', 'mods', 'scripts', 'kneeboard', 'liveries']):
                 return True
         return False
 
-    async def do_install(self, reference: Union[Server, Node], folder: Folder, package_name: str, version: str,
+    async def do_install(self, reference: Server | Node, folder: Folder, package_name: str, version: str,
                          path: str, filename: str) -> bool:
         if folder == Folder.SavedGames:
             target = reference.instance.home
@@ -302,11 +353,13 @@ class ModManagerService(Service):
         log_entries = []
 
         def process_zipfile():
+            create_dirs = set()
             with zipfile.ZipFile(filename, 'r') as zfile:
+                namelist = zfile.namelist()
                 ovgme = self.is_ovgme(zfile, package_name)
                 if ovgme:
-                    root = (zfile.namelist()[0]).split('/')[0] + '/'
-                for name in zfile.namelist():
+                    root = PurePosixPath(namelist[0]).parts[0] + '/'
+                for name in namelist:
                     if ovgme:
                         _name = name.replace(root, '')
                         if not _name or name in ['README.txt', 'VERSION.txt']:
@@ -317,25 +370,33 @@ class ModManagerService(Service):
                     if os.path.basename(_name).lower() == 'thumbs.db':
                         continue
                     orig = os.path.join(target, _name)
+                    parent = os.path.dirname(orig)
+
                     if os.path.exists(orig) and os.path.isfile(orig):
                         log_entries.append(f"x {_name}\n")
                         dest = os.path.join(packages_path, _name)
-                        os.makedirs(os.path.dirname(dest), exist_ok=True)
-                        shutil.copy2(orig, dest)
+                        dest_parent = os.path.dirname(dest)
+                        if dest_parent not in create_dirs:
+                            os.makedirs(dest_parent, exist_ok=True)
+                            create_dirs.add(dest_parent)
+                        shutil.copyfile(orig, dest)
                     else:
+                        if parent and not parent in create_dirs:
+                            os.makedirs(parent, exist_ok=True)
+                            create_dirs.add(parent)
+                            log_entries.append(f"w {os.path.dirname(_name)}\n")
+                        if _name.endswith('/'):
+                            continue
                         log_entries.append(f"w {_name}\n")
-                    os.makedirs(os.path.dirname(orig), exist_ok=True)
-                    if orig.endswith('/'):
-                        continue
                     with zfile.open(name) as infile:
-                        self.log.debug(f"Extracting file {name} to {target}/{_name}")
                         with open(orig, mode='wb') as outfile:
-                            outfile.write(infile.read())
+                            shutil.copyfileobj(infile, outfile)
             return log_entries
-            
+
         def copy_tree():
             def backup(p, names) -> list[str]:
                 ignore_list = []
+                created_dirs = set()
                 _dir = p[len(os.path.join(path, package_name + '_v' + version)):].lstrip(os.path.sep)
                 for name in names:
                     # ignore all Thumbs.db files
@@ -349,8 +410,11 @@ class ModManagerService(Service):
                     if os.path.exists(orig) and os.path.isfile(orig) and not cmp(source, orig):
                         log_entries.append("x {}\n".format(name.replace('\\', '/')))
                         dest = os.path.join(packages_path, name)
-                        os.makedirs(os.path.dirname(dest), exist_ok=True)
-                        shutil.copy2(orig, dest)
+                        dest_parent = os.path.dirname(dest)
+                        if dest_parent not in created_dirs:
+                            os.makedirs(dest_parent, exist_ok=True)
+                            created_dirs.add(dest_parent)
+                        shutil.copy(orig, dest)
                     else:
                         log_entries.append("w {}\n".format(name.replace('\\', '/')))
                 return ignore_list
@@ -364,23 +428,46 @@ class ModManagerService(Service):
         else:
             self.log.error(f"- Installation of package {package_name}_v{version} failed, no package.")
             return False
-        async with aiofiles.open(os.path.join(packages_path, 'install.log'), 'w', encoding=ENCODING) as log:
-            await log.writelines(log_entries)
+        with open(os.path.join(packages_path, 'install.log'), mode='w', encoding=ENCODING) as log:
+            log.writelines(log_entries)
+
+        if isinstance(reference, Server):
+            column = 'server_name'
+        else:
+            column = 'node'
 
         async with self.apool.connection() as conn:
-            async with conn.transaction():
-                await conn.execute("""
-                    INSERT INTO mm_packages (server_name, package_name, version, folder) 
-                    VALUES (%s, %s, %s, %s) 
-                    ON CONFLICT (server_name, package_name) 
-                    DO UPDATE SET version=excluded.version
-                """, (reference.name, package_name, version, folder.value))
+            await conn.execute(f"""
+                INSERT INTO mm_packages ({column}, package_name, version, folder) 
+                VALUES (%s, %s, %s, %s) 
+                ON CONFLICT ({column}, package_name) 
+                DO UPDATE SET version=excluded.version
+            """, (reference.name, package_name, version, folder.value))
         self.log.info(f"- Package {package_name}_v{version} successfully installed in {target}.")
         return True
 
-    @proxy
-    async def install_package(self, server: Server, folder: Union[Folder, str], package_name: str, version: str,
-                              repo: Optional[str] = None) -> bool:
+    async def _ensure_package(self, folder: Folder, package_name: str, version: str,
+                              repo: str | None = None) -> str | None:
+        if isinstance(folder, str):
+            folder = Folder(folder)
+        config = self.get_config()
+        path = os.path.expandvars(config[folder.value])
+        try:
+            return str(next(Path(path).glob(f"{package_name}*{version}*")))
+        except StopIteration:
+            if repo:
+                try:
+                    if await self.download_from_repo(repo, folder, package_name=package_name, version=version):
+                        raise
+                    return str(next(Path(path).glob(f"{package_name}*{version}*")))
+                except Exception:
+                    pass
+            self.log.warning(f"Can't find {package_name}_v{version} in {repo}.")
+            return None
+
+    @proxy(timeout=180)
+    async def install_package(self, server: Server, folder: Folder | str, package_name: str, version: str,
+                              repo: str | None = None) -> bool:
         self.log.info(f"Installing package {package_name}_v{version} ...")
         if isinstance(folder, str):
             folder = Folder(folder)
@@ -392,12 +479,8 @@ class ModManagerService(Service):
         else:
             reference = server.node
             os.makedirs(os.path.join(path, '.' + reference.name), exist_ok=True)
-        try:
-            filename = str(next(Path(path).glob(f"{package_name}*{version}*")))
-        except StopIteration:
-            if repo:
-                await self.download_from_repo(repo, folder, package_name=package_name, version=version)
-                return await self.install_package(reference, folder, package_name, version)
+        filename = await self._ensure_package(folder, package_name, version, repo)
+        if not filename:
             return False
         try:
             return await self.do_install(reference, folder, package_name, version, path, filename)
@@ -405,40 +488,64 @@ class ModManagerService(Service):
             self.log.exception(ex)
             raise
 
-    async def do_uninstall(self, reference: Union[Server, Node], folder: Folder, package_name: str, version: str,
+    async def do_uninstall(self, reference: Server | Node, folder: Folder, package_name: str, version: str,
                            packages_path: str) -> bool:
         target = reference.installation if folder == Folder.RootFolder else reference.instance.home
-        async with aiofiles.open(os.path.join(packages_path, 'install.log'), mode='r', encoding=ENCODING) as log:
-            lines = await log.readlines()
-            for i in range(len(lines) - 1, 0, -1):
-                filename = lines[i][2:].strip()
+
+        def _process_install_log() -> list[tuple[str, str]]:
+            actions: list[tuple[str, str]] = []
+            log_path = os.path.join(packages_path, 'install.log')
+            with open(log_path, mode='r', encoding=ENCODING) as log:
+                for line in log:
+                    if len(line) < 3:
+                        continue
+                    action = line[0]
+                    filename = line[2:].strip()
+                    if filename:
+                        actions.append((action, filename))
+            return actions
+
+        actions = await asyncio.to_thread(_process_install_log)
+
+        def _apply_actions() -> None:
+            for action, filename in reversed(actions):
                 file = os.path.normpath(os.path.join(target, filename))
-                if lines[i].startswith('w'):
+                if action == 'w':
                     if os.path.isfile(file):
                         os.remove(file)
-                    elif os.path.isdir(file) and not os.listdir(file):
+                    elif os.path.isdir(file):
                         with suppress(Exception):
-                            os.removedirs(file)
-                elif lines[i].startswith('x'):
+                            # avoid loading the full directory listing when only emptiness matters
+                            if next(os.scandir(file), None) is None:
+                                os.removedirs(file)
+                elif action == 'x':
                     try:
-                        shutil.copy2(os.path.join(packages_path, filename), file)
+                        shutil.copy(os.path.join(packages_path, filename), file)
                     except FileNotFoundError:
                         if folder == Folder.RootFolder:
-                            self.log.warning(f"- Can't recover file {filename}, because it has been removed! "
-                                             f"You might need to run a slow repair.")
+                            self.log.warning(
+                                f"- Can't recover file {filename}, because it has been removed! "
+                                f"You might need to run a slow repair."
+                            )
+
+        await asyncio.to_thread(_apply_actions)
         utils.safe_rmtree(packages_path)
+
+        if isinstance(reference, Server):
+            column = 'server_name'
+        else:
+            column = 'node'
         async with self.apool.connection() as conn:
-            async with conn.transaction():
-                await conn.execute("""
-                    DELETE FROM mm_packages 
-                    WHERE server_name = %s AND folder = %s AND package_name = %s AND version = %s
-                """, (reference.name, folder, package_name, version))
+            await conn.execute(f"""
+                DELETE FROM mm_packages 
+                WHERE {column} = %s AND folder = %s AND package_name = %s AND version = %s
+            """, (reference.name, folder, package_name, version))
         self.log.info(f"- Package {package_name}_v{version} successfully removed.")
         return True
 
-    @proxy
-    async def uninstall_package(self, server: Server, folder: Union[Folder, str], package_name: str,
-                                version: str) -> bool:
+    @proxy(timeout=180)
+    async def uninstall_package(self, server: Server, folder: Folder | str, package_name: str,
+                                version: str, repo: str | None = None) -> bool:
         if isinstance(folder, str):
             folder = Folder(folder)
         if folder == Folder.RootFolder:
@@ -450,14 +557,15 @@ class ModManagerService(Service):
         if not os.path.exists(os.path.join(packages_path, 'install.log')):
             self.log.warning(f"- Can't find {os.path.join(packages_path, 'install.log')}. Trying to recreate ...")
             # try to recreate it
-            if not await self.recreate_install_log(server, folder, package_name, version):
+            if not await self.recreate_install_log(server, folder, package_name, version, repo):
                 self.log.error(f"- Recreation failed. Can't uninstall {package_name}.")
                 return False
             else:
                 self.log.info("- Recreation successful.")
         return await self.do_uninstall(server, folder, package_name, version, packages_path)
 
-    async def uninstall_root_package(self, node: Node, package_name: str, version: str) -> bool:
+    async def uninstall_root_package(self, node: Node, package_name: str, version: str,
+                                     repo: str | None = None) -> bool:
         self.log.info(f"Uninstalling root-package {package_name}_v{version} ...")
         folder = Folder.RootFolder
         config = self.get_config()
@@ -466,7 +574,7 @@ class ModManagerService(Service):
         if not os.path.exists(os.path.join(packages_path, 'install.log')):
             self.log.warning(f"- Can't find {os.path.join(packages_path, 'install.log')}. Trying to recreate ...")
             # try to recreate it
-            if not await self.recreate_install_log(node, folder, package_name, version):
+            if not await self.recreate_install_log(node, folder, package_name, version, repo):
                 self.log.error(f"- Recreation failed. Can't uninstall {package_name}.")
                 return False
             else:

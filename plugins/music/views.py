@@ -2,7 +2,7 @@ import discord
 import os
 
 from core import utils, Server, ServiceRegistry, get_translation
-from discord import SelectOption, TextStyle
+from discord import SelectOption, ButtonStyle, TextStyle
 from discord.ui import View, Select, Button, Modal, TextInput
 from services.music import MusicService
 from services.music.radios import Mode
@@ -17,7 +17,7 @@ class MusicPlayer(View):
     def __init__(self, server: Server, radio_name: str, playlists: list[str]):
         super().__init__()
         self.radio_name = radio_name
-        self.service = ServiceRegistry.get(MusicService)
+        self.service: MusicService = ServiceRegistry.get(MusicService)
         self.log = self.service.log
         self.server = server
         self.playlists = playlists
@@ -84,25 +84,30 @@ class MusicPlayer(View):
             select.callback = self.playlist
             self.add_item(select)
         # Play/Stop Button
-        button = Button(style=discord.ButtonStyle.primary,
+        # noinspection PyTypeChecker
+        button = Button(style=ButtonStyle.primary,
                         emoji="⏹️" if await self.service.get_current_song(self.server, self.radio_name) else "▶️")
         button.callback = self.on_play_stop
         self.add_item(button)
         # Skip Button
-        button = Button(style=discord.ButtonStyle.primary, emoji="⏩")
+        # noinspection PyTypeChecker
+        button = Button(style=ButtonStyle.primary, emoji="⏩")
         button.callback = self.on_skip
         self.add_item(button)
         # Repeat Button
-        button = Button(style=discord.ButtonStyle.primary,
+        # noinspection PyTypeChecker
+        button = Button(style=ButtonStyle.primary,
                         emoji="🔁" if await self.service.get_mode(self.server, self.radio_name) == Mode.REPEAT else "🔂")
         button.callback = self.on_repeat
         self.add_item(button)
         # Edit Button
-        button = Button(label="Edit", style=discord.ButtonStyle.secondary)
+        # noinspection PyTypeChecker
+        button = Button(label="Edit", style=ButtonStyle.secondary)
         button.callback = self.on_edit
         self.add_item(button)
         # Quit Button
-        button = Button(label="Quit", style=discord.ButtonStyle.red)
+        # noinspection PyTypeChecker
+        button = Button(label="Quit", style=ButtonStyle.red)
         button.callback = self.on_cancel
         self.add_item(button)
         if await self.service.get_current_song(self.server, self.radio_name):
@@ -119,14 +124,19 @@ class MusicPlayer(View):
 
     def edit(self) -> Modal:
         class EditModal(Modal, title=_("Change Settings for {}").format(self.radio_name)):
+            # noinspection PyTypeChecker
             frequency = TextInput(label=_('Frequency (xxx.xx)'), style=TextStyle.short, required=True,
                                   default=self.config['frequency'], min_length=4, max_length=6)
+            # noinspection PyTypeChecker
             modulation = TextInput(label=_('Modulation (AM | FM)'), style=TextStyle.short, required=True,
                                    default=self.config['modulation'], min_length=2, max_length=2)
+            # noinspection PyTypeChecker
             volume = TextInput(label=_('Volume'), style=TextStyle.short, required=True,
                                default=self.config['volume'], min_length=1, max_length=3)
+            # noinspection PyTypeChecker
             coalition = TextInput(label=_('Coalition (1=red | 2=blue)'), style=TextStyle.short, required=True,
                                   default=self.config['coalition'], min_length=1, max_length=2)
+            # noinspection PyTypeChecker
             display_name = TextInput(label=_('Display Name'), style=TextStyle.short, required=True,
                                      default=self.config['display_name'], min_length=3, max_length=30)
 

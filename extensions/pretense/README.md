@@ -7,14 +7,23 @@ specific statistic displays. But you can also use this small extension to either
 Pretense you are using and to have a very basic configuration of it. 
 
 ## Configuration
-Just add some lines to your nodes.yaml like so:
+You can use `/extension enable <Pretense>` to enable the extension.
+This will add an entry in your `nodes.yaml` like so:
 ```yaml
 MyNode:
   # [...]
   instances:
-    DCS.release_server:
+    DCS.dcs_serverrelease:
       # [...]
       extensions:
         Pretense:
           randomize: true # puts a randomize.lua in your Missions\Saves directory. See the Pretense documentation for more.
 ```
+
+> [!TIP]
+> You can rename the Pretense extension in your server status embed by setting a "name" in the configuration like so:
+> ```yaml
+> extension:
+>   Pretense:
+>     name: MyFancyName  # Optional: default is "Pretense"
+> ```

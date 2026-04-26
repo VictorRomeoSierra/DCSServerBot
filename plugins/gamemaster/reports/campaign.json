@@ -1,6 +1,7 @@
 {
   "color": "blue",
   "title": "{title}",
+  "img": "{campaign[image_url]}",
   "elements":
   [
     {
@@ -9,8 +10,8 @@
         "values": [
           {
             "Name": "{campaign[name]}",
-            "Start": "{campaign[start]:%y-%m-%d}",
-            "End": "{campaign[stop]:%y-%m-%d}"
+            "Start": "{campaign[start]:%y-%m-%d %H:%Mz}",
+            "End": "{campaign[stop]:%y-%m-%d %H:%Mz}"
           }
         ]
       }
@@ -24,7 +25,12 @@
         "inline": false
       }
     },
-    "Ruler",
+    {
+      "type": "Ruler",
+      "params": {
+        "ruler_length": 28
+      }
+    },
     {
       "type": "SQLTable",
       "params": {

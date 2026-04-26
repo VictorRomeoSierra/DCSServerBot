@@ -1,15 +1,16 @@
 import aiohttp
+import asyncio
 import certifi
 import os
 import shutil
 import ssl
 
-from aiohttp import BasicAuth
-from core import Extension, Server, utils, DEFAULT_TAG
+from core import Extension, Server, DEFAULT_TAG
 from datetime import datetime, timezone
 from http import HTTPStatus
 from pathlib import Path
-from typing import Optional, Any
+from typing import Any
+from typing_extensions import override
 
 # ruamel YAML support
 from ruamel.yaml import YAML
@@ -25,7 +26,8 @@ class Cloud(Extension):
         self.client = None
         self.base_url = f"{self.config['protocol']}://{self.config['host']}:{self.config['port']}"
 
-    def load_config(self) -> Optional[dict]:
+    @override
+    def load_config(self) -> dict:
         return yaml.load(Path(os.path.join(self.node.config_dir, 'services', 'bot.yaml')).read_text(encoding='utf-8'))
 
     def read_config(self):
@@ -34,20 +36,6 @@ class Cloud(Extension):
             self.log.info('No cloud.yaml found, copying the sample.')
             shutil.copyfile('samples/plugins/cloud.yaml', config_file)
         return yaml.load(Path(config_file).read_text(encoding='utf-8'))
-
-    @property
-    def proxy(self) -> Optional[str]:
-        return self.locals.get('proxy', {}).get('url')
-
-    @property
-    def proxy_auth(self) -> Optional[BasicAuth]:
-        username = self.locals.get('proxy', {}).get('username')
-        try:
-            password = utils.get_password('proxy', self.node.config_dir)
-        except ValueError:
-            return None
-        if username and password:
-            return BasicAuth(username, password)
 
     @property
     def session(self):
@@ -66,8 +54,14 @@ class Cloud(Extension):
     async def post(self, request: str, data: Any) -> Any:
         async def send(element: dict):
             url = f"{self.base_url}/{request}/"
-            async with (self.session.post(url, json=element, proxy=self.proxy, proxy_auth=self.proxy_auth,
-                                         raise_for_status=False) as response):
+            async with self.session.post(
+                    url,
+                    json=element,
+                    proxy=self.node.proxy,
+                    proxy_auth=self.node.proxy_auth,
+                    raise_for_status=False,
+                    timeout=aiohttp.ClientTimeout(total=30)  # Add reasonable timeout
+            ) as response:
                 if response.status > 299:
                     body = await response.text()
                     raise aiohttp.ClientResponseError(
@@ -79,11 +73,14 @@ class Cloud(Extension):
                     )
                 return await response.json()
 
-        if isinstance(data, list):
-            for line in data:
-                await send(line)
-        else:
-            await send(data)
+        try:
+            if isinstance(data, list):
+                tasks = [send(line) for line in data]
+                return await asyncio.gather(*tasks, return_exceptions=True)
+            else:
+                return await send(data)
+        except asyncio.TimeoutError:
+            raise aiohttp.ClientError("Request timed out")
 
     async def cloud_register(self):
         # we do not send cloud updates if we are not allowed and for non-public servers
@@ -95,8 +92,8 @@ class Cloud(Extension):
             payload = {
                 "guild_id": self.node.guild_id,
                 "server_name": self.server.name,
-                "port": self.server.instance.dcs_port,
-                "password": (self.server.settings['password'] != ""),
+                "port": int(self.server.instance.dcs_port),
+                "password": (self.server.settings.get('password', '') != ''),
                 "theatre": self.server.current_mission.map,
                 "dcs_version": self.node.dcs_version,
                 "num_players": len(self.server.get_active_players()) + 1,
@@ -110,8 +107,9 @@ class Cloud(Extension):
             # noinspection PyUnresolvedReferences
             await self.post('register_server', payload)
             self.log.debug(f"Server {self.server.name} registered with the cloud.")
-        except aiohttp.ClientError:
+        except aiohttp.ClientError as ex:
             self.log.warning(f"Could not register server {self.server.name} with the cloud.")
+            self.log.debug(f"Error: {ex}")
             self.log.debug(payload)
 
     async def cloud_unregister(self):
@@ -128,10 +126,12 @@ class Cloud(Extension):
             self.log.warning(f"Could not unregister server {self.server.name} from the cloud.", exc_info=ex)
             self.log.debug(payload)
 
-    async def startup(self) -> bool:
-        await self.cloud_register()
-        return await super().startup()
+    @override
+    async def startup(self, *, quiet: bool = False) -> bool:
+        self.loop.create_task(self.cloud_register())
+        return await super().startup(quiet=True)
 
-    def shutdown(self) -> bool:
+    @override
+    def shutdown(self, *, quiet: bool = False) -> bool:
         self.loop.create_task(self.cloud_unregister())
-        return super().shutdown()
+        return super().shutdown(quiet=True)

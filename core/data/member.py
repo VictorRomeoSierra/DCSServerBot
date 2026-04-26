@@ -1,10 +1,10 @@
 from __future__ import annotations
+
 import discord
 
 from core import DataObjectFactory, DataObject
 from dataclasses import dataclass, field
-from typing import Optional
-
+from typing_extensions import override
 
 __all__ = ["Member"]
 
@@ -13,10 +13,11 @@ __all__ = ["Member"]
 @DataObjectFactory.register()
 class Member(DataObject):
     member: discord.Member
-    _ucid: Optional[str] = field(default=None, init=False)
+    _ucid: str | None = field(default=None, init=False)
     banned: bool = field(default=False, init=False)
     _verified: bool = field(default=False, init=False)
 
+    @override
     def __post_init__(self):
         super().__post_init__()
         self.is_remote = False
@@ -42,14 +43,13 @@ class Member(DataObject):
         if ucid == self._ucid:
             return
         with self.pool.connection() as conn:
-            with conn.transaction():
-                # if there was an old link, delete it
-                if self._ucid:
-                    conn.execute('UPDATE players SET discord_id = -1 WHERE ucid = %s AND discord_id = %s',
-                                 (self._ucid, self.member.id))
-                if ucid:
-                    conn.execute('UPDATE players SET discord_id = %s WHERE ucid = %s', (self.member.id, ucid))
-                self._ucid = ucid
+            # if there was an old link, delete it
+            if self._ucid:
+                conn.execute('UPDATE players SET discord_id = -1 WHERE ucid = %s AND discord_id = %s',
+                             (self._ucid, self.member.id))
+            if ucid:
+                conn.execute('UPDATE players SET discord_id = %s WHERE ucid = %s', (self.member.id, ucid))
+            self._ucid = ucid
 
     @property
     def verified(self) -> bool:
@@ -60,15 +60,14 @@ class Member(DataObject):
         if flag == self._verified:
             return
         with self.pool.connection() as conn:
-            with conn.transaction():
-                # verify the link
-                conn.execute('UPDATE players SET manual = %s WHERE ucid = %s', (flag, self._ucid))
-                if flag:
-                    # delete all old automated links
-                    conn.execute("DELETE FROM players WHERE ucid = %s AND manual = FALSE", (self.ucid,))
-                    conn.execute("DELETE FROM players WHERE discord_id = %s AND length(ucid) = 4", (self.member.id,))
-                    conn.execute("UPDATE players SET discord_id = -1 WHERE discord_id = %s AND manual = FALSE",
-                                 (self.member.id,))
+            # verify the link
+            conn.execute('UPDATE players SET manual = %s WHERE ucid = %s', (flag, self._ucid))
+            if flag:
+                # delete all old automated links
+                conn.execute("DELETE FROM players WHERE ucid = %s AND manual = FALSE", (self.ucid,))
+                conn.execute("DELETE FROM players WHERE discord_id = %s AND length(ucid) = 4", (self.member.id,))
+                conn.execute("UPDATE players SET discord_id = -1 WHERE discord_id = %s AND manual = FALSE",
+                             (self.member.id,))
         self._verified = flag
 
     def link(self, ucid: str, verified: bool = True):
