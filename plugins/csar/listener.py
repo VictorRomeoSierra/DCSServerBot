@@ -35,7 +35,7 @@ class CsarEventListener(EventListener):
         with self.pool.connection() as conn:
             with closing(conn.cursor(row_factory=dict_row)) as cursor:
                 return list(cursor.execute("""
-                    SELECT DATE_PART('EPOCH', datestamp) AS time, id, coalition, country, pos, coordinates, typename, unitname, playername, freq FROM csar_wounded
+                    SELECT DATE_PART('EPOCH', datestamp) AS time, id, coalition, country, pos, coordinates, typename, unitname, playername, freq, voice FROM csar_wounded
                     WHERE server_name = %s
                 """, (server.name, )).fetchall())
 
@@ -76,16 +76,17 @@ class CsarEventListener(EventListener):
                     row = conn.execute("""
                         SELECT id FROM csar_wounded WHERE id = %s AND server_name = %s
                         """,(w['id'], server.name, )).fetchone()
+                    voice = w.get('voice')
                     if row:
                         conn.execute("""
-                            UPDATE csar_wounded SET (coalition, country, pos, coordinates, typename, unitname, playername, freq, server_name) = (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            UPDATE csar_wounded SET (coalition, country, pos, coordinates, typename, unitname, playername, freq, voice, server_name) = (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                             WHERE id = %s AND server_name = %s
-                            """, (w['coalition'], w['country'], json.dumps(w['pos']), w['coordinates'], w['typename'], w['unitname'], playername, w['freq'], server.name, w['id'], server.name))
+                            """, (w['coalition'], w['country'], json.dumps(w['pos']), w['coordinates'], w['typename'], w['unitname'], playername, w['freq'], voice, server.name, w['id'], server.name))
                     else:
                         conn.execute("""
-                            INSERT INTO csar_wounded (id, coalition, country, pos, coordinates, typename, unitname, playername, freq, server_name) 
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        """, (w['id'], w['coalition'], w['country'], json.dumps(w['pos']), w['coordinates'], w['typename'], w['unitname'], playername, w['freq'], server.name))
+                            INSERT INTO csar_wounded (id, coalition, country, pos, coordinates, typename, unitname, playername, freq, voice, server_name)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """, (w['id'], w['coalition'], w['country'], json.dumps(w['pos']), w['coordinates'], w['typename'], w['unitname'], playername, w['freq'], voice, server.name))
                 if currentids:
                     delete = "DELETE FROM csar_wounded WHERE id NOT IN (" + currentids.strip(', ') + ") AND server_name = '" + server.name + "'"
                 else:
