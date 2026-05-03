@@ -394,12 +394,16 @@ class Cloud(Plugin[CloudListener]):
                         LIMIT 10
                     """)
                     rows = await cursor.fetchall()
+                    if not rows:
+                        # all is synced, no need to poll every 10s
+                        self.cloud_sync.change_interval(minutes=5.0)
+                        return
 
                     for row in rows:
                         await cursor.execute("""
                             SELECT DISTINCT x.name, x.discord_id, min(time) AS linked_at, max(time) AS last_seen FROM  
                             (
-                                SELECT name, discord_id, last_seen AS time FROM players
+                                SELECT name, discord_id, COALESCE(last_seen, first_seen) AS time FROM players
                                 WHERE ucid = %(ucid)s AND manual = TRUE AND discord_id != -1
                                 UNION
                                 SELECT DISTINCT name, discord_id, min(time) AS time FROM players_hist
@@ -410,11 +414,12 @@ class Cloud(Plugin[CloudListener]):
                             ORDER BY 3
                         """, {"ucid": row['ucid']})
                         async for player in cursor:
+                            linked_at = player['linked_at'] or player['last_seen']
                             await self.post('register_player', {
                                 "ucid": row['ucid'],
                                 "name": player['name'],
                                 "discord_id": player['discord_id'],
-                                "linked_at": player['linked_at'].isoformat(),
+                                "linked_at": linked_at.isoformat(),
                                 "last_seen": player['last_seen'].isoformat()
                             })
                         await cursor.execute("""
