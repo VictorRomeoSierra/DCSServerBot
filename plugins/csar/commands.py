@@ -1,145 +1,169 @@
 import discord
 import psycopg
-# import requests
-# import json
 
-# from contextlib import closing
-from core import Plugin, utils, Server, TEventListener, Status, command, DEFAULT_TAG, Report, ReportEnv, Group
+from core import Plugin, utils, DEFAULT_TAG, Report, Group, Server
 from discord import app_commands
 from services.bot import DCSServerBot
-from typing import Type
-# from discord.ext import tasks
-from typing import Optional, Union
-# from psycopg.rows import dict_row
 
 from .listener import CsarEventListener
 
 
-class Csar(Plugin):
-    """
-    A class where all your discord commands should go.
+class Csar(Plugin[CsarEventListener]):
+    """Discord-facing commands for the CSAR plugin."""
 
-    If you need a specific initialization, make sure that you call super().__init__() after it, to
-    assure a proper initialization of the plugin.
-
-    Attributes
-    ----------
-    :param bot: DCSServerBot
-        The discord bot instance.
-    :param listener: EventListener
-        A listener class to receive events from DCS.
-
-    Methods
-    -------
-    sample(ctx, text)
-        Send the text to DCS, which will return the same text again (echo).
-    """
-
-    def __init__(self, bot: DCSServerBot, listener: Type[TEventListener]):
+    def __init__(self, bot: DCSServerBot, listener: type[CsarEventListener]):
         super().__init__(bot, listener)
-        self.expire_after = self.locals.get(DEFAULT_TAG, {}).get('expire_after')
-        # self.prune.add_exception_type(psycopg.DatabaseError)
-        # self.prune.start()
+        cfg = self.locals.get(DEFAULT_TAG, {}) if self.locals else {}
+        self.expire_after = cfg.get('expire_after')
+        self.lives = cfg.get('lives') or {}
+        self.default_server = cfg.get('default_server')
 
-        # api_url = "https://customdcs.com/playerranks.json"
-        # response = requests.get(api_url)
-        # self.rank_table = response.json()
+    async def rename(self, conn: psycopg.AsyncConnection, old_name: str, new_name: str) -> None:
+        await conn.execute(
+            'UPDATE csar_wounded SET server_name = %s WHERE server_name = %s',
+            (new_name, old_name)
+        )
 
-        self.lives = self.locals.get(DEFAULT_TAG, {}).get('lives')
+    async def _resolve_user(
+        self, user: discord.Member | str | None, fallback: discord.Member
+    ) -> tuple[str | None, str]:
+        # Returns (ucid, display_name); ucid is None if no DCS link exists.
+        if user is None:
+            user = fallback
+        if isinstance(user, str):
+            ucid = user
+            resolved = await self.bot.get_member_or_name_by_ucid(ucid)
+            if isinstance(resolved, discord.Member):
+                return ucid, resolved.display_name
+            return ucid, resolved or ucid
+        ucid = await self.bot.get_ucid_by_member(user)
+        return ucid, user.display_name
 
-    def rename(self, conn: psycopg.Connection, old_name: str, new_name: str):
-        # If a server rename takes place, you might want to update data in your created tables
-        # if they contain a server_name value. You usually don't need to implement this function.
-        pass
-    
+    @staticmethod
+    def _rescue_rank(total: int) -> str:
+        if total >= 250: return "Hero"
+        if total >= 100: return "Legend"
+        if total >= 50:  return "Ace"
+        if total >= 10:  return "Veteran"
+        if total >= 1:   return "Pilot"
+        return "Rookie"
+
     group = Group(name="csar", description="Commands to check your CSAR data")
 
-    @group.command(name="stats", description='Shows your CSAR stats')
+    @group.command(name="stats", description='Shows CSAR rescue stats')
     @app_commands.guild_only()
     @utils.app_has_role('DCS')
     async def stats(self, interaction: discord.Interaction,
-                     user: Optional[app_commands.Transform[Union[str, discord.Member], utils.UserTransformer]]):
+                    user: app_commands.Transform[
+                        discord.Member | str, utils.UserTransformer
+                    ] | None = None):
+        ucid, name = await self._resolve_user(user, interaction.user)
+        if not ucid:
+            # noinspection PyUnresolvedReferences
+            await interaction.response.send_message(
+                f"{name} is not linked to a DCS account.", ephemeral=True)
+            return
 
-        if not user:
-            user = interaction.user
-        if isinstance(user, str):
-            ucid = user
-            user = self.bot.get_member_or_name_by_ucid(ucid)
-            if isinstance(user, discord.Member):
-                name = user.display_name
-            else:
-                name = user
-        else:
-            ucid = self.bot.get_ucid_by_member(user)
-            name = user.display_name
-        
-        with self.pool.connection() as conn:
-            with conn.transaction():
-                row = conn.execute("""
-                    SELECT SUM(savedpilots) as total_rescues FROM csar_events WHERE ucid = %s
-                    """,(ucid, )).fetchone()
-                total_rescues = row[0]
-        if not total_rescues: total_rescues = 0
+        # noinspection PyUnresolvedReferences
+        await interaction.response.defer()
+        async with self.apool.connection() as conn:
+            cursor = await conn.execute("""
+                SELECT COALESCE(SUM(savedpilots), 0) AS total,
+                       COUNT(*) AS events,
+                       MIN(datestamp) AS first_rescue,
+                       MAX(datestamp) AS last_rescue
+                FROM csar_events
+                WHERE ucid = %s
+            """, (ucid,))
+            total, events, first_rescue, last_rescue = await cursor.fetchone()
 
-        rank = "Non CSAR Pilot"
-        # for key in self.rank_table:
-        #     if int(key) <= total_rescues :
-        #         rank = self.rank_table[key]
-        #     else:
-        #         if int(key) > total_rescues :
-        #             break
+        if total == 0:
+            embed = discord.Embed(
+                title=f"CSAR Rescues for {name}",
+                description="No rescues recorded yet. Go save someone!",
+                color=discord.Color.blue()
+            )
+            await interaction.followup.send(embed=embed)
+            return
 
         report = Report(self.bot, self.plugin_name, 'rescues.json')
-        env = await report.render(name=name, ucid=ucid, rank=rank)  # params={"rescues": rescues}
-        await interaction.response.send_message(embed=env.embed)
+        env = await report.render(
+            name=name, ucid=ucid,
+            rank=self._rescue_rank(int(total)),
+            total=int(total), events=int(events),
+            first_rescue=first_rescue, last_rescue=last_rescue,
+        )
+        await interaction.followup.send(embed=env.embed)
 
     @group.command(name="lives", description='Shows your slot lives for airframes with active CSARs')
     @app_commands.guild_only()
     @utils.app_has_role('DCS')
     async def lives(self, interaction: discord.Interaction,
-                     user: Optional[app_commands.Transform[Union[str, discord.Member], utils.UserTransformer]]):
-        if not user:
-            user = interaction.user
-        if isinstance(user, str):
-            ucid = user
-            user = self.bot.get_member_or_name_by_ucid(ucid)
-            if isinstance(user, discord.Member):
-                name = user.display_name
-            else:
-                name = user
-        else:
-            ucid = self.bot.get_ucid_by_member(user)
-            name = user.display_name
-        
-        lives = {}
-        with self.pool.connection() as conn:
-            with conn.transaction():
-                rows = conn.execute("""
-                    SELECT typename, count(*) FROM csar_wounded w
-                    JOIN players p ON w.playername = p.name
-                    WHERE p.ucid = %s
-                    GROUP BY typename
-                    """,(ucid, )).fetchall()
-                for row in rows:
-                    if self.lives[row[0]]:
-                        lives[row[0]] = int(self.lives[row[0]]) - int(row[1])
-                    else:
-                        lives[row[0]] = int(self.lives['DEFAULT']) - int(row[1])
-        
-        report = Report(self.bot, self.plugin_name, 'lives.json')
-        env = await report.render(name=name, lives=lives)
-        await interaction.response.send_message(embed=env.embed)
+                    user: app_commands.Transform[
+                        discord.Member | str, utils.UserTransformer
+                    ] | None = None,
+                    server: app_commands.Transform[
+                        Server, utils.ServerTransformer
+                    ] | None = None):
+        ucid, name = await self._resolve_user(user, interaction.user)
+        if not ucid:
+            # noinspection PyUnresolvedReferences
+            await interaction.response.send_message(
+                f"{name} is not linked to a DCS account.", ephemeral=True)
+            return
 
-    # @tasks.loop(hours=1.0)
-    # async def prune(self):
-    #     if self.expire_after:
-    #         self.log.debug('CSAR: Pruning aged CSARS from DB')
-    #         # self.log.debug('self.expire_after: {}'.format(self.expire_after))
-    #         command = "DELETE FROM csar_wounded WHERE datestamp < NOW() - INTERVAL '{}'".format(self.expire_after)
-    #         # self.log.debug(command)
-    #         with self.pool.connection() as conn:
-    #             with conn.transaction():
-    #                 conn.execute(command)
+        # Looking up someone else's lives is admin-only.
+        caller_ucid = await self.bot.get_ucid_by_member(interaction.user)
+        if ucid != caller_ucid and not utils.check_roles(
+                self.bot.roles['DCS Admin'], interaction.user):
+            # noinspection PyUnresolvedReferences
+            await interaction.response.send_message(
+                "You need the DCS Admin role to view another user's lives.",
+                ephemeral=True)
+            return
+
+        server_name = server.name if server else self.default_server
+        if not server_name:
+            # noinspection PyUnresolvedReferences
+            await interaction.response.send_message(
+                "No `default_server` configured for csar; pass a `server:` to query.",
+                ephemeral=True)
+            return
+
+        default_allowance = int(self.lives.get('DEFAULT', 0))
+        rows: list[dict] = []
+        async with self.apool.connection() as conn:
+            cursor = await conn.execute("""
+                SELECT typename, COUNT(*) AS used
+                FROM csar_wounded
+                WHERE ucid = %s AND server_name = %s
+                GROUP BY typename
+                ORDER BY typename
+            """, (ucid, server_name))
+            for typename, used in await cursor.fetchall():
+                allowance = int(self.lives.get(typename, default_allowance))
+                remaining = max(0, allowance - int(used))
+                rows.append({
+                    "airframe": typename,
+                    "remaining": str(remaining),
+                    "max": str(allowance),
+                })
+
+        # noinspection PyUnresolvedReferences
+        await interaction.response.defer()
+        if not rows:
+            embed = discord.Embed(
+                title=f"Pilot lives for {name}",
+                description=f"All lives intact on **{server_name}**.",
+                color=discord.Color.blue()
+            )
+            await interaction.followup.send(embed=embed)
+            return
+
+        report = Report(self.bot, self.plugin_name, 'lives.json')
+        env = await report.render(name=name, server_name=server_name, lives=rows)
+        await interaction.followup.send(embed=env.embed)
+
 
 async def setup(bot: DCSServerBot):
     await bot.add_cog(Csar(bot, CsarEventListener))
