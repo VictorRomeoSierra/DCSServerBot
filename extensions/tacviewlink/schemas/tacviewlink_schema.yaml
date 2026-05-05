@@ -1,0 +1,19 @@
+schema;node_tacviewlink_schema:
+  type: map
+  nullable: false
+  allowempty: true
+  mapping:
+    name: {type: str, nullable: false, range: {min: 1}}
+
+schema;instance_tacviewlink_schema:
+  type: map
+  nullable: false
+  allowempty: true
+  mapping:
+    enabled: {type: bool, nullable: false}
+    name: {type: str, nullable: false, range: {min: 1}}
+    target: {type: str, nullable: false, range: {min: 1}}
+    base_url: {type: url, nullable: false}
+    log: {type: str, nullable: false}
+    poll_timeout: {type: int, nullable: false, range: {min: 60}}
+    poll_interval: {type: int, nullable: false, range: {min: 5}}
