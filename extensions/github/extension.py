@@ -34,6 +34,11 @@ class GitHub(Extension):
             "type": str,
             "label": _("Filter"),
             "required": False
+        },
+        "manifest": {
+            "type": str,
+            "label": _("Manifest"),
+            "required": False
         }
     }
 
@@ -87,6 +92,24 @@ class GitHub(Extension):
         self.log.debug(f"{self.name}: Updating repository {self.repo} into {self.target}")
         repo = git.Repo(self.target)
         repo.git.pull()
+        self._write_manifest(repo)
+
+    def _write_manifest(self, repo):
+        manifest = self.config.get('manifest')
+        if not manifest:
+            return
+        try:
+            log_output = repo.git.log('-3', '--format=%H|%an|%s')
+            manifest_path = os.path.join(self.target, manifest)
+            tmp_path = manifest_path + '.tmp'
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                f.write(log_output)
+                if log_output and not log_output.endswith('\n'):
+                    f.write('\n')
+            os.replace(tmp_path, manifest_path)
+            self.log.debug(f"{self.name}: wrote recent-commits manifest to {manifest_path}")
+        except Exception as e:
+            self.log.warning(f"{self.name}: failed to write recent-commits manifest: {e}")
 
     async def clone(self):
         self.log.debug(f"{self.name}: Cloning repository {self.repo} into {self.target}")
