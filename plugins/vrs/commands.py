@@ -1,10 +1,14 @@
+import asyncio
+
 import discord
 
-from core import Plugin, Group, Server, Status, utils
+from core import Plugin, Group, Server, Status, Coalition, utils
 from discord import app_commands
 from services.bot import DCSServerBot
 
 from .listener import VrsEventListener
+
+WARN_TIMES = (60, 30, 10)
 
 
 def _lua_quote(s: str) -> str:
@@ -31,7 +35,7 @@ class Vrs(Plugin[VrsEventListener]):
     group = Group(name="vrs", description="VRS server admin commands")
 
     @group.command(name="reset_campaign",
-                   description="Arm a campaign reset for the next server restart")
+                   description="Reset the campaign and restart the server")
     @app_commands.guild_only()
     @utils.app_has_role('DCS Admin')
     async def reset_campaign(
@@ -48,29 +52,43 @@ class Vrs(Plugin[VrsEventListener]):
             )
             return
 
-        # Destructive — require explicit confirmation.
+        warn_times = sorted(WARN_TIMES, reverse=True)
+        lead_time = warn_times[0]
+
         confirm_text = (
-            f"Arm a campaign reset on **{server.name}**?\n"
-            f"All previous progress, base ownership, salvage jobs, and CSAR state "
-            f"will be cleared on the next server restart."
+            f"Reset the campaign on **{server.name}**?\n"
+            f"Players will get a **{lead_time}-second** warning, then the server "
+            f"will restart. All previous progress, base ownership, salvage jobs, "
+            f"and CSAR state will be cleared."
         )
         if not await utils.yn_question(interaction, confirm_text):
             await interaction.followup.send("Cancelled.", ephemeral=True)
             return
 
         reason_str = (reason or "").strip()
-        script = f"VRS.persistence.armCampaignReset({_lua_quote(reason_str)})"
-        await server.send_to_dcs({"command": "do_script", "script": script})
 
-        msg = (
+        async def _warn(secs_left: int):
+            await asyncio.sleep(lead_time - secs_left)
+            popup = f"Campaign reset in {secs_left} second{'s' if secs_left != 1 else ''} — land or eject!"
+            if reason_str:
+                popup += f"\nReason: {reason_str}"
+            await server.sendPopupMessage(Coalition.ALL, popup)
+
+        ack = (
             f"Campaign reset armed on **{server.name}**. "
-            f"It will fire on the next server restart."
+            f"Server will restart in {lead_time} seconds."
         )
         if reason_str:
-            msg += f"\nReason: {reason_str}"
-        await interaction.followup.send(msg, ephemeral=utils.get_ephemeral(interaction))
+            ack += f"\nReason: {reason_str}"
+        await interaction.followup.send(ack, ephemeral=utils.get_ephemeral(interaction))
 
-        audit_msg = f"armed campaign reset on {server.name}"
+        await utils.run_parallel_nofail(*(_warn(t) for t in warn_times))
+
+        script = f"VRS.persistence.armCampaignReset({_lua_quote(reason_str)})"
+        await server.send_to_dcs({"command": "do_script", "script": script})
+        await server.restart(modify_mission=True)
+
+        audit_msg = f"reset campaign on {server.name} (server restarted)"
         if reason_str:
             audit_msg += f" (reason: {reason_str})"
         await self.bot.audit(audit_msg, user=interaction.user, server=server)
