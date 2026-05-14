@@ -69,7 +69,7 @@ class Vrs(Plugin[VrsEventListener]):
 
         async def _warn(secs_left: int):
             await asyncio.sleep(lead_time - secs_left)
-            popup = f"Campaign reset in {secs_left} second{'s' if secs_left != 1 else ''} — land or eject!"
+            popup = f"Campaign reset in {secs_left} second{'s' if secs_left != 1 else ''} - land or eject!"
             if reason_str:
                 popup += f"\nReason: {reason_str}"
             await server.sendPopupMessage(Coalition.ALL, popup)
