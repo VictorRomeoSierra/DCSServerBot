@@ -52,7 +52,9 @@ class VrsEventListener(EventListener["Vrs"]):
                             f"url={url_preview} body={body_preview}"
                         )
                     else:
-                        self.log.info(
+                        # Success path at DEBUG: keeps Prod bot console quiet
+                        # under normal operation. WARN/ERROR are still surfaced.
+                        self.log.debug(
                             f"VRS sendDiscordWebhook status={resp.status} "
                             f"url={url_preview}"
                         )
