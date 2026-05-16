@@ -86,9 +86,16 @@ class Vrs(Plugin[VrsEventListener]):
 
         script = f"VRS.persistence.armCampaignReset({_lua_quote(reason_str)})"
         await server.send_to_dcs({"command": "do_script", "script": script})
-        await server.restart(modify_mission=True)
 
-        audit_msg = f"reset campaign on {server.name} (server restarted)"
+        # Full DCS process cycle (not just `server.restart`, which only reloads
+        # the mission). shutdown + startup re-runs the bot's plugin-Lua-glue
+        # install (_install_plugin copies plugins/<name>/lua/* into Saved Games),
+        # so any pushed mission-Lua hotfixes plus updated bot plugin glue take
+        # effect on the post-reset boot. Adds ~30s of downtime vs mission reload.
+        await server.shutdown()
+        await server.startup(modify_mission=True)
+
+        audit_msg = f"reset campaign on {server.name} (DCS cycled)"
         if reason_str:
             audit_msg += f" (reason: {reason_str})"
         await self.bot.audit(audit_msg, user=interaction.user, server=server)
