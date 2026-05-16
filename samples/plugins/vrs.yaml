@@ -1,0 +1,38 @@
+# VRS plugin sample config
+#
+# Webhook URLs are resolved bot-side from this file. Mission Lua passes a
+# webhook key (e.g. "admin", "bugReport") via dcsbot.sendDiscordWebhook,
+# and the bot looks up the URL keyed by (current server instance, key).
+#
+# Place this file at: config/plugins/vrs.yaml on the bot host. The
+# config/ directory is gitignored, so URLs stay out of source control.
+#
+# Resolution order: the bot tries the exact key first, then falls back to
+# a category (see KEY_TO_CATEGORY in plugins/vrs/listener.py). The current
+# fallback map is:
+#
+#   sitrep, general, events, status -> "messages"
+#   admin, boot                     -> "admin"
+#   bugReport                       -> "bugReport"
+#
+# So if you only configure messages / admin / bugReport URLs (below), every
+# logical key routes correctly. Override an individual key by adding its
+# own entry alongside (e.g. `boot: https://...different-url`).
+#
+# Per-server entries override DEFAULT. The bugReport URL is intentionally
+# placed in DEFAULT so Prod and Test bug reports land in the same triage
+# channel.
+
+DEFAULT:
+  webhooks:
+    bugReport: https://discord.com/api/webhooks/xxx/xxx  # shared bug-report channel
+
+"VRS AI Test Server":
+  webhooks:
+    messages: https://discord.com/api/webhooks/xxx/xxx
+    admin:    https://discord.com/api/webhooks/xxx/xxx
+
+"VRS_AI":
+  webhooks:
+    messages: https://discord.com/api/webhooks/xxx/xxx
+    admin:    https://discord.com/api/webhooks/xxx/xxx
