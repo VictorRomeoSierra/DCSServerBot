@@ -1,6 +1,8 @@
 import aiofiles
+import aiohttp
 import asyncio
 import os
+import psutil
 import psycopg
 import random
 import re
@@ -21,11 +23,12 @@ from typing import Any, Literal, cast
 
 from .models import (TopKill, ServerInfo, SquadronInfo, Trueskill, Highscore, UserEntry, WeaponPK, PlayerStats,
                      CampaignCredits, TrapEntry, SquadronCampaignCredit, LinkMeResponse, ServerStats, PlayerInfo,
-                     PlayerSquadron, LeaderBoard, ModuleStats, PlayerEntry, WeatherInfo, ServerAttendanceStats, 
+                     PlayerSquadron, LeaderBoard, ModuleStats, PlayerEntry, WeatherInfo, ServerAttendanceStats,
                      AirbasesResponse, AirbaseInfoResponse, AirbaseWarehouseResponse, AirbaseSetWarehouseItemResponse,
                      AirbaseCaptureResponse, ConvertCoordinates, MissionRestartResponse, MissionLoadResponse,
                      MissionPauseResponse, MissionUnpauseResponse, MissionsResponse, ServerStartResponse,
-                     ServerStopResponse, ServerRestartResponse, MissionUploadResponse, GroupWaypointsResponse)
+                     ServerStopResponse, ServerRestartResponse, MissionUploadResponse, GroupWaypointsResponse,
+                     AlertEnrichRequest, AlertEnrichResponse)
 from ..srs.commands import SRS
 
 app: FastAPI | None = None
@@ -417,6 +420,16 @@ class RestAPI(Plugin):
             description="Upload a .miz mission file to the server.",
             summary="Upload mission file",
             tags=["Mission"]
+        )
+
+        ## Alerting Routes
+        self.router.add_api_route(
+            "/alert/enrich", self.alert_enrich,
+            methods=["POST"],
+            response_model=AlertEnrichResponse,
+            description="Receive a Seq alert payload, enrich with live mission / voice / host context, forward to Pushover.",
+            summary="Enrich and forward a Seq alert to Pushover",
+            tags=["Alerting"]
         )
 
         self.app.include_router(self.router)
@@ -2024,6 +2037,173 @@ class RestAPI(Plugin):
             "timestamp": expiry_timestamp,
             "rc": rc
         })
+
+    # --- Alerting -----------------------------------------------------------
+    # POST /alert/enrich receives a webhook from Seq when one of the
+    # signals defined in VRSInfra/alerting/signals/ fires. We enrich the
+    # base Pushover payload with live context (mission, voice channel
+    # headcount, host CPU/RAM) under a tight deadline, then forward to
+    # Pushover. If enrichment can't be gathered in time the bare message
+    # still goes out -- delivery beats decoration.
+    #
+    # Per-signal enrichment profile lives in _ALERT_ENRICHMENT_PROFILES.
+    # Defaults to all-on for unrecognised signals.
+
+    _ALERT_ENRICHMENT_PROFILES = {
+        'wan-flap':          {'mission': True,  'voice': True,  'host': True},
+        'player-disconnect': {'mission': True,  'voice': True,  'host': True},
+        'creating-path':     {'mission': True,  'voice': False, 'host': True},
+        'dcs-died':          {'mission': True,  'voice': True,  'host': True},
+        'bot-bootloop-prod': {'mission': False, 'voice': False, 'host': True},
+    }
+
+    async def alert_enrich(self, payload: AlertEnrichRequest) -> AlertEnrichResponse:
+        alerting_cfg = self.locals.get(DEFAULT_TAG, {}).get('alerting') or {}
+        app_token = alerting_cfg.get('pushover_app_token')
+        user_key  = alerting_cfg.get('pushover_user_key')
+        if not app_token or not user_key:
+            raise HTTPException(
+                status_code=503,
+                detail="Pushover not configured. Set DEFAULT.alerting.pushover_app_token and pushover_user_key in restapi.yaml."
+            )
+
+        timeout_secs = float(alerting_cfg.get('enrichment_timeout_secs', 2))
+        voice_channel_id = alerting_cfg.get('voice_channel_id')
+
+        notes: list[str] = []
+        extras: list[str] = []
+        try:
+            extras = await asyncio.wait_for(
+                self._enrich_for_signal(payload.signal_key, voice_channel_id=voice_channel_id, notes=notes),
+                timeout=timeout_secs,
+            )
+        except asyncio.TimeoutError:
+            notes.append(f"enrichment timed out after {timeout_secs}s")
+        except Exception as e:
+            self.log.warning(f"/alert/enrich enrichment error: {e!r}")
+            notes.append(f"enrichment error: {e}")
+
+        # Compose final message. Pushover caps at 1024 chars.
+        parts = [payload.pushover_message]
+        if extras:
+            parts.append("")
+            parts.extend(extras)
+        elif notes:
+            parts.append("")
+            parts.append(f"(enrichment unavailable: {'; '.join(notes)})")
+        if payload.fired_at:
+            parts.append(f"Fired: {payload.fired_at}")
+        if payload.event_count is not None:
+            parts.append(f"Events in window: {payload.event_count}")
+        if payload.sample_message:
+            sample = payload.sample_message.strip().splitlines()[0]
+            if len(sample) > 160:
+                sample = sample[:157] + "..."
+            parts.append(f"Sample: {sample}")
+        if payload.seq_url:
+            parts.append(payload.seq_url)
+
+        final_message = "\n".join(parts)
+        if len(final_message) > 1024:
+            final_message = final_message[:1020] + "..."
+
+        pushover_status: int | None = None
+        delivered = False
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    "https://api.pushover.net/1/messages.json",
+                    data={
+                        "token": app_token,
+                        "user": user_key,
+                        "title": payload.pushover_title,
+                        "message": final_message,
+                        "priority": str(payload.pushover_priority),
+                    },
+                    timeout=aiohttp.ClientTimeout(total=8),
+                ) as resp:
+                    pushover_status = resp.status
+                    delivered = 200 <= resp.status < 300
+                    if not delivered:
+                        body = await resp.text()
+                        self.log.error(f"/alert/enrich Pushover {resp.status}: {body[:200]}")
+        except Exception as e:
+            self.log.error(f"/alert/enrich Pushover POST failed: {e!r}")
+            notes.append(f"pushover post failed: {e}")
+
+        return AlertEnrichResponse.model_validate({
+            "delivered": delivered,
+            "enriched": bool(extras),
+            "pushover_status": pushover_status,
+            "notes": "; ".join(notes) if notes else None,
+        })
+
+    async def _enrich_for_signal(self, signal_key: str, *, voice_channel_id: Any, notes: list[str]) -> list[str]:
+        profile = self._ALERT_ENRICHMENT_PROFILES.get(
+            signal_key, {'mission': True, 'voice': True, 'host': True}
+        )
+        lines: list[str] = []
+
+        if profile.get('mission'):
+            try:
+                mission_lines = self._mission_summary_lines()
+                lines.extend(mission_lines)
+            except Exception as e:
+                notes.append(f"mission fetch failed: {e}")
+
+        if profile.get('voice') and voice_channel_id:
+            try:
+                ch = self.bot.get_channel(int(voice_channel_id))
+                if ch is None:
+                    notes.append(f"voice channel {voice_channel_id} not in cache")
+                elif not hasattr(ch, 'members'):
+                    notes.append(f"channel {voice_channel_id} is not a voice channel")
+                else:
+                    names = [m.display_name for m in ch.members if not m.bot]
+                    suffix = ""
+                    if names:
+                        shown = names[:8]
+                        suffix = f" ({', '.join(shown)}" + ("..." if len(names) > 8 else "") + ")"
+                    lines.append(f"Voice '{ch.name}': {len(names)}{suffix}")
+            except Exception as e:
+                notes.append(f"voice fetch failed: {e}")
+
+        if profile.get('host'):
+            try:
+                loop = asyncio.get_running_loop()
+                cpu, mem = await asyncio.gather(
+                    loop.run_in_executor(None, lambda: psutil.cpu_percent(interval=0.2)),
+                    loop.run_in_executor(None, psutil.virtual_memory),
+                )
+                ram_used_gb = (mem.total - mem.available) / (1024 ** 3)
+                ram_total_gb = mem.total / (1024 ** 3)
+                lines.append(f"Host: CPU {cpu:.0f}%  RAM {ram_used_gb:.1f}/{ram_total_gb:.1f} GB")
+            except Exception as e:
+                notes.append(f"host metrics failed: {e}")
+
+        return lines
+
+    def _mission_summary_lines(self) -> list[str]:
+        # All signals that hit /alert/enrich are scoped to Prod (server='Prod'
+        # in their Seq Where clause). The bot runs on the master node which
+        # also owns the Test cluster member, so filter to the local node to
+        # avoid leaking Test mission info into Prod alerts.
+        lines: list[str] = []
+        for server in self.bot.servers.values():
+            if server.node != self.node:
+                continue
+            if server.current_mission is None:
+                continue
+            uptime = int(server.current_mission.mission_time)
+            hours = uptime // 3600
+            mins = (uptime % 3600) // 60
+            blue = len(server.get_active_players(side=Side.BLUE))
+            red = len(server.get_active_players(side=Side.RED))
+            lines.append(
+                f"{server.name}: {server.current_mission.name} "
+                f"({server.current_mission.map}) up {hours}h{mins:02d}m  B:{blue} R:{red}"
+            )
+        return lines
 
     @tasks.loop(hours=1)
     async def refresh_views(self):

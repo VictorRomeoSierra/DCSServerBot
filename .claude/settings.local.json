@@ -2,7 +2,16 @@
   "permissions": {
     "allow": [
       "WebFetch(domain:raw.githubusercontent.com)",
-      "WebFetch(domain:github.com)"
+      "WebFetch(domain:github.com)",
+      "Bash(python -c \"import urllib.parse;print\\(urllib.parse.quote\\(\\\\\"server='Test' and app='Bot' and level='ERROR'\\\\\"\\)\\)\")",
+      "Bash(python -c \"import urllib.parse;print\\(urllib.parse.quote\\(\\\\\"server='Test' and app='Bot' and level='WARNING'\\\\\"\\)\\)\")",
+      "Bash(curl -s 'https://logs.victorromeosierra.com/api/events?count=40&range=1d&filter=__TRACKED_VAR__&apiKey=rHqmAXdSexsL8fYIcacp')",
+      "Bash(python -c ' *)",
+      "Bash(python -c \"import urllib.parse;print\\(urllib.parse.quote\\(\\\\\"server='Test'\\\\\"\\)\\)\")",
+      "Bash(curl -s 'https://logs.victorromeosierra.com/api/events?count=300&range=6h&filter=__TRACKED_VAR__&apiKey=rHqmAXdSexsL8fYIcacp')",
+      "Bash(python -c \"import urllib.parse;print\\(urllib.parse.quote\\(\\\\\"server='Test' and app='Bot' and \\(@Message like '%ERROR%' or @Message like '%WARNING%' or @Message like '%Traceback%' or @Message like '%Exception%'\\)\\\\\"\\)\\)\")",
+      "Bash(curl -s 'https://logs.victorromeosierra.com/api/events?count=80&range=1d&filter=__TRACKED_VAR__&apiKey=rHqmAXdSexsL8fYIcacp')",
+      "Bash(python -m py_compile plugins/vrs/commands.py)"
     ]
   }
 }

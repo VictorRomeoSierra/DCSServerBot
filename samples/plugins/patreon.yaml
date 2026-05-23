@@ -1,0 +1,33 @@
+# VRS Patreon plugin -- Discord-role-as-truth tier mapping.
+#
+# The plugin watches Patreon's native Discord integration (which grants
+# tier roles automatically when a patron links their Discord account in
+# Patreon settings). On player connect, the plugin walks the player's
+# Discord roles, picks the highest-numbered matching tier, and pushes it
+# to the mission for mission-side perks.
+#
+# `role` accepts:
+#   - bare integer (Discord role ID, recommended -- rename-proof)
+#   - quoted string of digits (also a role ID)
+#   - quoted string (role name -- looked up at runtime in guild)
+#
+# `tier` is the numeric tier passed to the mission; higher = more perks.
+# `label` is cosmetic (used in /patreon list + /patreon whois output).
+#
+# `announce_channel` (optional) is the Discord channel ID that receives
+# patron join / leave / tier-change notifications. Omit or leave 0 to skip.
+DEFAULT:
+  announce_channel: 123456789012345678  # replace with your channel ID
+  tiers:
+    - tier: 1
+      role: 123456789012345001          # Backer role ID
+      label: Backer
+    - tier: 2
+      role: 123456789012345002          # Supporter role ID
+      label: Supporter
+    - tier: 3
+      role: 123456789012345003          # Baller role ID
+      label: Baller
+    - tier: 4
+      role: 123456789012345004          # VRS Dev Team role ID
+      label: VRS Dev Team

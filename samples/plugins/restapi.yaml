@@ -7,3 +7,12 @@ DEFAULT:
     server_attendance:
       # Configuration options for the /server_attendance endpoint if needed in the future
       enabled: true
+  # Optional: enables POST /alert/enrich. A Seq.App.HttpRequest instance
+  # POSTs alert payloads here; this bot enriches with live context and
+  # forwards to Pushover. Omit the whole block to leave the endpoint
+  # configured but returning HTTP 503 (no credentials).
+  alerting:
+    pushover_app_token: pa3bSAMPLE                  # Pushover application token
+    pushover_user_key: u9999SAMPLE                  # Pushover user/group key
+    voice_channel_id: 123456789012345678            # optional: Discord voice channel for headcount enrichment
+    enrichment_timeout_secs: 2                      # default 2 -- aggregate budget for live data fetch

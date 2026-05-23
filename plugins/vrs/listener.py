@@ -34,7 +34,9 @@ BUG_REPORT_FLOOD_WINDOW_SECONDS = 60  # sliding window for flood detection
 BUG_REPORT_FLOOD_THRESHOLD = 5        # >= this many reports in window = FLOOD prefix
 BUG_REPORT_EMBED_COLOR = 0xCC0000     # red
 BUG_REPORT_DESCRIPTION_MAX = 3500     # leave headroom under Discord's 4096 cap
-BUG_REPORT_RECENT_ERRORS_LIMIT = 50   # how many ring buffer entries to render
+BUG_REPORT_RECENT_ERRORS_LIMIT = 4    # how many ring buffer entries to render
+                                     # (mission side already prioritises and
+                                     # caps to ~4; this is the upper safety net)
 
 
 @dataclass
@@ -342,12 +344,16 @@ class VrsEventListener(EventListener["Vrs"]):
             title = f"**FLOOD** {title}"
 
         # Description: player-provided chat lines, plus recent-errors code block.
+        # Build the code block separately and apply truncation INSIDE the fence
+        # so the closing ``` is always preserved (otherwise Discord drops the
+        # markdown formatting and the report renders as raw text).
         if state.chat_lines:
-            description = "\n".join(state.chat_lines)
+            header = "\n".join(state.chat_lines)
         else:
-            description = "_(no details added)_"
+            header = "_(no details added)_"
 
         recent = state.auto_state.get('recentErrors') or []
+        errors_section = ""
         if recent:
             lines = []
             for entry in recent[-BUG_REPORT_RECENT_ERRORS_LIMIT:]:
@@ -355,10 +361,28 @@ class VrsEventListener(EventListener["Vrs"]):
                 msg = entry.get('message', '')
                 lines.append(f"[{level:5}] {msg}")
             errors_block = "\n".join(lines)
-            description += f"\n\n**Recent errors**\n```\n{errors_block}\n```"
 
-        if len(description) > BUG_REPORT_DESCRIPTION_MAX:
-            description = description[:BUG_REPORT_DESCRIPTION_MAX] + "\n...(truncated)"
+            fence_open = "\n\n**Recent errors**\n```\n"
+            fence_close = "\n```"
+            truncate_marker = "\n...(truncated)"
+
+            # If the assembled description would exceed the limit, trim the
+            # errors_block (which is the only variable-length part) so the
+            # closing fence still fits.
+            overhead = len(header) + len(fence_open) + len(fence_close)
+            available = BUG_REPORT_DESCRIPTION_MAX - overhead
+            if available < 0:
+                # Header alone is over budget; drop the errors section entirely.
+                errors_section = ""
+                if len(header) > BUG_REPORT_DESCRIPTION_MAX:
+                    header = header[:BUG_REPORT_DESCRIPTION_MAX] + truncate_marker
+            elif len(errors_block) > available:
+                kept = errors_block[: max(0, available - len(truncate_marker))]
+                errors_section = fence_open + kept + truncate_marker + fence_close
+            else:
+                errors_section = fence_open + errors_block + fence_close
+
+        description = header + errors_section
 
         auto = state.auto_state
         utc_now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
