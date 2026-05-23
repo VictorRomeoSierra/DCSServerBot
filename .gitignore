@@ -22,3 +22,4 @@ config
 /.emmyrc.json
 .copilot-docs/*
 reference/
+.claude/settings.local.json

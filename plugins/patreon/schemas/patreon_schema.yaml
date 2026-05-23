@@ -1,0 +1,50 @@
+schema;tier_schema:
+  type: map
+  nullable: false
+  mapping:
+    tier: {type: int, nullable: false, range: {min: 1}}
+    role: {type: any, nullable: false}
+    label: {type: str, nullable: true}
+
+schema;tiers_schema:
+  type: seq
+  nullable: false
+  sequence:
+    - include: 'tier_schema'
+
+schema;default_schema:
+  type: map
+  nullable: false
+  mapping:
+    tiers:
+      include: 'tiers_schema'
+    announce_channel: {type: any, nullable: true}
+
+schema;element_schema:
+  type: map
+  func: is_element
+  nullable: false
+  mapping:
+    tiers:
+      include: 'tiers_schema'
+    announce_channel: {type: any, nullable: true}
+
+schema;instance_schema:
+  type: map
+  func: is_node
+  nullable: false
+  mapping:
+    regex;(.+):
+      include: 'element_schema'
+
+type: map
+func: check_main_structure
+nullable: false
+mapping:
+  DEFAULT:
+    include: 'default_schema'
+  regex;(.+):
+    type: any
+    func: any_of
+    nullable: false
+    enum: ['element_schema', 'instance_schema']
