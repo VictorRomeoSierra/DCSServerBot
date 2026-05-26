@@ -402,11 +402,33 @@ class PunishmentEventListener(EventListener["Punishment"]):
             # mark the event for a potential penalty
             self.disconnected[initiator.ucid] = (int(time.time()), evt)
 
-    async def _send_player_points(self, player: Player):
+    async def _send_player_points(self, player: Player, force: bool = False):
         points = await self._get_punishment_points(player)
-        if points > 0:
-            asyncio.create_task(player.sendChatMessage(_("{name}, you have {points} punishment points.").format(
-                name=player.name, points=points)))
+        if points <= 0:
+            return
+        # VRS: gate the spontaneous notification (onPlayerStart) to the
+        # threshold below which nothing actually happens to the player. The
+        # `-penalty` chat command passes force=True to always show.
+        if not force:
+            threshold = self._join_message_threshold(player.server)
+            if points < threshold:
+                return
+        asyncio.create_task(player.sendChatMessage(_("{name}, you have {points} punishment points.").format(
+            name=player.name, points=points)))
+
+    def _join_message_threshold(self, server: Server) -> int:
+        """VRS: lowest points value in the punishments ladder that triggers a
+        non-trivial action (anything other than `warn` or `message`, which are
+        just DM text). Below this, the player faces no real consequence yet,
+        so the spontaneous join-time notification is suppressed. Fallback to
+        the legacy ">0" behaviour if no real actions are configured."""
+        config = self.plugin.get_config(server) or {}
+        ladder = config.get('punishments') or []
+        real = [p.get('points', 0) for p in ladder
+                if p.get('action') not in (None, 'warn', 'message')]
+        if not real:
+            return 1
+        return min(real)
 
     def _schedule_give_kill(self, server: Server, victim_ucid: str, s_event: dict, delay: int = 10) -> None:
         def fire() -> None:
@@ -719,4 +741,4 @@ class PunishmentEventListener(EventListener["Punishment"]):
 
     @chat_command(name="penalty", help=_("displays your penalty points"))
     async def penalty(self, _server: Server, player: Player, _params: list[str]):
-        asyncio.create_task(self._send_player_points(player))
+        asyncio.create_task(self._send_player_points(player, force=True))

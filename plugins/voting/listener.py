@@ -18,12 +18,14 @@ _ = get_translation(__name__.split('.')[1])
 
 class VotingHandler:
 
-    def __init__(self, listener: 'VotingListener', item: VotableItem, server: Server, config: dict):
+    def __init__(self, listener: 'VotingListener', item: VotableItem, server: Server, config: dict,
+                 initiator: Player | None = None):
         self.loop = asyncio.get_event_loop()
         self.listener = listener
         self.item = item
         self.server = server
         self.config = config
+        self.initiator = initiator   # VRS: player who started the vote, or None
         self.votes:  dict[int, int] = dict()
         self.voter: list[Player] = list()
         self.tasks: list[asyncio.TimerHandle] = []
@@ -130,6 +132,13 @@ class VotingHandler:
             message = f"\"{winner}\" won with {self.votes[win_id + 1]} votes!"
             await self.server.sendChatMessage(Coalition.ALL, message)
             await self.server.sendPopupMessage(Coalition.ALL, message)
+            # VRS: emit onVotePassed so other plugins can react before execute fires
+            await self.listener.bus.propagate_event("onVotePassed", {
+                "what": self.item.name,
+                "winner": winner,
+                "votes": self.votes[win_id + 1],
+                "initiator_ucid": self.initiator.ucid if self.initiator else None,
+            }, self.server)
             await self.item.execute(winner)
         self.listener._all_votes.pop(self.server.name, None)
 
@@ -210,7 +219,8 @@ class VotingListener(EventListener["Voting"]):
         except (TypeError, ValueError) as ex:
             await player.sendChatMessage(str(ex))
             return
-        type(self)._all_votes[server.name] = VotingHandler(listener=self, item=item, server=server, config=config)
+        type(self)._all_votes[server.name] = VotingHandler(listener=self, item=item, server=server,
+                                                           config=config, initiator=player)
         await self.bot.audit(f"{player.display_name} called a vote for {what}",
                              user=player.member or player.ucid, server=server)
 

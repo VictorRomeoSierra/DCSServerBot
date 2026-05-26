@@ -2055,6 +2055,7 @@ class RestAPI(Plugin):
         'creating-path':     {'mission': True,  'voice': False, 'host': True},
         'dcs-died':          {'mission': True,  'voice': True,  'host': True},
         'bot-bootloop-prod': {'mission': False, 'voice': False, 'host': True},
+        'fps-low':           {'mission': True,  'voice': True,  'host': True},
     }
 
     async def alert_enrich(self, payload: AlertEnrichRequest) -> AlertEnrichResponse:
@@ -2187,10 +2188,16 @@ class RestAPI(Plugin):
         # All signals that hit /alert/enrich are scoped to Prod (server='Prod'
         # in their Seq Where clause). The bot runs on the master node which
         # also owns the Test cluster member, so filter to the local node to
-        # avoid leaking Test mission info into Prod alerts.
+        # avoid leaking Test mission info into Prod alerts. Optional
+        # DEFAULT.alerting.relevant_servers list further narrows to a named
+        # subset (e.g. only VRS_AI on prod); absent = include all local.
+        alerting_cfg = self.locals.get(DEFAULT_TAG, {}).get('alerting') or {}
+        relevant = alerting_cfg.get('relevant_servers')
         lines: list[str] = []
         for server in self.bot.servers.values():
             if server.node != self.node:
+                continue
+            if relevant and server.name not in relevant:
                 continue
             if server.current_mission is None:
                 continue

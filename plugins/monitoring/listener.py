@@ -39,6 +39,13 @@ class MonitoringListener(EventListener["Monitoring"]):
                                    "Server {server} FPS ({fps}) has been below {min_fps} for more than "
                                    "{period} minutes."),
                         server=server.name, fps=round(fps, 2), min_fps=min_fps, period=period)
+                    # Emit a structured Seq-friendly line so VRSInfra alerting can fire on it.
+                    # Keep [PERFMON-FPS-LOW] stable -- the alerting/signals/06-fps-low.ps1
+                    # filter matches against this exact token.
+                    self.log.warning(
+                        f"[PERFMON-FPS-LOW] server={server.name} fps={round(fps, 2)} "
+                        f"min_fps={min_fps} period={period}min users={len(server.get_active_players())}"
+                    )
                     if config.get("mentioning", True):
                         asyncio.create_task(ServiceRegistry.get(BotService).alert(title="Server Performance Low!",
                                                                                   message=message, server=server))

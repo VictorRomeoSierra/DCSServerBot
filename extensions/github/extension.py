@@ -1,11 +1,19 @@
 import asyncio
 import git
 import os
+import re
 import subprocess
 
 from core import Extension, utils, Server, get_translation
 from typing_extensions import override
 from urllib.parse import urlparse
+
+
+# Semver-only tag filter for the rollback command. Bare X.Y.Z per
+# .github/release-tagging-spec.md in the XSAF repo. Non-version tags
+# (backup/*, vrs-launch-*, etc.) live in a separate namespace and are
+# intentionally excluded from rollback targets.
+_SEMVER_TAG_RE = re.compile(r'^\d+\.\d+\.\d+$')
 
 _ = get_translation(__name__.split('.')[1])
 
@@ -91,8 +99,101 @@ class GitHub(Extension):
     async def update(self):
         self.log.debug(f"{self.name}: Updating repository {self.repo} into {self.target}")
         repo = git.Repo(self.target)
-        repo.git.pull()
+        branch = self.config.get('branch') or self.get_default_branch(self.target)
+
+        # Fetch first so we can inspect the remote without touching the
+        # working tree.
+        origin = repo.remotes.origin
+        await asyncio.to_thread(origin.fetch)
+
+        # Resolve local + remote HEAD commits. If anything goes sideways
+        # (no remote-tracking ref yet, detached HEAD, etc.), fall back to
+        # the legacy pull behavior so we don't regress an already-working
+        # setup.
+        try:
+            local_commit = repo.head.commit
+            remote_commit = repo.refs[f'origin/{branch}'].commit
+        except (IndexError, KeyError, AttributeError, ValueError) as e:
+            self.log.warning(
+                f"{self.name}: could not resolve refs for rewind check "
+                f"({e}); falling back to pull")
+            await asyncio.to_thread(repo.git.pull)
+            self._write_manifest(repo)
+            return
+
+        if local_commit.hexsha == remote_commit.hexsha:
+            # Already in sync. Nothing to do; rewrite the manifest in case
+            # it drifted on disk.
+            self._write_manifest(repo)
+            return
+
+        # Rewind detection: the remote head is an ancestor of the local
+        # head AND they differ. That means `origin/<branch>` moved
+        # BACKWARDS relative to where we are. The legacy `repo.git.pull()`
+        # path silently no-ops on this (FF-only) which caused the
+        # 2026-05-25 Prod incident -- restarts kept loading hotfix-era
+        # code because `git pull` couldn't rewind. See
+        # postmortem-2026-05-25-prod-multi-lag-cascade.md.
+        try:
+            rewound = await asyncio.to_thread(
+                repo.is_ancestor, remote_commit, local_commit)
+        except git.GitCommandError as e:
+            self.log.warning(
+                f"{self.name}: rewind ancestor check failed ({e}); "
+                f"falling back to pull")
+            await asyncio.to_thread(repo.git.pull)
+            self._write_manifest(repo)
+            return
+
+        if rewound:
+            self.log.warning(
+                f"{self.name}: origin/{branch} was rewound "
+                f"(local={local_commit.hexsha[:8]} -> "
+                f"remote={remote_commit.hexsha[:8]}); resetting hard. "
+                f"Force-pushes propagate within one update cycle by design.")
+            await asyncio.to_thread(
+                repo.git.reset, '--hard', f'origin/{branch}')
+        else:
+            # Normal forward motion -- regular pull.
+            await asyncio.to_thread(repo.git.pull)
+
         self._write_manifest(repo)
+
+    async def reset_to_ref(self, ref: str) -> tuple[str, str]:
+        """Reset the target repo to a given ref (tag, branch, or SHA).
+
+        Used by the /vrs rollback admin command (plugins/vrs/commands.py).
+        The ref is passed straight to `git reset --hard`, so callers
+        should pass `refs/tags/X.Y.Z` to disambiguate from branches.
+
+        Returns (old_sha, new_sha) for audit logging. Fetches tags first
+        so freshly-pushed tags resolve.
+        """
+        self.log.info(f"{self.name}: reset {self.target} -> {ref}")
+        repo = git.Repo(self.target)
+        old_sha = repo.head.commit.hexsha
+        await asyncio.to_thread(repo.remotes.origin.fetch, tags=True)
+        await asyncio.to_thread(repo.git.reset, '--hard', ref)
+        new_sha = repo.head.commit.hexsha
+        self._write_manifest(repo)
+        return old_sha, new_sha
+
+    async def list_release_tags(self) -> list[str]:
+        """Return semver-style release tags sorted descending (newest first).
+
+        Filters to bare X.Y.Z (per the XSAF release-tagging spec) so the
+        rollback autocomplete doesn't surface backup/save-point tags.
+        Fetches tags first so the list reflects the published state, not
+        the last cached snapshot.
+        """
+        repo = git.Repo(self.target)
+        await asyncio.to_thread(repo.remotes.origin.fetch, tags=True)
+        tags = [t.name for t in repo.tags if _SEMVER_TAG_RE.match(t.name)]
+
+        def _version_key(name: str) -> tuple[int, int, int]:
+            return tuple(int(p) for p in name.split('.'))  # type: ignore[return-value]
+
+        return sorted(tags, key=_version_key, reverse=True)
 
     def _write_manifest(self, repo):
         manifest = self.config.get('manifest')

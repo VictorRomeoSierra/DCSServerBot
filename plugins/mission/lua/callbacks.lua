@@ -309,12 +309,19 @@ function mission.onPlayerStart(id)
 end
 
 function mission.onPlayerStop(id)
-    log.write('DCSServerBot', log.DEBUG, 'Mission: onPlayerStop()')
+    local ucid = net.get_player_info(id, 'ucid')
+    local name = net.get_player_info(id, 'name')
+    -- ucid is included in the log line so Seq's @EventType hash becomes
+    -- UCID-unique. The VRSInfra Signal 2 alert dedupes via
+    -- count(distinct(@EventType)) and needs distinct players (not slots) for
+    -- correctness. tostring() handles the (rare) case where net.get_player_info
+    -- returns nil because the netcode-layer state was cleared first.
+    log.write('DCSServerBot', log.DEBUG, 'Mission: onPlayerStop() ucid=' .. tostring(ucid) .. ' name=' .. tostring(name))
     local msg = {
         command = 'onPlayerStop',
         id = id,
-        ucid = net.get_player_info(id, 'ucid'),
-        name = net.get_player_info(id, 'name'),
+        ucid = ucid,
+        name = name,
         active = false
     }
     utils.sendBotTable(msg)
