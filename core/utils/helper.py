@@ -81,6 +81,7 @@ __all__ = [
     "RemoteSettingsDict",
     "tree_delete",
     "deep_merge",
+    "update_in_place",
     "hash_password",
     "run_parallel_nofail",
     "safe_set_result",
@@ -93,7 +94,8 @@ __all__ = [
     "show_dict_diff",
     "to_valid_pyfunc_name",
     "pg_interval_to_seconds",
-    "pg_get_latest_version"
+    "get_latest_postgres_version",
+    "get_latest_python_version"
 ]
 
 logger = logging.getLogger(__name__)
@@ -216,11 +218,12 @@ def sanitize_string(s: str) -> str:
 
     return s
 
-
-SECONDS_IN_DAY = 86400
-SECONDS_IN_HOUR = 3600
 SECONDS_IN_MINUTE = 60
-TIME_LABELS = [("d", "day"), ("h", "hour"), ("m", "minute")]
+SECONDS_IN_HOUR = SECONDS_IN_MINUTE * 60
+SECONDS_IN_DAY = SECONDS_IN_HOUR * 24
+SECONDS_IN_YEAR = SECONDS_IN_DAY * 365
+
+TIME_LABELS = [("y", "year"), ("d", "day"), ("h", "hour"), ("m", "minute")]
 
 
 def format_time_units(units, label_single, label_plural=None):
@@ -485,7 +488,7 @@ def get_presets(node: Node) -> Iterable[str]:
     return presets
 
 
-def get_preset(node: Node, name: str, filename: str | list[str] | None = None) -> dict | None:
+def get_preset(node: Node, name: str, filename: str | list[str] | None = None) -> dict | list | None:
     """
     :param node: The node where the configuration is stored.
     :param name: The name of the preset to retrieve.
@@ -574,10 +577,12 @@ def matches_cron(datetime_obj: datetime, cron_string: str):
 
 def dynamic_import(package_name: str):
     package = importlib.import_module(package_name)
-    for loader, module_name, is_pkg in pkgutil.walk_packages(package.__path__):
+    prefix = package.__name__ + '.'
+
+    for loader, module_name, is_pkg in pkgutil.walk_packages(package.__path__, prefix):
         if is_pkg:
             try:
-                globals()[module_name] = importlib.import_module(f"{package_name}.{module_name}")
+                importlib.import_module(module_name)
             except Exception as ex:
                 logger.error(f"Failed to import {module_name} due to {ex}, skipping.")
 
@@ -1095,6 +1100,37 @@ def deep_merge(d1: Mapping[str, Any], d2: Mapping[str, Any]) -> Mapping[str, Any
     return result
 
 
+def update_in_place(d1: dict, d2: dict) -> dict:
+    """
+    Update *d1* in place, replacing values with those from *d2*
+    only for keys that already exist in *d1*.
+
+    Keys that appear only in *d2* are ignored; keys that appear only in *d1*
+    retain their original values.
+
+    Parameters
+    ----------
+    d1 : dict
+        The dictionary to be updated.
+    d2 : dict
+        The source of replacement values.
+
+    Returns
+    -------
+    dict
+        The updated dictionary *d1*.
+    """
+
+    for k, v1 in d1.items():
+        if k in d2:
+            v2 = d2[k]
+            if isinstance(v1, dict) and isinstance(v2, dict):
+                update_in_place(v1, v2)
+            else:
+                d1[k] = v2
+    return d1
+
+
 def hash_password(password: str) -> str:
     # Generate an 11-character alphanumeric string
     key = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(11))
@@ -1526,27 +1562,63 @@ def pg_interval_to_seconds(interval: str) -> int:
     return total_seconds
 
 
-async def pg_get_latest_version(node: Node, version: str | None = None) -> dict | None:
+async def get_latest_postgres_version(node: Node, version: str | None = None) -> dict | None:
     ssl_ctx = ssl.create_default_context(cafile=certifi.where())
 
-    async with aiohttp.ClientSession(
-        connector=aiohttp.TCPConnector(ssl=ssl_ctx)
-    ) as session:
-        async with session.get(
-            "https://www.postgresql.org/versions.json",
-            proxy=node.proxy,
-            proxy_auth=node.proxy_auth,
-        ) as resp:
-            if resp.status != 200:
-                return None
-            data = await resp.json(encoding="utf-8")
+    try:
+        async with aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(ssl=ssl_ctx)
+        ) as session:
+            async with session.get(
+                "https://www.postgresql.org/versions.json",
+                proxy=node.proxy,
+                proxy_auth=node.proxy_auth,
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json(encoding="utf-8")
 
-    # if we did not pass a version, return the latest available
-    if not version:
-        return data[-1]
+        # if we did not pass a version, return the latest available
+        if not version:
+            return data[-1]
 
-    my_version = parse(version)
-    check = next((x for x in data if x['major'] == str(my_version.major)), None)
-    if not check:
+        my_version = parse(version)
+        check = next((x for x in data if x['major'] == str(my_version.major)), None)
+        if not check:
+            return None
+        return check
+    except Exception:
         return None
-    return check
+
+
+async def get_latest_python_version(node: Node, version: str | None = None) -> dict | None:
+    ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+
+    try:
+        async with aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(ssl=ssl_ctx)
+        ) as session:
+            async with session.get(
+                "https://endoflife.date/api/v1/products/python",
+                proxy=node.proxy,
+                proxy_auth=node.proxy_auth,
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json(encoding="utf-8")
+
+        releases = data.get('result', {}).get('releases', [])
+        if not releases:
+            return None
+
+        # if we did not pass a version, return the latest available
+        if not version:
+            return releases[0]
+
+        my_version = parse(version)
+        check = next((x for x in releases if x['name'] == f"{my_version.major}.{my_version.minor}"), None)
+        if not check:
+            return None
+        return check
+    except Exception:
+        return None

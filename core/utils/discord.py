@@ -15,6 +15,7 @@ from core.translations import get_translation
 from datetime import datetime, timedelta
 from discord import app_commands, Interaction, SelectOption, ButtonStyle
 from discord.ext import commands
+from discord.ext.tasks import Loop
 from discord.ui import Button, View, Select, Item, Modal, TextInput
 from enum import Enum, auto
 from fuzzywuzzy import fuzz
@@ -59,6 +60,8 @@ __all__ = [
     "match",
     "find_similar_names",
     "get_all_linked_members",
+    "safe_start",
+    "safe_cancel",
     "NodeTransformer",
     "InstanceTransformer",
     "ServerTransformer",
@@ -123,7 +126,7 @@ async def wait_for_single_reaction(interaction: discord.Interaction, message: di
     # cancel pending tasks
     for task in pending:
         task.cancel()
-        await task
+    await asyncio.gather(*pending, return_exceptions=True)
 
     if not done:
         raise TimeoutError
@@ -132,8 +135,16 @@ async def wait_for_single_reaction(interaction: discord.Interaction, message: di
     return react
 
 
-async def selection_list(interaction: discord.Interaction, data: list, embed_formatter, num: int = 5,
-                         marker: int = -1, marker_emoji='🔄'):
+async def selection_list(
+        interaction: discord.Interaction,
+        data: list,
+        embed_formatter,
+        *,
+        num: int = 5,
+        marker: int = -1,
+        marker_emoji='🔄',
+        no_selection: bool = False
+):
     """
     :param interaction: A discord.Interaction instance representing the interaction event.
     :param data: A list of data to display in the embeds.
@@ -141,6 +152,7 @@ async def selection_list(interaction: discord.Interaction, data: list, embed_for
     :param num: An integer representing the number of data to display per page, default is 5.
     :param marker: An integer representing the marker index, default is -1.
     :param marker_emoji: A string representing the emoji for the marker, default is '🔄'.
+    :param no_selection: A boolean indicating whether to have a selection or display only, default is False (selection).
     :return: An integer representing the index of the selected item, or -1 if no item is selected or an error occurs.
 
     This method is used to display a paginated selection list based on the given data. It sends embeds with reaction buttons for navigation and selection. The user can navigate through the
@@ -161,11 +173,12 @@ async def selection_list(interaction: discord.Interaction, data: list, embed_for
             message = await interaction.followup.send(embed=embed)
             if j > 0:
                 await message.add_reaction('◀️')
-            for i in range(1, max_i + 1):
-                if (j * num + i) != marker:
-                    await message.add_reaction(chr(0x30 + i) + '\u20E3')
-                else:
-                    await message.add_reaction(marker_emoji)
+            if not no_selection:
+                for i in range(1, max_i + 1):
+                    if (j * num + i) != marker:
+                        await message.add_reaction(chr(0x30 + i) + '\u20E3')
+                    else:
+                        await message.add_reaction(marker_emoji)
             await message.add_reaction('⏹️')
             if ((j + 1) * num) < len(data):
                 await message.add_reaction('▶️')
@@ -925,6 +938,19 @@ async def get_all_linked_members(
     return results
 
 
+def safe_start(loop: Loop):
+    if not loop.is_running():
+        loop.start()
+
+
+async def safe_cancel(loop: Loop):
+    loop.cancel()
+    task = loop.get_task()
+    if task:
+        with suppress(asyncio.CancelledError):
+            await task
+
+
 class ServerTransformer(app_commands.Transformer):
     """
     A transformer for Discord application commands that handles server selection.
@@ -1225,7 +1251,7 @@ class UserTransformer(app_commands.Transformer):
                 )
                 for ucid, name in get_all_players(interaction.client, self.linked, self.watchlist, search=current)
             ][:25])
-        # we do not add linked accounts, if the result above fills the return list already
+        # we do not add linked accounts if the result above fills the return list already
         if len(ret) < 25 and self.sel_type in [PlayerType.ALL, PlayerType.MEMBER] and (self.linked is None or self.linked):
             ret.extend([
                 app_commands.Choice[str](

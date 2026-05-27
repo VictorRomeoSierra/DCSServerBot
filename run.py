@@ -123,6 +123,14 @@ class Main:
         pfh.doRollover()
         perf_logger.addHandler(pfh)
 
+        # Rotate async_errors.log
+        async_log = os.path.join('logs', 'async_errors.log')
+        async_old = async_log.replace('.log', '.old')
+        if os.path.exists(async_old):
+            os.remove(async_old)
+        if os.path.exists(async_log):
+            os.rename(async_log, async_old)
+
     @staticmethod
     def reveal_passwords(config_dir: str):
         print("[yellow]These are your hidden secrets:[/]")
@@ -135,7 +143,7 @@ class Main:
 
     async def start_service(self, registry: ServiceRegistry, cls: Any) -> None:
         try:
-            await registry.new(cls).start()
+            await registry.start_service(cls)
         except Exception as ex:
             self.log.error(f"  - {ex.__str__()}")
             self.log.error(f"  => {cls.__name__} NOT loaded.")
@@ -183,15 +191,18 @@ class Main:
                         await asyncio.sleep(1)
                         continue
 
+                    # clear proxies
+                    registry.clear_proxies()
+
                     # switch master
                     if self.node.claimed_master:
                         self.log.info("Taking over as the MASTER node ...")
-                        # start all master-only services
+                        # stop all agent-only services
                         tasks = []
                         for cls in [x for x in registry.services().keys() if registry.agent_only(x)]:
                             tasks.append(registry.get(cls).stop())
                         await asyncio.gather(*tasks)
-                        # stop all agent-only services
+                        # start all master-only services
                         tasks = []
                         for cls in [x for x in registry.services().keys() if registry.master_only(x)]:
                             tasks.append(self.start_service(registry, cls))
@@ -332,16 +343,10 @@ if __name__ == "__main__":
         Main.reveal_passwords(args.config)
         exit(-2)
 
-    # Require Python >= 3.10
-    if sys.version_info < (3,10):
-        print("ERROR: DCSServerBot requires Python >= 3.10.")
+    # Require Python >= 3.11
+    if sys.version_info < (3,11):
+        print("ERROR: DCSServerBot requires Python >= 3.11.")
         sys.exit(-2)
-    elif sys.version_info < (3,11):
-        print(
-"""
-WARNING: DCSServerBot will drop support for Pyton 3.10 soon.
-         Please upgrade to Python 3.11+
-""")
 
     # Add certificates
     os.environ["SSL_CERT_FILE"] = certifi.where()

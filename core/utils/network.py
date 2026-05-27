@@ -36,12 +36,20 @@ API_URLS = [
 ]
 
 
-def get_hash_secret() -> bytes:
+def get_hash_secret(config_dir='config') -> bytes:
+    """
+        Return the HMAC secret key as raw bytes.
+
+        The key is stored in a base‑64 string under the name 'hash' inside
+        ``config_dir``.  If the key is missing, corrupted, or otherwise
+        undecodable, a new 32‑byte key is generated, stored, and returned.
+    """
     try:
-        secret = base64.b64decode(get_password('hash'))
-    except ValueError:
-        secret = base64.b64encode(secrets.token_bytes(32)).decode()
-        set_password("hash", secret)
+        secret = base64.b64decode(get_password('hash', config_dir).encode('ascii'))
+    except (ValueError, TypeError):
+        secret = secrets.token_bytes(32)
+        secret_b64 = base64.b64encode(secret).decode('ascii')
+        set_password("hash", secret_b64, config_dir)
     return secret
 
 
@@ -71,10 +79,13 @@ def is_open(ip, port):
 
 
 async def get_public_ip(node: "Node | None" = None):
+    proxy = node.proxy if node else None
+    proxy_auth = node.proxy_auth if node else None
+
     for url in API_URLS:
         with suppress(aiohttp.ClientError, ValueError):
             async with aiohttp.ClientSession() as session:
-                async with session.get(url) as resp:
+                async with session.get(url, proxy=proxy, proxy_auth=proxy_auth) as resp:
                     return ipaddress.ip_address(await resp.text()).compressed
     raise TimeoutError("Public IP could not be retrieved.")
 

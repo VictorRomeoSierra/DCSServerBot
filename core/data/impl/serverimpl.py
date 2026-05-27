@@ -5,13 +5,12 @@ import atexit
 import importlib
 import inspect
 import json
-import sqlite3
-
 import luadata
 import os
 import pkgutil
 import psutil
 import shutil
+import sqlite3
 import sys
 import tempfile
 import time
@@ -20,6 +19,7 @@ import traceback
 if sys.platform == 'win32':
     import win32con
     import win32gui
+    import win32process
 
 from collections import OrderedDict
 from contextlib import suppress
@@ -131,7 +131,7 @@ class MissionFileSystemEventHandler(FileSystemEventHandler):
 
     def on_deleted(self, event: DirDeletedEvent | FileDeletedEvent) -> None:
         path = os.path.normpath(event.src_path)
-        if not path.endswith('.miz'):
+        if not self._is_valid_mission_file(path):
             return
         missions = self.server.settings['missionList']
         if '.dcssb' not in path:
@@ -157,6 +157,7 @@ class ServerImpl(Server):
     bot: DCSServerBot | None = field(compare=False, init=False)
     event_handler: MissionFileSystemEventHandler = field(compare=False, default=None)
     observer: ObserverType = field(compare=False, default=None)
+    process: psutil.Process | None = field(default=None, compare=False)
 
     @override
     def __post_init__(self):
@@ -493,7 +494,7 @@ class ServerImpl(Server):
 
     @override
     async def rename(self, new_name: str, update_settings: bool = False) -> None:
-        def update_config(old_name, new_name: str, update_settings: bool = False):
+        def update_config(old_name: str | None, new_name: str, update_settings: bool = False):
             # update servers.yaml
             filename = os.path.join(self.node.config_dir, 'servers.yaml')
             if os.path.exists(filename):
@@ -510,7 +511,7 @@ class ServerImpl(Server):
             if update_settings:
                 self.settings['name'] = new_name
 
-        async def update_database(old_name: str, new_name: str):
+        async def update_database(old_name: str | None, new_name: str):
             # rename the server in the database
             async with self.apool.connection() as conn:
                 await conn.execute("UPDATE servers SET server_name = %s WHERE server_name = %s",
@@ -547,7 +548,8 @@ class ServerImpl(Server):
                 self.name = new_name
             except Exception:
                 # rollback config
-                update_config(new_name, old_name, update_settings)
+                if old_name:
+                    update_config(new_name, old_name, update_settings)
                 raise
         except Exception:
             self.log.exception(f"Error during renaming of server {old_name} to {new_name}: ", exc_info=True)
@@ -619,13 +621,13 @@ class ServerImpl(Server):
                 instance=self.instance.name
             )
             if 'priority' in self.locals:
-                self.set_priority(self.locals.get('priority'))
+                self.set_priority(self.locals['priority'])
             self.log.info(f"  => DCS server starting up with PID {self.process.pid}")
         except Exception:
             self.log.error(f"  => Error while trying to launch DCS!", exc_info=True)
             self.process = None
 
-    def load_extension(self, name: str) -> Extension | None:
+    def load_extension(self, name: str, config: dict | None = None) -> Extension | None:
         if '.' not in name:
             _extension = f'extensions.{name.lower()}.extension.{name}'
         else:
@@ -634,10 +636,13 @@ class ServerImpl(Server):
         if not _ext:
             self.log.error(f"Extension {name} could not be found!")
             return None
-        return _ext(
-            self,
-            self.node.locals.get('extensions', {}).get(name, {}) | (DEFAULT_EXTENSIONS | self.locals.get('extensions', {}))[name]
-        )
+        if not config:
+            config = self.node.locals.get('extensions', {}).get(name, {}) | (
+                    DEFAULT_EXTENSIONS | self.locals.get('extensions', {})
+            ).get(name, {})
+        else:
+            config = self.node.locals.get('extensions', {}).get(name, {}) | config
+        return _ext(self, config)
 
     @override
     async def init_extensions(self) -> list[str]:
@@ -669,25 +674,63 @@ class ServerImpl(Server):
                 except Exception:
                     self.log.error(f"  => Unknown error during {ext.name}.prepare() - skipped.", exc_info=True)
 
-    @staticmethod
-    def _window_enumeration_handler(hwnd, top_windows):
-        top_windows.append((hwnd, win32gui.GetWindowText(hwnd)))
-
     def _minimize(self):
-        top_windows = []
-        win32gui.EnumWindows(self._window_enumeration_handler, top_windows)
+        """
+        Minimize the main window of the process represented by
+        self.process (a psutil.Process instance).
 
-        # Fetch the window name of the process
-        window_name = self.instance.name
+        If no window is found or the window disappears before the
+        message is sent, the call is silently ignored.
+        """
+        target_pid = self.process.pid
 
-        for hwnd, title in top_windows:
-            if window_name.lower() in title.lower():
-                # non-blocking call
+        # ------------------------------------------------------------------
+        # 1. Gather all top‑level windows that belong to the target PID
+        # ------------------------------------------------------------------
+        candidate_windows = []
+
+        def enum_handler(hwnd, _):
+            # Skip invisible or child windows – we only care about
+            # top‑level windows that belong to the process.
+            if not win32gui.IsWindowVisible(hwnd):
+                return True
+
+            try:
+                _, win_pid = win32process.GetWindowThreadProcessId(hwnd)
+            except Exception:
+                # Some exotic windows can raise an exception when queried.
+                return True
+
+            if win_pid == target_pid:
+                title = win32gui.GetWindowText(hwnd)
+                candidate_windows.append((hwnd, title))
+
+            return True  # keep enumerating
+
+        win32gui.EnumWindows(enum_handler, None)
+
+        if not candidate_windows:
+            self.log.debug("No visible window found for PID %s", target_pid)
+            return
+
+        # ------------------------------------------------------------------
+        # 2. Pick the “main” window – usually the first one we found.
+        # ------------------------------------------------------------------
+        hwnd, title = candidate_windows[0]
+
+        # ------------------------------------------------------------------
+        # 3. Post the minimize command – only if the handle is still valid
+        # ------------------------------------------------------------------
+        try:
+            if win32gui.IsWindow(hwnd):
                 win32gui.PostMessage(hwnd,
                                      win32con.WM_SYSCOMMAND,
                                      win32con.SC_MINIMIZE,
                                      0)
-                break
+            else:
+                self.log.debug("Handle %s no longer refers to a window", hwnd)
+        except win32gui.error as exc:
+            return
 
     def set_priority(self, priority: str):
         if priority == 'below_normal':
@@ -707,14 +750,19 @@ class ServerImpl(Server):
         self.process.nice(p)
 
     def _cleanup_sqlite(self):
-        sqlite_path = os.path.join(self.instance.home, 'Config', 'serverdata.sqlite3')
-        with sqlite3.connect(sqlite_path) as conn:
-            cur = conn.cursor()
-            # we need to delete all net sessions regularly to obey the GDPR requirements
-            cur.execute("DELETE FROM net_sessions;")
-            conn.commit()
-            conn.execute("VACUUM;")
-            conn.commit()
+        try:
+            sqlite_path = os.path.join(self.instance.home, 'Config', 'serverdata.sqlite3')
+            if not os.path.exists(sqlite_path):
+                return
+            with sqlite3.connect(sqlite_path) as conn:
+                cur = conn.cursor()
+                # we need to delete all net sessions regularly to obey the GDPR requirements
+                cur.execute("DELETE FROM net_sessions;")
+                conn.commit()
+                conn.execute("VACUUM;")
+                conn.commit()
+        except sqlite3.OperationalError:
+            pass
 
     @override
     async def startup(self, modify_mission: bool | None = True, use_orig: bool | None = True) -> None:
@@ -979,7 +1027,12 @@ class ServerImpl(Server):
 
     @override
     async def restart(self, modify_mission: bool | None = True, use_orig: bool | None = True) -> None:
-        await self.loadMission(self._get_current_mission_file(), modify_mission=modify_mission, use_orig=use_orig)
+        current_mission = self._get_current_mission_file()
+        if current_mission:
+            await self.loadMission(current_mission, modify_mission=modify_mission, use_orig=use_orig)
+        else:
+            await self.stop()
+            await self.start()
 
     @override
     async def getStartIndex(self) -> int:
@@ -1278,9 +1331,9 @@ class ServerImpl(Server):
     async def enable_extension(self, name: str, config: dict | None = None) -> bool:
         ext = self.extensions.get(name)
         if not ext:
-            ext = self.load_extension(name)
+            ext = self.load_extension(name, config)
             self.extensions[name] = ext
-        if await ext.enable():
+        if ext and await ext.enable():
             await self.config_extension(name, (config or {}) | {"enabled": True})
             return True
         return False

@@ -20,10 +20,12 @@ The main structure of the scheduler.yaml consists out of these blocks:
 
 a) DEFAULT Section
 ```yaml
+# config/plugins/scheduler.yaml
 DEFAULT:                                              # the DEFAULT block is valid for ALL your servers
   startup_delay: 10                                   # delay in seconds between the startup of each DCS instance (default: 10)
   warn:                                               # warn times before a restart / shutdown (see an alternative format below)
-    message: '!!! {item} will {what} in {when} !!!'   # Message to be displayed as a popup in DCS. These variables can be used in your own message. 
+    message: '!!! {item} will {what} in {when} !!!'   # Message to be displayed as a popup in DCS. These variables can be used in your own message.
+    sound: alarm.ogg                                  # Optional: Sound to be played (default: none)
     countdown:                                        # Optional: Send a countdown
       time: 10                                        # ... 10 seconds before shutdown
       message: '!!! {item} will {what} in {when} !!!' # Optional: Message to be sent (default: warn/message)
@@ -45,6 +47,7 @@ The instance-specific section consists out of three blocks:
 | action   | WHAT should happen durning the RUNTIME?         |
 
 ```yaml
+# config/plugins/scheduler.yaml
 DCS.dcs_serverrelease:                              
   timezone: UTC             # Optional: timezone (default: local timezone)
   schedule:                 # Server "DCS.dcs_serverrelease" will run 24x7
@@ -63,13 +66,17 @@ DCS.dcs_serverrelease:
 
 ### Section "warn"
 
-| Parameter       | Description                                                                                                                                                                                                                                                                                                      |
-|:----------------|:-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| times           | List of seconds, when a warning should be issued or alternatively a dictionary with seconds and specific warn texts.                                                                                                                                                                                             |
-| text            | A customizable message that will be sent to the users when a restart is pending.<br/>{item} will be replaced with either "server" or "mission", depending on what's happening.<br/>{what} will be replaced with what is happening (restart, shutdown, rotate)<br/>{when} will be replaced with the time to wait. |
+| Parameter | Description                                                                                                                                                                                                                                                                                                      |
+|:----------|:-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| times     | List of seconds, when a warning should be issued or alternatively a dictionary with seconds and specific warn texts / sounds.                                                                                                                                                                                    |
+| message   | A customizable message that will be sent to the users when a restart is pending.<br/>{item} will be replaced with either "server" or "mission", depending on what's happening.<br/>{what} will be replaced with what is happening (restart, shutdown, rotate)<br/>{when} will be replaced with the time to wait. |
+| sound     | Optional: Sound to be played (default: none)                                                                                                                                                                                                                                                                     |
+| countdown | Optional: Send a countdown message every second starting x seconds before restart                                                                                                                                                                                                                                |
 
+Alternative format for `warn`, e.g., to display messages in your own language:
 ```yaml
-  # Alternative format for `warn`, e.g., to display messages in your own language
+# config/plugins/scheduler.yaml
+DEFAULT:
   warn:
     times:
       600: Внимание сервер будет перезапущен через 10 минут! 
@@ -77,6 +84,30 @@ DCS.dcs_serverrelease:
       60: Минутная готовность!
       10: Сервер перезапускается!
 ```
+
+Even more format options to add specific sounds to specific times:
+```yaml
+# config/plugins/scheduler.yaml
+DEFAULT:
+  warn:
+    times:
+      600: 
+        message: "The server is going to be restarted in 10 minutes, you should RTB!"
+        sound: beep.ogg
+      300: 
+        message: "5 minutes left until the server restarts!"
+        sound: beep.ogg
+      60: 
+        message: "Server restarts in 1 minute!"
+        sound: notify.ogg
+      10: 
+        message: "Server is going to restart in 10 seconds!"
+        sound: alarm.ogg
+```
+
+> [!NOTE]
+> Any sound you add to your warn-structure has to be loaded into the mission.
+> You can use a [MizEdit](../../extensions/mizedit/README.md#attaching-files) preset to do this.
 
 ### Section "timezone"
 The timezone used for any of the sections below. 
@@ -126,12 +157,14 @@ Characters represent Mon, Tue, Wed, Thu, Fri, Sat, Sun in that order.
 ### Section "startup"
 The "startup" section is treated like a "load" command:
 ```yaml
-startup:
-  mission_id: 1           # Set the mission id to be loaded at startup. Could also be a mission_file.
-  presets:
-    - config/presets.yaml # Optional: presets file to be used for modifications
-  settings:
-    - NoMods              # Optional: apply the "NoMods" preset to the mission prior to startup
+# config/plugins/scheduler.yaml
+DCS.dcs_serverrelease:
+  startup:
+    mission_id: 1           # Set the mission id to be loaded at startup. Could also be a mission_file.
+    presets:
+      - config/presets.yaml # Optional: presets file to be used for modifications
+    settings:
+      - NoMods              # Optional: apply the "NoMods" preset to the mission prior to startup
 ```
 
 > [!NOTE]
@@ -200,19 +233,22 @@ startup:
 > • month   : 1–12 (or names Jan–Dec)
 > • dow     : 0–6 (Sunday=0) (or names Sun–Sat)
 > ```
-> Our implementation has 2 additional fields:
+> Our implementation has two additional fields:
 > - You can add a 6th field at the front for seconds
 > - You can add a 7th field at the end for the year
 
 ### method
 
-| Parameter | Description                                                                                                              |
-|:----------|:-------------------------------------------------------------------------------------------------------------------------|
-| restart   | Restart the configured mission.                                                                                          |
-| rotate    | Rotate to the next mission in the mission list.                                                                          |
-| load      | Load another mission. Optional parameter no_reload to not reload an already running mission.                             |
-| stop      | Stop the running server.                                                                                                 |
-| shutdown  | Shutdown the running server. You can also shutdown during restart, load and rotate with the `shutdown: true` parameter.  |
+| Parameter | Description                                                                                                                     |
+|:----------|:--------------------------------------------------------------------------------------------------------------------------------|
+| restart   | Restart the configured mission.                                                                                                 |
+| rotate    | Rotate to the next mission in the mission list.                                                                                 |
+| load      | Load another mission. Optional parameter no_reload to not reload an already running mission.                                    |
+| stop      | Stop the running server.                                                                                                        |
+| shutdown  | Shutdown the running server. You can also shutdown during restart, load and rotate with the `shutdown: true` parameter.         |
+
+> [!NOTE]
+> The shutdown method will set the maintenance flag, unless you specify `maintenance: false` in the action section.
 
 ### on-commands
 
@@ -239,6 +275,17 @@ The following environment variables can be used in the "run" command:
 | dcs_installation | DCS installation path         |
 | dcs_home         | Saved Games directory         |
 | server           | internal server datastructure |
+
+Examples:
+```yaml
+  onSimulationStart: load:Scripts/net/start.lua   # We will run a specific Lua script on server start
+```
+
+```yaml
+  onSimulationStart:
+    sleep: 10                            # sleep 10 seconds before loading the script
+    command: load:Scripts/net/start.lua  # load the script into your mission
+```
 
 ## Discord Commands
 
@@ -278,6 +325,7 @@ The following environment variables can be used in the "run" command:
 ## Examples:
 
 ```yaml
+# config/plugins/scheduler.yaml
 DEFAULT:
   startup_delay: 30                               # delay in seconds between the startup of each DCS instance (default: 10)
   warn:                                           # warn times before a restart / shutdown (see the alternative format below)
@@ -305,9 +353,9 @@ instance2:
     - 08:00
     method: rotate                                # ... it will rotate ...                                
     populated: true                               # ... independently if players are flying or not. 
-  onSimulationStart: load:Scripts/net/start.lua   # We will run a specific lua script on server start
-  onSimulationStop: load:Scripts/net/stop.lua     # We will run a specific lua script on server stop (restart will trigger stop and start!)
-  onMissionEnd: load:Scripts/net/end.lua          # We will run a specific lua script on the mission end
+  onSimulationStart: load:Scripts/net/start.lua   # We will run a specific Lua script on server start
+  onSimulationStop: load:Scripts/net/stop.lua     # We will run a specific Lua script on server stop (restart will trigger stop and start!)
+  onMissionEnd: load:Scripts/net/end.lua          # We will run a specific Lua script on the mission end
   onShutdown: run:shutdown /r                     # if the DCS server is shut down, the real PC will restart
 
 instance3:

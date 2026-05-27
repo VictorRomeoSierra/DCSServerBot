@@ -54,16 +54,15 @@ class RestAPI(Plugin):
     async def cog_load(self) -> None:
         await super().cog_load()
         self.refresh_views.add_exception_type(psycopg.DatabaseError)
-        self.refresh_views.start()
+        utils.safe_start(self.refresh_views)
         asyncio.create_task(self.init_webservice())
 
     async def cog_unload(self) -> None:
-        self.refresh_views.cancel()
+        await utils.safe_cancel(self.refresh_views)
         if self.app and self.router:
             # Remove our routes from the main app to prevent duplicates on reload
             for route in self.router.routes:
                 self.app.routes.remove(route)
-
         await super().cog_unload()
 
     async def init_webservice(self):
@@ -1061,11 +1060,14 @@ class RestAPI(Plugin):
                     params = {}
                     
                 await cursor.execute(f"""
-                    SELECT SUM("totalPlayers") AS "totalPlayers", SUM("totalPlaytime") AS "totalPlaytime",
-                           SUM("avgPlaytime") AS "avgPlaytime",
-                           SUM("totalSorties") AS "totalSorties", SUM("totalKills") AS "totalKills",
-                           SUM("totalDeaths") AS "totalDeaths", SUM("totalPvPKills") AS "totalPvPKills",
-                           SUM("totalPvPDeaths") AS "totalPvPDeaths" 
+                    SELECT COALESCE(SUM("totalPlayers"), 0) AS "totalPlayers", 
+                           COALESCE(SUM("totalPlaytime"), 0) AS "totalPlaytime",
+                           COALESCE(SUM("avgPlaytime"), 0) AS "avgPlaytime",
+                           COALESCE(SUM("totalSorties"), 0) AS "totalSorties", 
+                           COALESCE(SUM("totalKills"), 0) AS "totalKills",
+                           COALESCE(SUM("totalDeaths"), 0) AS "totalDeaths", 
+                           COALESCE(SUM("totalPvPKills"), 0) AS "totalPvPKills",
+                           COALESCE(SUM("totalPvPDeaths"), 0) AS "totalPvPDeaths" 
                     FROM mv_serverstats
                     {where_clause}
                 """, params)
@@ -1272,6 +1274,7 @@ class RestAPI(Plugin):
                            SUM("totalPvPKills") AS total_pvp_kills,
                            SUM("totalPvPDeaths") AS total_pvp_deaths
                     FROM mv_serverstats m
+                    WHERE 1 = 1
                     {where_clause}
                 """, params)
                 mv_row = await cursor.fetchone()
@@ -1383,10 +1386,16 @@ class RestAPI(Plugin):
         for server in filter_servers([s for s in self.bot.servers.values() if not server_name or s.name == server_name]):
             data: dict[str, Any] = {
                 'name': server.name,
+                'description': server.settings.get('description', ''),
                 'status': server.status.value,
                 'address': f"{server.node.public_ip}:{server.settings.get('port', 10308)}",
                 'password': server.settings.get('password', ''),
                 'restart_time': server.restart_time,
+                'max_players': server.settings.get('maxPlayers', 16),
+                'require_pure_clients': server.settings.get('require_pure_clients', False),
+                'require_pure_models': server.settings.get('require_pure_models', False),
+                'require_pure_scripts': server.settings.get('require_pure_scripts', False),
+                'require_pure_textures': server.settings.get('require_pure_textures', False)
             }
             if server.current_mission:
                 mission = data['mission'] = {}
@@ -1425,7 +1434,7 @@ class RestAPI(Plugin):
                 "unit_type": player.unit_type if player.unit_type != '?' else "",
                 "callsign": player.unit_callsign,
                 "radios": await self.get_srs_channels(server.name, player.name)
-            }) for player in server.players.values()]
+            }) for player in server.get_active_players()]
 
             # add weather information
             config = self.get_endpoint_config('servers')
@@ -2214,10 +2223,16 @@ class RestAPI(Plugin):
 
     @tasks.loop(hours=1)
     async def refresh_views(self):
-        async with self.apool.connection() as conn:
-            await conn.execute("""
-                REFRESH MATERIALIZED VIEW CONCURRENTLY mv_serverstats;
-            """)
+        try:
+            async with self.apool.connection() as conn:
+                await conn.execute("""
+                    REFRESH MATERIALIZED VIEW CONCURRENTLY mv_serverstats;
+                """)
+        except psycopg.errors.FeatureNotSupported:
+            async with self.apool.connection() as conn:
+                await conn.execute("""
+                    REFRESH MATERIALIZED VIEW mv_serverstats;
+                """)
 
     @refresh_views.before_loop
     async def before_refresh_views(self):

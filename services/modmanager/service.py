@@ -6,15 +6,13 @@ import zipfile
 
 from aiohttp import ClientSession, ClientResponseError
 from contextlib import suppress
-
-from psycopg import sql
-
 from core import ServiceRegistry, Service, Server, Status, ServiceInstallationError, utils, proxy, Node
 from enum import Enum
 from filecmp import cmp
 from functools import total_ordering
 from packaging import version
 from pathlib import Path, PurePosixPath
+from psycopg import sql
 from urllib.parse import urlparse
 
 from ..servicebus import ServiceBus
@@ -46,13 +44,14 @@ class ModManagerService(Service):
 
     def __init__(self, node):
         super().__init__(node=node, name="ModManager")
-        if not os.path.exists(os.path.join(self.node.config_dir, 'services', 'modmanager.yaml')):
-            raise ServiceInstallationError(service='ModManager', reason="config/services/modmanager.yaml missing!")
-        self.bus = ServiceRegistry.get(ServiceBus)
+        if not self.locals:
+            raise ServiceInstallationError(service=self.name, reason="config/services/modmanager.yaml missing!")
+        self.bus = None
         self.temp_packages = []
 
     async def start(self):
         await super().start()
+        self.bus = ServiceRegistry.get(ServiceBus)
         config = self.get_config()
         for folder in Folder:
             os.makedirs(os.path.expandvars(config[folder.value]), exist_ok=True)
@@ -86,47 +85,52 @@ class ModManagerService(Service):
             if 'packages' not in config:
                 continue
 
-            for package in config.get('packages', []):
-                folder = Folder(package['source'])
-                if package.get('version', 'latest') == 'latest':
-                    _version = await self.get_latest_version(package)
-                else:
-                    _version = package['version']
-                # check for valid versions
-                if _version is None:
-                    self.log.warning(f"{package['name']} without version in {folder.name}, skipped!")
-                    continue
+            try:
+                for package in config.get('packages', []):
+                    folder = Folder(package['source'])
+                    if package.get('version', 'latest') == 'latest':
+                        _version = await self.get_latest_version(package)
+                    else:
+                        _version = package['version']
+                    # check for valid versions
+                    if _version is None:
+                        self.log.warning(f"{package['name']} without version in {folder.name}, skipped!")
+                        continue
 
-                installed = await self.get_installed_package(server, folder, package['name'])
-                if (not installed or installed != _version) and \
-                        server.status != Status.SHUTDOWN:
-                    self.log.warning(
-                        f"  - Server {server.name} needs to be shutdown to auto-install package {package['name']}")
-                    break
-                maintenance = server.maintenance
-                server.maintenance = True
-                try:
-                    if not installed:
-                        if not await self.install_package(server, folder, package['name'], _version,
-                                                          package.get('repo')):
-                            self.log.warning(f"- Package {package['name']}_v{_version} not found!")
-                    elif installed != _version:
-                        if version.parse(installed) > version.parse(_version):
-                            self.log.debug(f"- Installed package {package['name']}_v{installed} is newer than the "
-                                           f"configured version. Skipping.")
-                            continue
-                        if not await self.uninstall_package(server, folder, package['name'], installed):
-                            self.log.warning(f"- Package {package['name']}_v{installed} could not be uninstalled on "
-                                             f"server {server.name}!")
-                        elif not await self.install_package(server, folder, package['name'], _version,
-                                                            package.get('repo')):
-                            self.log.warning(f"- Package {package['name']}_v{_version} could not be installed on "
-                                             f"server {server.name}!")
-                        else:
-                            self.log.info(f"- Package {package['name']}_v{installed} updated to v{_version}.")
-                finally:
-                    if not maintenance:
-                        server.maintenance = False
+                    installed = await self.get_installed_package(server, folder, package['name'])
+                    if (not installed or installed != _version) and \
+                            server.status != Status.SHUTDOWN:
+                        self.log.warning(
+                            f"  - Server {server.name} needs to be shutdown to auto-install package {package['name']}")
+                        break
+                    maintenance = server.maintenance
+                    server.maintenance = True
+                    try:
+                        if not installed:
+                            if not await self.install_package(server, folder, package['name'], _version,
+                                                              package.get('repo')):
+                                self.log.warning(f"- Package {package['name']}_v{_version} not found!")
+                        elif installed != _version:
+                            if version.parse(installed) > version.parse(_version):
+                                self.log.debug(f"- Installed package {package['name']}_v{installed} is newer than the "
+                                               f"configured version. Skipping.")
+                                continue
+                            if not await self.uninstall_package(server, folder, package['name'], installed):
+                                self.log.warning(f"- Package {package['name']}_v{installed} could not be uninstalled on "
+                                                 f"server {server.name}!")
+                            elif not await self.install_package(server, folder, package['name'], _version,
+                                                                package.get('repo')):
+                                self.log.warning(f"- Package {package['name']}_v{_version} could not be installed on "
+                                                 f"server {server.name}!")
+                            else:
+                                self.log.info(f"- Package {package['name']}_v{installed} updated to v{_version}.")
+                    except Exception as ex:
+                        self.log.error(f"Error while installing package {package['name']}_v{_version}: {ex}")
+                    finally:
+                        if not maintenance:
+                            server.maintenance = False
+            except Exception as ex:
+                self.log.error(f"Error while installing packages for server {server.name}: {ex}")
 
     @staticmethod
     def parse_filename(filename: str) -> tuple[str | None, str | None]:

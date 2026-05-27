@@ -264,7 +264,6 @@ class DCSServerBot(commands.Bot):
                                    (self.guilds[0].name, self.guilds[0].id))
 
         try:
-            await self.wait_until_ready()
             if not self.guilds:
                 self.log.error("You need to invite your bot to a Discord server!")
                 raise FatalException()
@@ -325,13 +324,18 @@ class DCSServerBot(commands.Bot):
                         cmd.mention = f"</{cmd.name}:{app_ids[cmd.name]}>"
 
                 self.synced = True
+
+                # run on_ready() in your plugins
+                for cog in self.cogs.values():
+                    asyncio.create_task(cog.on_ready())
+
                 self.log.info('  => Discord Commands registered.')
                 self.log.info('- Discord Bot started, accepting commands.')
                 asyncio.create_task(self.audit(message="Discord Bot started."))
             else:
                 self.log.warning('- Discord connection re-established.')
         except (discord.HTTPException, RuntimeError) as ex:
-            self.log.warning(f"Discord connection error: {repr(ex)}")
+            raise FatalException(f"Discord connection error: {repr(ex)}")
 
     async def on_error(self, event_method: str, /, *args: Any, **kwargs: Any) -> None:
         ex = sys.exc_info()[1]
@@ -360,11 +364,9 @@ class DCSServerBot(commands.Bot):
     async def on_app_command_error(self, interaction: discord.Interaction, error: discord.app_commands.AppCommandError):
         if isinstance(error, discord.app_commands.CommandNotFound):
             pass
-        # noinspection PyUnresolvedReferences
         if interaction.response.is_done():
             send = interaction.followup.send
         else:
-            # noinspection PyUnresolvedReferences
             send = interaction.response.send_message
         try:
             if isinstance(error, discord.app_commands.NoPrivateMessage):

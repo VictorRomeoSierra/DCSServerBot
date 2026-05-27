@@ -200,10 +200,8 @@ def any_of(value, rule_obj, path):
         try:
             _validate_schema(_load_schema(include_name, path), value, path)
             break
-        except SchemaError as ex:
+        except (SchemaError, CoreError) as ex:
             errors.append(ex)
-        except CoreError:
-            pass
     else:
         msg = []
         new_path = set()
