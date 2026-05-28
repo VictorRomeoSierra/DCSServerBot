@@ -76,7 +76,7 @@ SHAME_DEFAULT_DAYLIGHT = (6, 19)
 # Direct Tenor media URL so we can embed via embeds[].image.url without the
 # raw URL also showing as text content (which is what happens when you drop
 # the page URL in content -- Discord renders the embed AND leaves the URL).
-SHAME_GIF = "https://media1.tenor.com/m/5t7dwIkeSioAAAAd/shame-bell.gif"
+SHAME_GIF = "https://media.tenor.com/5t7dwIkeSioAAAAC/shame-bell.gif"
 SHAME_LINE = "Your request shall be granted, at a cost to your dignity."
 
 
