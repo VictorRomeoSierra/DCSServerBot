@@ -7,6 +7,20 @@ mapping:
     mapping:
       prefix: {type: str, nullable: false}
       api_key: {type: text, nullable: false}
+      alerting:
+        type: map
+        nullable: false
+        allowempty: true
+        mapping:
+          pushover_app_token: {type: str, nullable: false}
+          pushover_user_key: {type: str, nullable: false}
+          voice_channel_id: {type: int, nullable: false}
+          relevant_servers:
+            type: seq
+            nullable: false
+            sequence:
+              - {type: str, nullable: false}
+          enrichment_timeout_secs: {type: number, nullable: false}
       endpoints:
         type: map
         nullable: false

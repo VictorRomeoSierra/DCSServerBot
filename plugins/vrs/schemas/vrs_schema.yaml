@@ -13,6 +13,25 @@ schema;default_schema:
   mapping:
     webhooks:
       include: 'webhooks_schema'
+    oncall_nudge:
+      type: map
+      nullable: false
+      allowempty: true
+      mapping:
+        enabled: {type: bool, nullable: false}
+        github_pat: {type: str, nullable: false}
+        github_owner: {type: str, nullable: false}
+        github_repo: {type: str, nullable: false}
+        base_branch: {type: str, nullable: false}
+        head_branch: {type: str, nullable: false}
+        cooldown_seconds: {type: int, nullable: false}
+        oncall_role_id: {type: int, nullable: false}
+        target_server: {type: str, nullable: false}
+        bot_player_names:
+          type: seq
+          nullable: false
+          sequence:
+            - {type: str, nullable: false}
 
 schema;element_schema:
   type: map
