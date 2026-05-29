@@ -2117,6 +2117,30 @@ class RestAPI(Plugin):
         if len(final_message) > 1024:
             final_message = final_message[:1020] + "..."
 
+        # Restart-aware suppression: a server restart drops every player at
+        # once, which trips Signal 2 (player-disconnect). If any Prod instance
+        # restarted within the window, skip the page -- the Seq event still
+        # records it. Fail-open: any error here falls through to normal
+        # delivery (better to page than to silently drop a real storm).
+        if payload.signal_key == 'player-disconnect':
+            try:
+                from plugins.vrs import restart_state
+                prod_instances = [
+                    s.instance.name for s in self.bot.servers.values()
+                    if s.node == self.node
+                ]
+                if any(restart_state.recent_restart(n) for n in prod_instances):
+                    self.log.info("/alert/enrich suppressed player-disconnect: "
+                                  "server restart within window")
+                    return AlertEnrichResponse.model_validate({
+                        "delivered": False,
+                        "enriched": bool(extras),
+                        "pushover_status": None,
+                        "notes": "suppressed: server restart in progress",
+                    })
+            except Exception as e:
+                self.log.warning(f"/alert/enrich restart-suppression check failed: {e!r}")
+
         pushover_status: int | None = None
         delivered = False
         try:

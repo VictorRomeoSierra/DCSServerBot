@@ -6,8 +6,10 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from core import EventListener, event, Server, Player, Coalition
+from core import EventListener, event, Server, Player, Coalition, Status
 from typing import TYPE_CHECKING
+
+from . import restart_state
 
 if TYPE_CHECKING:
     from .commands import Vrs
@@ -221,6 +223,13 @@ class VrsEventListener(EventListener["Vrs"]):
     async def onVotePassed(self, server: Server, data: dict):
         if data.get('what') != 'restart' or data.get('winner') != 'Restart':
             return
+        # Record the impending restart so the disconnect-storm alert and the
+        # merge nudge don't treat the mass player-drop as an incident. Logged
+        # for an independent paper trail.
+        restart_state.mark_restart(server.instance.name)
+        self.log.info(
+            f"[VOTE-RESTART] {server.instance.name} restart vote passed "
+            f"(votes={data.get('votes')} initiator_ucid={data.get('initiator_ucid')})")
         if not self._is_dark(server):
             return
         initiator = None
@@ -228,6 +237,13 @@ class VrsEventListener(EventListener["Vrs"]):
         if ucid:
             initiator = server.get_player(ucid=ucid)
         await self._shame_for_night_restart(server, initiator)
+
+    @event(name="onSimulationStop")
+    async def onSimulationStop(self, server: Server, data: dict):
+        # The sim stopping (restart or shutdown) drops every player at once.
+        # Record it so the disconnect-storm alert and the merge nudge don't
+        # read that mass drop as an incident / a clean deploy window.
+        restart_state.mark_restart(server.instance.name)
 
     def _is_dark(self, server: Server) -> bool:
         mission = server.current_mission
@@ -577,6 +593,14 @@ class VrsEventListener(EventListener["Vrs"]):
             return
         bot_names = set(cfg.get('bot_player_names') or [])
         if self._count_human_players(server, bot_names, exclude_ucid=leaving_ucid) > 0:
+            return
+
+        # A restart/shutdown empties the server too, but that is not a clean
+        # "no user impact, merge now" window -- players are about to return.
+        # Suppress when the sim isn't actively running, or a restart was just
+        # recorded for this instance.
+        if server.status not in (Status.RUNNING, Status.PAUSED) or \
+                restart_state.recent_restart(server.instance.name):
             return
 
         pat = cfg.get('github_pat') or ""
