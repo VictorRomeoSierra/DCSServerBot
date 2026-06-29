@@ -39,7 +39,7 @@ class Cloud(Extension):
 
     @property
     def session(self):
-        if not self._session:
+        if not self._session or self._session.closed:
             headers = {
                 "Content-type": "application/json"
             }
@@ -134,5 +134,11 @@ class Cloud(Extension):
 
     @override
     def shutdown(self, *, quiet: bool = False) -> bool:
-        self.loop.create_task(self.cloud_unregister())
+        async def _shutdown():
+            await self.cloud_unregister()
+            if self._session and not self._session.closed:
+                await self._session.close()
+                self._session = None
+
+        self.loop.create_task(_shutdown())
         return super().shutdown(quiet=True)

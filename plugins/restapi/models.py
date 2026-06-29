@@ -6,6 +6,8 @@ from pydantic import BaseModel, Field
 
 
 class UserEntry(BaseModel):
+    ucid: str = Field(..., description="DCS account ID")
+    discord_id: int = Field(..., description="Discord user ID")
     nick: str = Field(..., description="Player nickname")
     date: datetime = Field(..., description="Last seen timestamp")
     current_server: Optional[str] = Field(None, description="Current server")
@@ -277,6 +279,7 @@ class ModuleStats(BaseModel):
     kills: int | None = Field(None, description="Number of kills with this module")
     deaths: int | None = Field(None, description="Number of deaths with this module")
     kdr: Decimal | None = Field(None, description="Kill/Death ratio with this module")
+    playtime: int | None = Field(None, description="Total playtime with this module in seconds")
 
     model_config = {
         "json_encoders": {
@@ -287,7 +290,8 @@ class ModuleStats(BaseModel):
                 "module": "F/A-18C",
                 "kills": 30,
                 "deaths": 10,
-                "kdr": 3.0
+                "kdr": 3.0,
+                "playtime": 3600
             }
         }
     }
@@ -479,6 +483,7 @@ class CampaignCredits(BaseModel):
 
 
 class TrapEntry(BaseModel):
+    id: int = Field(..., description="Trap ID")
     unit_type: str = Field(..., description="Type of aircraft")
     grade: str = Field(..., description="Landing grade")
     comment: str = Field(..., description="Landing comment")
@@ -508,6 +513,53 @@ class TrapEntry(BaseModel):
         }
     }
 
+
+class GreenieboardEntry(BaseModel):
+    nick: str = Field(..., description="Player name")
+    traps: list[TrapEntry] = Field(..., description="List of traps for this player")
+
+
+class GreenieboardResponse(BaseModel):
+    players: list[GreenieboardEntry] = Field(..., description="All players and their traps")
+
+
+class EventEntry(BaseModel):
+    mission_id: int = Field(..., description="Mission ID")
+    event: str = Field(..., description="Event type")
+    init_id: str | None = Field(None, description="Initiator UCID")
+    init_side: int | None = Field(None, description="Initiator side")
+    init_type: str | None = Field(None, description="Initiator type")
+    init_cat: str | None = Field(None, description="Initiator category")
+    target_id: str | None = Field(None, description="Target UCID")
+    target_side: int | None = Field(None, description="Target side")
+    target_type: str | None = Field(None, description="Target type")
+    target_cat: str | None = Field(None, description="Target category")
+    weapon: str | None = Field(None, description="Weapon used in the event")
+    place: str | None = Field(None, description="Event location")
+    comment: str | None = Field(None, description="Event comment")
+    time: datetime = Field(..., description="Event time")
+
+    model_config = {
+        "json_encoders": {
+            datetime: lambda v: v.isoformat()
+        },
+        "json_schema_extra": {
+            "example": {
+                "mission_id": 1,
+                "event": "S_EVENT_KILL",
+                "init_id": "aabbccddeeffgghhiiffkk1234567890",
+                "init_type": "FA-18C_hornet",
+                "init_cat": "Airplanes",
+                "target_id": "aabbccddeeffgghhiiffkk1234567890",
+                "target_type": "FA-18C_hornet",
+                "target_cat": "Airplanes",
+                "weapon": "Mk-12",
+                "place": "Over the Pacific",
+                "comment": "First kill of the day!",
+                "time": "2023-10-01T12:00:00",
+            }
+        }
+    }
 
 class SquadronCampaignCredit(BaseModel):
     campaign: str | None = Field(None, description="Campaign name")

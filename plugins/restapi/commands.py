@@ -11,24 +11,60 @@ from core import (Plugin, DEFAULT_TAG, Side, DataObjectFactory, utils, Status, S
                   Server, async_cache)
 from datetime import datetime, timedelta, timezone
 from discord.ext import tasks
-from fastapi import FastAPI, APIRouter, Form, Query, HTTPException, Depends, File, UploadFile
+from fastapi import FastAPI, APIRouter, Form, Query, HTTPException, Depends, File, UploadFile, Response
 from fastapi.security import APIKeyHeader
 from plugins.creditsystem.squadron import Squadron
 from plugins.userstats.filter import StatisticsFilter, PeriodFilter
+from psycopg.errors import UndefinedTable
 from psycopg.rows import dict_row
 from services.bot import DCSServerBot
 from services.servicebus import ServiceBus
 from services.webservice import WebService
 from typing import Any, Literal, cast
 
-from .models import (TopKill, ServerInfo, SquadronInfo, Trueskill, Highscore, UserEntry, WeaponPK, PlayerStats,
-                     CampaignCredits, TrapEntry, SquadronCampaignCredit, LinkMeResponse, ServerStats, PlayerInfo,
-                     PlayerSquadron, LeaderBoard, ModuleStats, PlayerEntry, WeatherInfo, ServerAttendanceStats,
-                     AirbasesResponse, AirbaseInfoResponse, AirbaseWarehouseResponse, AirbaseSetWarehouseItemResponse,
-                     AirbaseCaptureResponse, ConvertCoordinates, MissionRestartResponse, MissionLoadResponse,
-                     MissionPauseResponse, MissionUnpauseResponse, MissionsResponse, ServerStartResponse,
-                     ServerStopResponse, ServerRestartResponse, MissionUploadResponse, GroupWaypointsResponse,
-                     AlertEnrichRequest, AlertEnrichResponse)
+from .models import (
+    TopKill,
+    ServerInfo,
+    SquadronInfo,
+    Trueskill,
+    Highscore,
+    UserEntry,
+    WeaponPK,
+    PlayerStats,
+    CampaignCredits,
+    TrapEntry,
+    GreenieboardEntry,
+    GreenieboardResponse,
+    SquadronCampaignCredit,
+    LinkMeResponse,
+    ServerStats,
+    PlayerInfo,
+    PlayerSquadron,
+    LeaderBoard,
+    ModuleStats,
+    PlayerEntry,
+    WeatherInfo,
+    ServerAttendanceStats,
+    AirbasesResponse,
+    AirbaseInfoResponse,
+    AirbaseWarehouseResponse,
+    AirbaseSetWarehouseItemResponse,
+    AirbaseCaptureResponse,
+    ConvertCoordinates,
+    MissionRestartResponse,
+    MissionLoadResponse,
+    MissionPauseResponse,
+    MissionUnpauseResponse,
+    MissionsResponse,
+    ServerStartResponse,
+    ServerStopResponse,
+    ServerRestartResponse,
+    MissionUploadResponse,
+    GroupWaypointsResponse,
+    EventEntry,
+    AlertEnrichRequest,
+    AlertEnrichResponse
+)
 from ..srs.commands import SRS
 
 app: FastAPI | None = None
@@ -60,9 +96,9 @@ class RestAPI(Plugin):
     async def cog_unload(self) -> None:
         await utils.safe_cancel(self.refresh_views)
         if self.app and self.router:
-            # Remove our routes from the main app to prevent duplicates on reload
             for route in self.router.routes:
-                self.app.routes.remove(route)
+                if route in self.app.routes:
+                    self.app.routes.remove(route)
         await super().cog_unload()
 
     async def init_webservice(self):
@@ -306,6 +342,30 @@ class RestAPI(Plugin):
             response_model = list[TrapEntry],
             description = "Get traps for players",
             summary = "Carrier Traps",
+            tags = ["Statistics"]
+        )
+        self.router.add_api_route(
+            "/traps/img", self.traps_image,
+            methods = ["GET"],
+            response_model = bytes,
+            description = "Get trap image for a player",
+            summary = "Carrier Trap Image",
+            tags = ["Statistics"]
+        )
+        self.router.add_api_route(
+            "/greenieboard", self.greenieboard,
+            methods = ["POST"],
+            response_model = GreenieboardResponse,
+            description = "Get a greenieboard",
+            summary = "GreenieBoard",
+            tags = ["Statistics"]
+        )
+        self.router.add_api_route(
+            "/events", self.events,
+            methods = ["GET"],
+            response_model = list[EventEntry],
+            description = "Get mission events for players",
+            summary = "Mission Events",
             tags = ["Statistics"]
         )
 
@@ -1648,19 +1708,39 @@ class RestAPI(Plugin):
 
         return Highscore.model_validate(highscore)
 
-    async def getuser(self, nick: str = Form(...)):
-        self.log.debug(f'Calling /getuser with nick="{nick}"')
+    async def getuser(self, nick: str = Form(None), discord_id: str = Form(None)):
+        self.log.debug(f'Calling /getuser with nick="{nick}", discord_id="{discord_id}"')
+        if not nick and not discord_id:
+            raise HTTPException(status_code=400, detail="You must provide either nick or discord_id")
+
         async with self.apool.connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cursor:
-                await cursor.execute("""
-                    SELECT 
-                        name AS "nick", 
-                        DATE_TRUNC('second', last_seen) AS "date" 
-                    FROM players 
-                    WHERE name ILIKE %s 
-                    ORDER BY 2 DESC
-                """, ('%' + nick + '%',))
+                if discord_id:
+                    query = """
+                            SELECT ucid,
+                                   discord_id,
+                                   name                            AS "nick",
+                                   DATE_TRUNC('second', last_seen) AS "date"
+                            FROM players
+                            WHERE discord_id = %s
+                            ORDER BY 4 DESC
+                            """
+                    params = (discord_id,)
+                else:
+                    query = """
+                            SELECT ucid,
+                                   discord_id,
+                                   name                            AS "nick",
+                                   DATE_TRUNC('second', last_seen) AS "date"
+                            FROM players
+                            WHERE name ILIKE %s
+                            ORDER BY 4 DESC
+                            """
+                    params = ('%' + nick + '%',)
+                await cursor.execute(query, params)
                 return [UserEntry.model_validate({
+                    "ucid": result['ucid'],
+                    "discord_id": result['discord_id'],
                     "nick": result["nick"],
                     "date": result["date"],
                     "current_server": await self.current_server(result["nick"], result["date"])
@@ -1830,11 +1910,12 @@ class RestAPI(Plugin):
                    SUM(s.kills) AS "kills",
                    SUM(s.deaths_planes + s.deaths_helicopters + s.deaths_ships + s.deaths_sams + s.deaths_ground) AS "deaths",
                    CASE WHEN SUM(s.deaths_planes + s.deaths_helicopters + s.deaths_ships + s.deaths_sams + s.deaths_ground) = 0 
-                        THEN SUM(s.kills) ELSE SUM(s.kills)::DECIMAL / SUM((s.deaths_planes + s.deaths_helicopters + s.deaths_ships + s.deaths_sams + s.deaths_ground)::DECIMAL) END AS "kdr" 
+                        THEN SUM(s.kills) ELSE SUM(s.kills)::DECIMAL / SUM((s.deaths_planes + s.deaths_helicopters + s.deaths_ships + s.deaths_sams + s.deaths_ground)::DECIMAL) END AS "kdr",
+                   SUM(s.playtime) AS "playtime"     
             FROM mv_statistics s
             WHERE s.player_ucid = %(ucid)s 
             {where}
-            GROUP BY 1 HAVING SUM(s.kills) > 0 
+            GROUP BY 1 
             ORDER BY 2 DESC
         """
         async with self.apool.connection() as conn:
@@ -1908,7 +1989,7 @@ class RestAPI(Plugin):
                     )
                 return CampaignCredits.model_validate(row)
 
-    async def traps(self, nick: str = Form(None), date: str | None = Form(None),
+    async def traps(self, nick: str = Form(...), date: str | None = Form(None),
                     limit: int | None = Form(10), offset: int | None = Form(0),
                     server_name: str | None = Form(None)):
         self.log.debug(f'Calling /traps with nick="{nick}", date="{date}", server_name="{server_name}"')
@@ -1916,36 +1997,150 @@ class RestAPI(Plugin):
         # Use centralized server resolution
         resolved_server_name, _ = self.get_resolved_server(server_name)
         
-        if resolved_server_name:
-            join = "JOIN missions m ON t.mission_id = m.id"
-            where = "WHERE t.player_ucid = %(ucid)s AND m.server_name = %(server_name)s"
+        try:
+            async with self.apool.connection() as conn:
+                async with conn.cursor(row_factory=dict_row) as cursor:
+                    ucid = await self.get_ucid(nick, date)
+                    if resolved_server_name:
+                        join = "JOIN missions m ON t.mission_id = m.id"
+                        where = "WHERE t.player_ucid = %(ucid)s AND m.server_name = %(server_name)s"
+                    else:
+                        join = ""
+                        where = "WHERE t.player_ucid = %(ucid)s"
+                    await cursor.execute(f"""
+                        SELECT t.id, t.unit_type, t.grade, t.comment, t.place, t.trapcase, t.wire, t.night, t.points, t.time
+                        FROM traps t
+                        {join}
+                        {where}
+                        ORDER BY time DESC 
+                        LIMIT {limit} OFFSET {offset}
+                    """, {"ucid": ucid, "server_name": resolved_server_name})
+                    return [TrapEntry.model_validate(result) for result in await cursor.fetchall()]
+        except UndefinedTable:
+            raise HTTPException(status_code=500, detail="Greenieboard is not active on this server")
+
+    async def traps_image(self, trap_id: int = Query(...)):
+        self.log.debug(f'Calling /traps_image with trap_id="{trap_id}"')
+        async with self.apool.connection() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute("SELECT trapsheet FROM traps WHERE id = %s", (trap_id, ))
+                row: dict | None = await cursor.fetchone()
+                if not row or not row[0]:
+                    raise HTTPException(status_code=404, detail="Trap image not found")
+
+                return Response(content=row[0], media_type="image/png")
+
+    async def greenieboard(
+            self,
+            date: str | None = Form(None),
+            server_name: str | None = Form(None)
+    ):
+        self.log.debug(f'Calling /greenieboard with date="{date}", server_name="{server_name}"')
+
+        # Use centralized server resolution
+        resolved_server_name, _ = self.get_resolved_server(server_name)
+
+        try:
+            async with self.apool.connection() as conn:
+                async with conn.cursor(row_factory=dict_row) as cursor:
+                    if resolved_server_name:
+                        extra_join = "JOIN missions m ON t.mission_id = m.id"
+                        where = "WHERE m.server_name = %(server_name)s"
+                    else:
+                        extra_join = ""
+                        where = ""
+
+                    await cursor.execute(f"""
+                        SELECT p.name AS nick, t.id, t.unit_type, t.grade, t.comment, t.place, 
+                               t.trapcase, t.wire, t.night, t.points, t.time
+                        FROM traps t
+                        JOIN players p ON t.player_ucid = p.ucid
+                        {extra_join}
+                        {where}
+                        ORDER BY p.name, t.time DESC
+                    """, {"server_name": resolved_server_name})
+                    rows = await cursor.fetchall()
+
+            # Group traps by player name
+            traps_by_nick: dict[str, list[TrapEntry]] = {}
+            for row in rows:
+                player_nick = row['nick']
+                if player_nick not in traps_by_nick:
+                    traps_by_nick[player_nick] = []
+                traps_by_nick[player_nick].append(TrapEntry.model_validate({
+                    "id": row['id'],
+                    "unit_type": row['unit_type'],
+                    "grade": row['grade'],
+                    "comment": row['comment'],
+                    "place": row['place'],
+                    "trapcase": row['trapcase'],
+                    "wire": row['wire'],
+                    "night": row['night'],
+                    "points": row['points'],
+                    "time": row['time']
+                }))
+
+            # Return as GreenieboardResponse with players grouped by nick
+            return GreenieboardResponse(
+                players=[
+                    GreenieboardEntry(
+                        nick=player_nick,
+                        traps=player_traps
+                    )
+                    for player_nick, player_traps in traps_by_nick.items()
+                ]
+            )
+        except UndefinedTable:
+            raise HTTPException(status_code=500, detail="Greenieboard is not active on this server")
+
+    async def events(self,
+                     ucid: str = Query(...),
+                     start_time: datetime = Query(...),
+                     end_time: datetime = Query(...),
+                     event: str | None = Query(default=None),
+                     init_type: str | None = Query(default=None),
+                     offset: int | None = Query(default=0),
+                     limit: int | None = Query(default=10)):
+        where = ""
+        if event:
+            where += f"AND event = '{event}' "
+        if init_type:
+            where += f"AND init_type = '{init_type}' "
+        if limit:
+            sql_part = f"LIMIT {limit} OFFSET {offset}"
         else:
-            join = ""
-            where = "WHERE t.player_ucid = %(ucid)s"
+            sql_part = ""
         async with self.apool.connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cursor:
-                ucid = await self.get_ucid(nick, date)
                 await cursor.execute(f"""
-                    SELECT t.unit_type, t.grade, t.comment, t.place, t.trapcase, t.wire, t.night, t.points, t.time
-                    FROM traps t
-                    {join}
-                    {where}
-                    ORDER BY time DESC 
-                    LIMIT {limit} OFFSET {offset}
-                """, {"ucid": ucid, "server_name": resolved_server_name})
-                return [TrapEntry.model_validate(result) for result in await cursor.fetchall()]
+                    SELECT mission_id, event, 
+                           init_id, init_side, init_type, init_cat, 
+                           target_id, target_side, target_type, target_cat,
+                           weapon, place, comment, time
+                    FROM missionstats 
+                    WHERE (init_id = %(ucid)s or target_id = %(ucid)s)
+                      AND time between %(start_time)s AND %(end_time)s
+                      {where}
+                      {sql_part}
+                """, {"ucid": ucid, "start_time": start_time, "end_time": end_time})
+                return [EventEntry.model_validate(result) for result in await cursor.fetchall()]
 
     async def squadron_members(self, name: str = Form(...)):
         self.log.debug(f'Calling /squadron_members with name="{name}"')
         async with self.apool.connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cursor:
                 await cursor.execute("""
-                    SELECT p.name AS "nick", DATE_TRUNC('second', p.last_seen) AS "date"  
+                    SELECT p.ucid, 
+                           p.discord_id, 
+                           p.name AS "nick", 
+                           DATE_TRUNC('second', p.last_seen) AS "date"  
                     FROM players p JOIN squadron_members sm ON sm.player_ucid = p.ucid
                                    JOIN squadrons s ON sm.squadron_id = s.id
                     WHERE s.name = %s
                 """, (name, ))
                 return [UserEntry.model_validate({
+                    "ucid": result['ucid'],
+                    "discord_id": result['discord_id'],
                     "nick": result["nick"],
                     "date": result["date"],
                     "current_server": await self.current_server(result["nick"], result["date"])

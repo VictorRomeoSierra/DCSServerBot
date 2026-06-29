@@ -1,4 +1,5 @@
 import asyncio
+import luadata
 import os
 import psycopg
 import re
@@ -32,6 +33,7 @@ class Restore:
         self.node = node
         self.config_dir = config_dir
         self.quiet = quiet
+        self.old_node = None
 
     @staticmethod
     def unzip(file: Path, target: Path) -> None:
@@ -41,8 +43,11 @@ class Restore:
     async def restore_bot(self, console: Console, backup_file: Path) -> bool:
         # back up the old config
         if os.path.exists(self.config_dir) and len(os.listdir(self.config_dir)) > 0:
-            backup_name = f"config.{datetime.now().strftime('%Y-%m-%d')}"
-            console.print(_("[yellow]A configuration directory exists. Renaming to {} ...").format(backup_name))
+            backup_name = f"config.{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            while os.path.exists(backup_name):
+                await asyncio.sleep(1)
+                backup_name = f"config.{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            console.print(_("[yellow]An old configuration directory exists. Renaming to {} ...").format(backup_name))
             if not is_junction(self.config_dir):
                 os.rename(self.config_dir, backup_name)
             else:
@@ -64,11 +69,34 @@ class Restore:
         nodes = yaml.load(nodes_yaml.read_text(encoding='utf-8'))
         if self.node not in nodes:
             console.print(_("[yellow]Node name not found in nodes.yaml[/]"))
-            old_node = Prompt.ask(_("Enter the node name you want to replace:"), choices=[_("- Abort -") + nodes.keys()])
-            if old_node == _("- Abort -"):
+            choices = [_("- Abort -")]
+            choices.extend(nodes.keys())
+            self.old_node = Prompt.ask(_("Enter the node name you want to replace:"), choices=choices)
+            if self.old_node == _("- Abort -"):
+                self.old_node = None
                 return False
-            Install.rename_node(self.config_dir, old_node, self.node)
-            console.print(_("[green]Node {} renamed to {}.[/]").format(old_node, self.node))
+            Install.rename_node(self.config_dir, self.old_node, self.node, database_only=False)
+            console.print(_("[green]Node {} renamed to {}.[/]").format(self.old_node, self.node))
+            # reload
+            nodes = yaml.load(nodes_yaml.read_text(encoding='utf-8'))
+            # ensure user profile changes will not hit in
+            for instance_name, instance in nodes.get(self.node, {}).get('instances', {}).items():
+                home = os.path.join("%USERPROFILE%", instance_name)
+                rel_home = os.path.join(SAVED_GAMES, instance_name)
+                # check if Saved Games was moved
+                if Path(os.path.expandvars(home)).resolve() != Path(os.path.expandvars(rel_home)).resolve():
+                    home = os.path.join(SAVED_GAMES, instance_name)
+                # now check if anything has changed and replace the home directory if that is the case
+                if Path(os.path.expandvars(instance.get('home', home))).resolve() != Path(os.path.expandvars(home)).resolve():
+                    instance['home'] = home
+
+                missions_dir = instance.get('missions_dir')
+                if missions_dir and not Path(os.path.expandvars(missions_dir)).exists():
+                    missions_dir = Prompt.ask(_("Instance {}: The missions_dir {} can not be found. "
+                                                "Please enter the correct path:").format(instance_name, missions_dir))
+                    instance['missions_dir'] = missions_dir
+            with nodes_yaml.open('w', encoding='utf-8') as f:
+                yaml.dump(nodes, f)
         return True
 
     async def prepare_restore_database(self, console: Console) -> str | None:
@@ -94,7 +122,7 @@ class Restore:
             console.print(_("[red]No database configuration found, aborting."))
             return None
 
-        db_url: ParseResult = urlparse(l_url)
+        db_url = urlparse(l_url)
         if db_url.password == 'SECRET':
             try:
                 db_pwd = get_password("database", config_dir=self.config_dir)
@@ -147,11 +175,12 @@ class Restore:
             try:
                 async with await AsyncConnection.connect(conninfo=conninfo, autocommit=True) as conn:
                     # terminate any existing connection to the database
-                    await conn.execute("""
+                    query = sql.SQL("""
                             SELECT pg_terminate_backend(pid) 
                             FROM pg_stat_activity 
                             WHERE datname='{}' AND pid != pg_backend_pid();
-                        """.format(db_url.path[1:]))
+                    """).format(sql.Literal(db_url.path[1:]))
+                    await conn.execute(query)
                     await conn.execute(sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(db_url.path[1:])))
                     try:
                         await conn.execute(sql.SQL("DROP USER IF EXISTS {}").format(sql.Identifier(db_url.username)))
@@ -239,6 +268,16 @@ class Restore:
         if rc > 1:
             console.print(_("[red]Failed to restore database.[/]"))
             return False
+
+        # cleanup instances and nodes to not cause any clashes
+        async with await AsyncConnection.connect(conninfo=conninfo, autocommit=True) as conn:
+            await conn.execute("DELETE FROM instances")
+            await conn.execute("DELETE FROM nodes")
+
+        # do we need to rename the node?
+        if self.old_node:
+            Install.rename_node(self.config_dir, self.old_node, self.node, database_only=True)
+
         return True
 
     async def restore_instance(self, console: Console, backup_file: Path) -> bool:
@@ -256,9 +295,34 @@ class Restore:
         # Check if the node name is in there
         nodes_yaml = Path(self.config_dir) / "nodes.yaml"
         nodes = yaml.load(nodes_yaml.read_text(encoding='utf-8'))
-        if instance_name not in nodes[self.node].get('instances', {}):
+        instance = nodes[self.node].get('instances', {}).get(instance_name, {})
+        if not instance:
             console.print(_("[yellow]Instance {} does not exist in your nodes.yaml. "
                             "Please use `/node add_instance` to add it.[/]").format(instance_name))
+            return False
+        # Now check serverSettings.lua for any directory changes
+        settings_path = instance_path / 'Config' / 'serverSettings.lua'
+        if settings_path.exists():
+            data = luadata.read(settings_path, encoding='utf-8')
+            mission_list = data.get('missionList')
+            missions_dir = instance.get('missions_dir')
+            if not missions_dir:
+                missions_dir = Path(os.path.expandvars(instance['home'])) / 'Missions'
+            else:
+                missions_dir = Path(os.path.expandvars(missions_dir))
+            dirty = False
+            if mission_list and isinstance(mission_list, list):
+                for idx, mission in enumerate(mission_list.copy()):
+                    mission_path = Path(os.path.expandvars(mission))
+                    if not mission_path.exists():
+                        mission_new = missions_dir / os.path.basename(mission_path)
+                        mission_list[idx] = mission_new
+                        dirty = True
+                        console.print(_("Mission file {} updated to {}.").format(mission_path.name,
+                                                                                 mission_new.name))
+            if dirty:
+                with open(settings_path, mode='wb') as outfile:
+                    outfile.write(("cgf = " + luadata.serialize(data, indent='\t', indent_level=0)).encode('utf-8'))
         return True
 
     async def run(self, restore_dir: Path | None = None, *, delete: bool = False) -> int:

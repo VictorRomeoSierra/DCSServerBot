@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import ipaddress
+import logging
 import secrets
 import socket
 import sys
@@ -34,6 +35,8 @@ API_URLS = [
     'https://www.trackip.net/ip',
     'https://api4.my-ip.io/v1/ip'  # they have an issue with their cert atm, hope they get it fixed
 ]
+
+logger = logging.getLogger(__name__)
 
 
 def get_hash_secret(config_dir='config') -> bytes:
@@ -72,20 +75,21 @@ def hash_ip_addr(ip_addr: str, prefix_len: int | None = None) -> str:
     return hmac_hash(get_network_prefix(ip_addr, prefix_len))
 
 
-def is_open(ip, port):
+def is_open(ip: str, port: int, *, timeout: float = 1.0) -> bool:
     with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
-        s.settimeout(1.0)
-        return s.connect_ex((ip, int(port))) == 0
+        s.settimeout(timeout)
+        try:
+            s.connect((ip, int(port)))
+            return True
+        except (socket.timeout, OSError) as ex:
+            return False
 
 
 async def get_public_ip(node: "Node | None" = None):
-    proxy = node.proxy if node else None
-    proxy_auth = node.proxy_auth if node else None
-
     for url in API_URLS:
         with suppress(aiohttp.ClientError, ValueError):
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, proxy=proxy, proxy_auth=proxy_auth) as resp:
+                async with session.get(url) as resp:
                     return ipaddress.ip_address(await resp.text()).compressed
     raise TimeoutError("Public IP could not be retrieved.")
 

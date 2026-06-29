@@ -110,6 +110,11 @@ class BotService(Service):
                 # Allow users to @mention the bot instead of using a prefix
                 return commands.when_mentioned_or(*prefixes)(client, message)
 
+            intents = discord.Intents.default()
+            # set privileged intents
+            intents.members=True            # necessary to be able to send welcome messages and such
+            intents.message_content=True    # necessary to allow file uploads
+
             # Create the Bot
             return DCSServerBot(version=self.node.bot_version,
                                 sub_version=self.node.sub_version,
@@ -117,7 +122,7 @@ class BotService(Service):
                                 description='Interact with DCS World servers',
                                 owner_id=self.locals['owner'],
                                 case_insensitive=True,
-                                intents=discord.Intents.all(),
+                                intents=intents,
                                 node=self.node,
                                 locals=self.locals,
                                 help_command=None,
@@ -196,7 +201,13 @@ class BotService(Service):
             self.bot = None
         await super().stop()
 
-    async def alert(self, title: str, message: str, server: Server | None = None) -> None:
+    async def alert(
+            self,
+            title: str,
+            message: str,
+            server: Server | None = None,
+            fields: list[tuple[str, str]] | None = None
+    ) -> None:
         try:
             # if we have dedicated managers of a server, send the alerts to them
             if server and server.locals.get('managed_by'):
@@ -209,7 +220,7 @@ class BotService(Service):
             except AttributeError:
                 self.log.error(f"Alert-Role {alert_roles} not found.")
                 mentions = ""
-            embed = utils.create_warning_embed(title=title, text=utils.escape_string(message))
+            embed = utils.create_warning_embed(title=title, text=utils.escape_string(message), fields=fields)
             admin_channel = self.bot.get_admin_channel(server)
             audit_channel = self.bot.get_channel(self.bot.locals.get('channels', {}).get('audit', -1))
             channel = admin_channel or audit_channel

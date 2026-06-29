@@ -17,7 +17,7 @@ if sys.platform == 'win32':
     import win32process
     from minidump.utils.createminidump import create_dump, MINIDUMP_TYPE
 
-from core import Status, Server, ServerImpl, Autoexec, utils, InstanceImpl
+from core import Status, Server, ServerImpl, Autoexec, utils, InstanceImpl, ServerMaintenanceManager
 from core.services.base import Service
 from core.services.registry import ServiceRegistry
 from datetime import datetime, timezone
@@ -254,15 +254,19 @@ class MonitoringService(Service):
                         node, pool_available, requests_queued, requests_wait_ms, dcs_queue, asyncio_queue
                     )
                     VALUES (%s, %s, %s, %s, %s, %s)
-                """, (self.node.name, pstats.get('pool_available', 0), pstats.get('requests_queued', 0),
-                      pstats.get('requests_wait_ms', 0), sum(x.qsize() for x in bus.udp_server.message_queue.values()),
-                      len(asyncio.all_tasks(self.bus.loop))))
+                """, (self.node.name,
+                      pstats.get('pool_available', 0),
+                      pstats.get('requests_queued', 0),
+                      pstats.get('requests_wait_ms', 0),
+                      sum(x.qsize() for x in bus.udp_server.message_queue.values()),
+                      len(asyncio.all_tasks(self.bus.loop))
+                ))
             self.apool.pop_stats()
         except psycopg_pool.PoolClosed:
             pass
 
     def _pull_load_params(self, server: Server) -> dict:
-        process = server.process
+        process = cast(ServerImpl, server).process
         pid = process.pid
 
         # Fetch process resource statistics
@@ -284,7 +288,7 @@ class MonitoringService(Service):
 
         # Network I/O counters (bytes sent/recv logic with batching interval optimization)
         net_io_counters = psutil.net_io_counters(pernic=False)
-        if not self.net_io_counters:  # No previous data, assume 0 activity.
+        if not self.net_io_counters:  # No previous data; assume 0 activity.
             bytes_sent = bytes_recv = 0
         else:
             interval_inverse = 1 / 7200
@@ -381,6 +385,21 @@ class MonitoringService(Service):
                                           f"{message}")
                     self.space_warning_sent[drive] = True
 
+    async def ip_check(self):
+        current_ip = await utils.get_public_ip()
+        if current_ip != self.node.public_ip:
+            config = self.get_config()
+            if config.get('ignore_ip_changes', False):
+                await self.bot.audit(f"Your public IP has changed on node {self.node.name}! "
+                                     f"Ignoring based on your configuration.")
+                return
+
+            # public IP has changed, shutdown all servers
+            message = self.get_config().get('messages', {}).get(
+                'ip_change', 'Server is being restarted due to an IP change')
+            async with ServerMaintenanceManager(self.node, message=message):
+                self.node._public_ip = current_ip
+
     @tasks.loop(minutes=1.0)
     async def monitoring(self):
         try:
@@ -398,6 +417,10 @@ class MonitoringService(Service):
 
             if self.node.locals.get('nodestats', True):
                 tasks.append(self.nodestats())
+
+            # check every 10 mins for IP changes if there is no public_ip set
+            if not self.node.locals.get('public_ip') and self.monitoring._current_loop % 10 == 0:
+                tasks.append(self.ip_check())
 
             # Run all tasks concurrently
             await asyncio.gather(*tasks)
@@ -427,3 +450,4 @@ class MonitoringService(Service):
         else:
             # not implemented for UNIX
             pass
+

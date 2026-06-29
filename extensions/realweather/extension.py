@@ -153,16 +153,28 @@ class RealWeather(Extension):
         try:
             cwd = await self.server.get_missions_dir()
 
-            def cleanup():
+            def get_logfile():
+                return os.path.join(cwd, self.locals.get('realweather', {}).get('log', {}).get('file', 'realweather.log'))
+
+            def cleanup(clean_logfile: bool = True):
                 # delete the mission_unpacked directory which might still be there from former RW runs
                 mission_unpacked_dir = os.path.join(cwd, 'mission_unpacked')
                 if os.path.exists(mission_unpacked_dir):
                     utils.safe_rmtree(mission_unpacked_dir)
+                # move the logfile to old
+                if clean_logfile:
+                    path = get_logfile()
+                    old_file = path + '.old'
+                    if os.path.exists(old_file):
+                        os.remove(old_file)
+                    if os.path.exists(path):
+                        os.rename(path, old_file)
 
             def run_subprocess():
                 # double-check that no mission_unpacked dir is there
-                cleanup()
+                cleanup(clean_logfile=True)
                 # run RW
+                self.log.debug(f"{self.name}: Running Real Weather: {self.get_rw_exe()} in {cwd}")
                 process = subprocess.Popen(
                     [self.get_rw_exe()],
                     stdout=subprocess.PIPE,
@@ -196,7 +208,7 @@ class RealWeather(Extension):
                 try:
                     await asyncio.to_thread(run_subprocess)
                 finally:
-                    cleanup()
+                    cleanup(clean_logfile=False)
 
             # check if DCS Real Weather corrupted the miz file
             await asyncio.to_thread(MizFile, tmpname)
@@ -207,6 +219,9 @@ class RealWeather(Extension):
             return new_filename, True
         except UnsupportedMizFileException:
             raise RealWeatherException(f"{self.name}: Could not process mission due to an internal error.")
+        except Exception as ex:
+            self.log.exception(ex)
+            raise
         finally:
             os.remove(tmpname)
 

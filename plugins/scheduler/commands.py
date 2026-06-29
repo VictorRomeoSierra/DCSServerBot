@@ -299,7 +299,7 @@ class Scheduler(Plugin[SchedulerListener]):
         tasks = [
             asyncio.create_task(do_warn(i))
             for i in warn_times
-            if math.ceil(i/(60 if i >= 60 else 1)) <= math.ceil(restart_in/(60 if i >= 60 else 1))
+            if math.ceil(i / (60 if i >= 60 else 1)) <= math.ceil(restart_in / (60 if i >= 60 else 1))
         ]
         await utils.run_parallel_nofail(*tasks)
 
@@ -484,6 +484,13 @@ class Scheduler(Plugin[SchedulerListener]):
             new_mission = rconf.get('mission_id')
             if isinstance(new_mission, list):
                 new_mission = random.choice(new_mission)
+            elif isinstance(new_mission, (int, str)):
+                new_mission = int(new_mission)
+                if new_mission > len(mission_list):
+                    self.log.warning(f"{self.__cog_name__}: "
+                                     f"Mission ID {new_mission} exceeds mission list length on server {server.name}, "
+                                     f"resetting to 1")
+                    new_mission = 1
             elif not new_mission:
                 new_mission = await self.get_mission_from_list(server, rconf.get('mission_file'))
                 if not new_mission:
@@ -770,12 +777,6 @@ class Scheduler(Plugin[SchedulerListener]):
             if server.status in [Status.UNREGISTERED, Status.LOADING, Status.SHUTTING_DOWN]:
                 continue
             config = self.get_config(server)
-            if server.maintenance:
-                if not config.get('startup', {}).get('clear_maintenance'):
-                    continue
-                server.maintenance = False
-                self.log.warning(f"Maintenance mode cleared on server {server.name}.")
-
             # if no config is defined for this server, ignore it
             if config:
                 try:
@@ -810,10 +811,19 @@ class Scheduler(Plugin[SchedulerListener]):
     @check_state.before_loop
     async def before_check(self):
         await self.bot.wait_until_ready()
+        # wait for all servers to be registered
         while True:
             if all(server.status != Status.UNREGISTERED for server in self.bot.servers.values()):
                 break
             await asyncio.sleep(1)
+        # reset maintenance flag
+        for server_name, server in self.bot.servers.items():
+            config = self.get_config(server)
+            if server.maintenance:
+                if not config.get('startup', {}).get('clear_maintenance'):
+                    continue
+                server.maintenance = False
+                self.log.warning(f"Maintenance mode auto-cleared on server {server.name}.")
 
     group = Group(name="server", description=_("Commands to manage a DCS server"))
 
