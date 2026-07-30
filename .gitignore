@@ -24,3 +24,4 @@ config
 reference/
 .claude/settings.local.json
 /.junie/
+version.sha

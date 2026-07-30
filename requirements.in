@@ -8,16 +8,16 @@ astral==3.2
 audioop-lts==0.2.2 ; python_version >= "3.13"
 
 # AIOHTTP: Uses asyncio for async/await native coroutines for establishing and handling HTTP connections
-aiohttp==3.14.1
+aiohttp==3.14.2
 
 # Certifi: Python package for providing Mozilla's CA Bundle
-certifi==2026.6.17
+certifi==2026.7.22
 
 # Python 3.14 compatibility
 contourpy==1.3.3
 
 # Croniter: Python iterator implementing a cron schedule format
-croniter==6.2.2
+croniter==6.2.4
 
 # discord.py: The python interface for the Discord API
 discord.py==2.7.1
@@ -26,16 +26,16 @@ discord.py==2.7.1
 eyeD3==0.9.9
 
 # FastAPI: A modern, fast (high-performance), web framework for building APIs with Python 3.6+ based on standard Python type hints
-fastapi==0.138.0
+fastapi==0.139.2
 
 # FuzzyWuzzy: Python library that uses Levenshtein Distance to calculate the differences between strings
 fuzzywuzzy==0.18.0
 
 # GeoPandas: World map
-geopandas==1.1.3
+geopandas==1.1.4
 
 # GitPython: Python library for interacting with git repositories
-GitPython>=3.1.50
+GitPython>=3.1.54
 
 # Jinja web template framework
 jinja2==3.1.6
@@ -47,7 +47,7 @@ jsonschema==4.26.0
 lupa==2.8
 
 # Matplotlib: Python 2D plotting library
-matplotlib==3.11.0
+matplotlib==3.11.1
 
 # MGRS: Python library for handling MGRS conversions
 mgrs==1.5.4
@@ -71,7 +71,7 @@ packaging==26.2
 pid==3.0.4
 
 # PIP Tools
-pip-tools==7.5.3
+pip-tools==7.6.0
 
 # Psycopg: PostgreSQL database adapter for Python
 psycopg[binary]==3.3.4
@@ -119,7 +119,7 @@ sqlparse==0.5.5
 telnetlib3==4.0.5
 
 # TimezoneFinder: Find the right timezones for a given coordinate
-tzfpy[tzdata]==1.3.1
+tzfpy[tzdata]==1.3.2
 
 # tomli: Python TOML parser
 tomli_w==1.2.0
@@ -132,7 +132,7 @@ upnpy==1.1.8 ; python_version >= "3.14"
 miniupnpc==2.3.3 ; python_version < "3.14"
 
 # Uvicorn: ASGI server implemented using asyncio and uvloop
-uvicorn==0.49.0
+uvicorn==0.51.0
 
 # Watchdog: API library and shell utilities to monitor file system events
 watchdog==6.0.0

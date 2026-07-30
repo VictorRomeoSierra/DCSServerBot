@@ -21,7 +21,6 @@ if sys.platform == 'win32':
     import win32gui
     import win32process
 
-from collections import OrderedDict
 from contextlib import suppress
 from copy import deepcopy
 from core import utils, Server
@@ -33,6 +32,7 @@ from core.data.node import UploadStatus
 from core.extension import Extension, InstallException
 from core.mizfile import MizFile
 from core.process import ProcessManager
+from core.services import ServiceRegistry
 from core.utils.helper import async_cache
 from core.utils.performance import performance_log
 from dataclasses import dataclass, field
@@ -154,10 +154,10 @@ class MissionFileSystemEventHandler(FileSystemEventHandler):
 @dataclass
 @DataObjectFactory.register()
 class ServerImpl(Server):
-    bot: DCSServerBot | None = field(compare=False, init=False)
-    event_handler: MissionFileSystemEventHandler = field(compare=False, default=None)
-    observer: ObserverType = field(compare=False, default=None)
-    process: psutil.Process | None = field(default=None, compare=False)
+    bot: DCSServerBot | None = field(compare=False, init=False, repr=False, default=None)
+    event_handler: MissionFileSystemEventHandler = field(compare=False, repr=False, default=None)
+    observer: ObserverType = field(compare=False, repr=False, default=None)
+    process: psutil.Process | None = field(default=None, repr=False, compare=False)
 
     @override
     def __post_init__(self):
@@ -623,6 +623,8 @@ class ServerImpl(Server):
                 shutil.copy2(orig, _mission)
                 missions.append(_mission)
             elif os.path.exists(mission):
+                if '.dcssb' in mission and os.path.exists(_mission) and os.path.getmtime(_mission) > os.path.getmtime(mission):
+                    shutil.copy2(_mission, mission)
                 missions.append(mission)
             else:
                 self.log.warning(f"Removing mission {mission} from serverSettings.lua as it could not be found!")
@@ -813,6 +815,12 @@ class ServerImpl(Server):
         if modify_mission:
             await self.apply_mission_changes(use_orig=use_orig)
         await asyncio.to_thread(self.do_startup)
+
+        from services.firewall import FirewallService
+        fw = ServiceRegistry.get(FirewallService)
+        if fw:
+            await fw.reset_fw_rules(self)
+
         timeout = 300 if self.node.locals.get('slow_system', False) else 180
         try:
             await self.wait_for_status_change([Status.SHUTDOWN, Status.STOPPED, Status.PAUSED, Status.RUNNING], timeout)

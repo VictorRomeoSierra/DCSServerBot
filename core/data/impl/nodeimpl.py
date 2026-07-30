@@ -1945,23 +1945,26 @@ class NodeImpl(Node):
         return True
 
     @override
-    async def get_cpu_info(self, used: bool = True) -> bytes | int:
-        from core.process import (ProcessManager, create_cpu_topology_visualization, get_cpus_from_affinity,
-                                  get_cache_info, get_p_core_affinity, get_e_core_affinity)
+    async def get_cpu_info(self, used: bool = True, export: bool = False) -> bytes | dict | int:
+        from core.process import ProcessManager
+
+        if export:
+            if self.node.master:
+                return ProcessManager().export_topology()
+            else:
+                async with self.apool.connection() as conn:
+                    cursor = await conn.execute("""
+                        INSERT INTO files (guild_id, name, data) 
+                        VALUES (%s, %s, %s)
+                        RETURNING id
+                    """, (self.guild_id, 'cpuinfo.json', psycopg.Binary(json.dumps(ProcessManager().export_topology()).encode('utf-8'))))
+                    return (await cursor.fetchone())[0]
 
         def create_image(used: bool) -> bytes:
             if used:
                 return ProcessManager().visualize_usage()
             else:
-                p_core_affinity_mask = get_p_core_affinity()
-                e_core_affinity_mask = get_e_core_affinity()
-                buffer = create_cpu_topology_visualization(get_cpus_from_affinity(p_core_affinity_mask),
-                                                           get_cpus_from_affinity(e_core_affinity_mask),
-                                                           get_cache_info())
-                try:
-                    return buffer.getvalue()
-                finally:
-                    buffer.close()
+                return ProcessManager().visualize_cache()
 
         if self.node.master:
             return create_image(used)
@@ -2011,4 +2014,14 @@ class NodeImpl(Node):
 
     @override
     async def get_config(self) -> dict:
+        return self.read_locals()
+
+    @override
+    async def set_config(self, config: dict) -> dict:
+        config_file = os.path.join(self.config_dir, 'nodes.yaml')
+        with open(config_file, mode='r', encoding='utf-8') as infile:
+            old_config = yaml.load(infile)
+        old_config[self.name] = utils.deep_merge(old_config[self.name], config)
+        with open(config_file, mode='w', encoding='utf-8') as outfile:
+            yaml.dump(old_config, outfile)
         return self.read_locals()
