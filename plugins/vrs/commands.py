@@ -209,8 +209,19 @@ class Vrs(Plugin[VrsEventListener]):
         # install (_install_plugin copies plugins/<name>/lua/* into Saved Games),
         # so any pushed mission-Lua hotfixes plus updated bot plugin glue take
         # effect on the post-reset boot. Adds ~30s of downtime vs mission reload.
-        await server.shutdown()
-        await server.startup(modify_mission=True)
+        #
+        # force=True skips the node-side graceful-exit wait (up to 180s). On a
+        # busy server DCS ignores the graceful shutdown, and that node-side wait
+        # collides with the master-side 180s RPC timeout -- the command aborts
+        # mid-cycle BEFORE startup and strands the server down with the reset
+        # armed. We're wiping the campaign and restarting anyway, so a graceful
+        # in-mission save is moot. The finally guarantees startup still runs even
+        # if shutdown reports an error, so a shutdown hiccup can never leave the
+        # server down.
+        try:
+            await server.shutdown(force=True)
+        finally:
+            await server.startup(modify_mission=True)
 
         audit_msg = f"reset campaign on {server.name} (DCS cycled)"
         if selected_mission_path:
@@ -321,8 +332,22 @@ class Vrs(Plugin[VrsEventListener]):
 
         # Full process cycle so post-reset hook + plugin Lua reinstall
         # picks up the rolled-back state. Same justification as
-        # reset_campaign.
-        await server.shutdown()
+        # reset_campaign. force=True avoids the same 180s graceful-exit / RPC
+        # timeout collision that would otherwise strand a busy server down
+        # mid-rollback.
+        try:
+            await server.shutdown(force=True)
+        except Exception as ex:
+            # Shutdown failed -- do NOT git reset the clone with DCS possibly
+            # still holding files open. Bring the server back on the current
+            # code and bail without rolling back.
+            await server.startup(modify_mission=True)
+            await interaction.followup.send(
+                f"Rollback ABORTED: shutdown failed (`{ex}`). "
+                f"Server restarted on the current code; no rollback performed.",
+                ephemeral=False
+            )
+            return
 
         try:
             old_sha, new_sha = await github_ext.reset_to_ref(f"refs/tags/{version}")
