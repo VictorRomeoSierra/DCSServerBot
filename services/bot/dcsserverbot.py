@@ -240,6 +240,19 @@ class DCSServerBot(commands.Bot):
         else:
             return None
 
+    def mention_admin(self, server: "Server | None" = None) -> str:
+        if server and server.locals.get('managed_by'):
+            alert_roles = server.locals['managed_by']
+        # use the default Alert role otherwise
+        else:
+            alert_roles = self.roles['Alert']
+        try:
+            mentions = ''.join([self.get_role(role).mention for role in alert_roles if role is not None])
+        except AttributeError:
+            self.log.error(f"Alert-Role {alert_roles} not found.")
+            mentions = ""
+        return mentions
+
     def _check_server_channels(self, server: "Server"):
         channels = {
             'status': DEFAULT_CHANNEL_PERMISSIONS,
@@ -410,7 +423,7 @@ class DCSServerBot(commands.Bot):
         else:
             rc = True
             for plugin in self.plugins:
-                if not await self.reload_plugin(plugin):
+                if plugin and not await self.reload_plugin(plugin):
                     rc = False
             return rc
 
@@ -440,7 +453,7 @@ class DCSServerBot(commands.Bot):
             if not user:
                 member = self.member
             elif isinstance(user, str):
-                member = self.get_member_by_ucid(user) if utils.is_ucid(user) else None
+                member = await self.get_member_by_ucid(user) if utils.is_ucid(user) else None
             else:
                 member = user
             embed = discord.Embed(color=discord.Color.blue())
@@ -520,26 +533,25 @@ class DCSServerBot(commands.Bot):
             else:
                 return None
 
-    # TODO: change to async (after change in DataClasses)
-    def get_member_by_ucid(self, ucid: str, verified: bool | None = False) -> discord.Member | None:
-        with self.pool.connection() as conn:
+    async def get_member_by_ucid(self, ucid: str, verified: bool | None = False) -> discord.Member | None:
+        async with self.apool.connection() as conn:
             sql = 'SELECT discord_id FROM players WHERE ucid = %s AND discord_id <> -1'
             if verified:
                 sql += ' AND manual IS TRUE'
-            cursor = conn.execute(sql, (ucid, ))
+            cursor = await conn.execute(sql, (ucid, ))
             if cursor.rowcount == 1:
-                return self.guilds[0].get_member(cursor.fetchone()[0])
+                return self.guilds[0].get_member((await cursor.fetchone())[0])
             else:
                 return None
 
-    def match_user(self, data: dict, rematch=False) -> discord.Member | None:
+    async def match_user(self, data: dict, rematch=False) -> discord.Member | None:
         if not rematch:
-            member = self.get_member_by_ucid(data['ucid'])
+            member = await self.get_member_by_ucid(data['ucid'])
             if member:
                 return member
         return utils.match(data['name'], [x for x in self.get_all_members() if not x.bot])
 
-    def get_servers(self, manager: discord.Member | None = None) -> dict[str, "Server"] | None:
+    def get_servers(self, manager: discord.Member | None = None) -> dict[str, "Server"]:
         def check_server_roles(server: "Server") -> bool:
             if server.locals.get('managed_by') and not utils.check_roles(server.locals.get('managed_by'), manager):
                 return False
@@ -547,10 +559,12 @@ class DCSServerBot(commands.Bot):
 
         return {k: v for k,v in self.servers.items() if check_server_roles(v)}
 
-    def get_server(self, ctx: commands.Context | discord.Interaction | discord.Message | str, *,
+    def get_server(self, ctx: discord.Interaction | discord.Message | str, *,
                    admin_only: bool | None = False) -> "Server | None":
 
-        all_servers = self.get_servers(manager=ctx.user if isinstance(ctx, discord.Interaction) else ctx.author)
+        all_servers = self.get_servers(
+            manager=ctx.user if isinstance(ctx, discord.Interaction) else ctx.author if isinstance(ctx, discord.Message) else None
+        )
         if len(all_servers) == 1:
             server = next(iter(all_servers.values()))
             if admin_only:
@@ -563,9 +577,12 @@ class DCSServerBot(commands.Bot):
                     return None
             else:
                 return server
+
         for server_name, server in all_servers.items():
-            if isinstance(ctx, commands.Context) or isinstance(ctx, discord.Interaction) \
-                    or isinstance(ctx, discord.Message):
+            if isinstance(ctx, str):
+                if server_name == ctx:
+                    return server
+            else:
                 if server.status == Status.UNREGISTERED:
                     continue
                 for channel in [Channel.ADMIN, Channel.STATUS, Channel.EVENTS, Channel.CHAT,
@@ -574,9 +591,6 @@ class DCSServerBot(commands.Bot):
                     if int(server.locals.get('channels', {}).get(channel.value, -1)) != -1 and \
                             server.channels[channel] == ctx.channel.id:
                         return server
-            else:
-                if server_name == ctx:
-                    return server
         return None
 
     async def fetch_embed(self, embed_name: str, channel: GuildChannel, server: "Server | None" = None):
@@ -621,7 +635,7 @@ class DCSServerBot(commands.Bot):
                 # we should not write to this channel
                 if channel_id == -1:
                     return None
-            else:
+            elif isinstance(channel_id, str):
                 channel_id = int(channel_id)
 
             # find the channel

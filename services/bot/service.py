@@ -85,18 +85,24 @@ class BotService(Service):
 
     @property
     def proxy(self) -> str | None:
-        return self.locals.get('proxy', {}).get('url')
+        if self.locals.get('proxy'):
+            return self.locals.get('proxy', {}).get('url')
+        else:
+            return self.node.proxy
 
     @property
     def proxy_auth(self) -> BasicAuth | None:
-        username = self.locals.get('proxy', {}).get('username')
-        try:
-            password = utils.get_password('proxy', self.node.config_dir)
-        except ValueError:
+        if self.locals.get('proxy'):
+            username = self.locals.get('proxy', {}).get('username')
+            try:
+                password = utils.get_password('proxy', self.node.config_dir)
+            except ValueError:
+                return None
+            if username and password:
+                return BasicAuth(username, password)
             return None
-        if username and password:
-            return BasicAuth(username, password)
-        return None
+        else:
+            return self.node.proxy_auth
 
     def init_bot(self):
         if self.locals.get('no_discord', False):
@@ -127,7 +133,8 @@ class BotService(Service):
                                 locals=self.locals,
                                 help_command=None,
                                 activity=discord.Game(
-                                    name=self.locals['discord_status']) if 'discord_status' in self.locals else None,
+                                    name=self.locals['discord_status']
+                                ) if 'discord_status' in self.locals else None,
                                 heartbeat_timeout=120,
                                 assume_unsync_clock=True,
                                 proxy=self.proxy,
@@ -206,26 +213,35 @@ class BotService(Service):
             title: str,
             message: str,
             server: Server | None = None,
-            fields: list[tuple[str, str]] | None = None
+            fields: list[tuple[str, str]] | None = None,
+            filename: str | None = None,
+            mention: bool = True,
+            warn: bool = True
     ) -> None:
         try:
-            # if we have dedicated managers of a server, send the alerts to them
-            if server and server.locals.get('managed_by'):
-                alert_roles = server.locals['managed_by']
-            # use the default Alert role otherwise
+            mentions = self.bot.mention_admin(server) if mention else ""
+            if warn:
+                embed = utils.create_warning_embed(title=title, text=utils.escape_string(message), fields=fields)
             else:
-                alert_roles = self.bot.roles['Alert']
-            try:
-                mentions = ''.join([self.bot.get_role(role).mention for role in alert_roles if role is not None])
-            except AttributeError:
-                self.log.error(f"Alert-Role {alert_roles} not found.")
-                mentions = ""
-            embed = utils.create_warning_embed(title=title, text=utils.escape_string(message), fields=fields)
+                embed = discord.Embed(color=discord.Color.blue(), title=title, description=message or "")
+                if fields:
+                    for name, value in fields:
+                        embed.add_field(name=name, value=value)
             admin_channel = self.bot.get_admin_channel(server)
             audit_channel = self.bot.get_channel(self.bot.locals.get('channels', {}).get('audit', -1))
             channel = admin_channel or audit_channel
+            attachment: discord.File | None = None
             if channel:
-                await channel.send(content=mentions, embed=embed)
+                if server and filename:
+                    file = await server.node.read_file(filename)
+                    zip_buffer = BytesIO()
+                    with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
+                        zip_file.writestr(filename, file)
+                    file = zip_buffer.getvalue()
+                    filename += '.zip'
+                    attachment = discord.File(fp=BytesIO(file), filename=os.path.basename(filename))
+
+                await channel.send(content=mentions, embed=embed, file=attachment)
             else:
                 self.log.critical(f"{title}: {message}")
         except Exception:

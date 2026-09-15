@@ -1,11 +1,12 @@
 import discord
 
 from contextlib import suppress
-from core import Plugin, command, utils, get_translation, Group
+from core import Plugin, utils, get_translation, Group
 from datetime import timedelta
 from discord import app_commands, Permissions
 from discord.abc import GuildChannel
 from discord.ext import commands
+from discord.utils import MISSING
 from services.bot import DCSServerBot
 from services.cron.actions import purge_channel
 from typing import cast
@@ -59,7 +60,9 @@ class Discord(Plugin):
             # set the id to handle reactions
             self.reaction_message_id = message.id
 
-    @command(name='clear', description=_('Clear Discord messages'))
+    disc = Group(name="discord", description=_("Discord management commands"))
+
+    @disc.command(name='clear', description=_('Clear Discord messages'))
     @app_commands.guild_only()
     @utils.app_has_role('Admin')
     @app_commands.describe(older_than=_('Delete messages older than x days (0 = all)'))
@@ -69,16 +72,18 @@ class Discord(Plugin):
                     after_id: str | None = None, before_id: str | None = None):
         if not channel:
             channel = interaction.channel
-        await interaction.response.defer(thinking=True, ephemeral=utils.get_ephemeral(interaction))
-        msg = await interaction.followup.send(_("Deleting messages ..."))
-        await purge_channel(node=self.node, channel=channel.id, older_than=older_than,
-                            ignore=ignore.id if ignore else None, after_id=int(after_id) if after_id else None,
-                            before_id=int(before_id) if before_id else None)
-        with suppress(discord.NotFound):
-            await msg.delete()
-        await interaction.followup.send(_("All messages deleted."))
+        ephemeral = utils.get_ephemeral(interaction)
+        await interaction.response.defer(thinking=True, ephemeral=ephemeral)
+        msg = await interaction.followup.send(_("Deleting messages ..."), ephemeral=ephemeral)
+        try:
+            await purge_channel(node=self.node, channel=channel.id, older_than=older_than,
+                                ignore=ignore.id if ignore else None, after_id=int(after_id) if after_id else None,
+                                before_id=int(before_id) if before_id else None)
+            await msg.edit(content=_("All messages deleted."))
+        except Exception as ex:
+            await msg.edit(content=_("Error while deleting messages: {}").format(ex))
 
-    @command(name='addrole', description=_('Adds a role to a member'))
+    @disc.command(name='addrole', description=_('Adds a role to a member'))
     @app_commands.guild_only()
     @utils.app_has_role('Admin')
     async def addrole(self, interaction: discord.Interaction, member: discord.Member, role: discord.Role):
@@ -98,7 +103,7 @@ class Discord(Plugin):
                 _("You don't have permission to add role {role} to {member}.").format(
                     role=role.mention, member=member.mention), ephemeral=True)
 
-    @command(name='delrole', description=_('Removes a role from a member'))
+    @disc.command(name='delrole', description=_('Removes a role from a member'))
     @app_commands.guild_only()
     @utils.app_has_role('Admin')
     async def delrole(self, interaction: discord.Interaction, member: discord.Member, role: discord.Role):
@@ -130,8 +135,6 @@ class Discord(Plugin):
         channel_id = config.get('channel', -1)
         channel = self.bot.get_channel(channel_id) if channel_id != -1 else member
         await channel.send(message.format(name=member.display_name, mention=member.mention))
-
-    disc = Group(name='discord', description="Discord commands")
 
     @disc.command(name='healthcheck', description=_("Run a healthcheck of your discord server"))
     @app_commands.guild_only()
@@ -203,11 +206,9 @@ class Discord(Plugin):
             else:
                 embed.add_field(name=_("Public Channels"), value='\n'.join(x.mention for x in channels_for_everyone),
                                 inline=False)
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-        try:
+        await interaction.response.send_message(embed=embed, view=view or MISSING, ephemeral=True)
+        if view:
             await view.wait()
-        finally:
-            await interaction.delete_original_response()
 
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):

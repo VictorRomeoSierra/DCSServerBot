@@ -222,7 +222,7 @@ class Node(ABC):
         raise NotImplementedError()
 
     @abstractmethod
-    async def write_file(self, filename: str, url: str, overwrite: bool = False) -> UploadStatus:
+    async def write_file(self, target: str, source: str | int, overwrite: bool = False) -> UploadStatus:
         raise NotImplementedError()
 
     @abstractmethod
@@ -261,7 +261,7 @@ class Node(ABC):
         raise NotImplementedError()
 
     @abstractmethod
-    async def find_all_instances(self) -> list[tuple[str, str]]:
+    async def find_all_instances(self) -> dict[str, str]:
         raise NotImplementedError()
 
     @abstractmethod

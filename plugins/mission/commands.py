@@ -26,7 +26,7 @@ from openpyxl.utils import get_column_letter
 from pathlib import Path
 from psycopg.rows import dict_row
 from services.bot import DCSServerBot
-from typing import Literal, Type
+from typing import Literal, Type, cast
 
 from .airbase import Info
 from .const import LIQUIDS
@@ -145,6 +145,8 @@ async def wh_category_autocomplete(interaction: discord.Interaction, _current: s
         return []
     try:
         server: Server = await utils.ServerTransformer().transform(interaction, interaction.namespace.server)
+        if not server.current_mission:
+            return []
         idx: int = interaction.namespace.airbase
         airbase: dict = server.current_mission.airbases[idx]
         data = await get_airbase(server, airbase['name'])
@@ -733,6 +735,7 @@ class Mission(Plugin[MissionEventListener]):
         except MarkedYAMLError:
             await interaction.response.send_message(
                 _("Can't load presets file {}.").format(presets_file), ephemeral=True)
+            return
         except FileNotFoundError:
             await interaction.response.send_message(
                 _('No presets available, please configure them in {}.').format(presets_file), ephemeral=True)
@@ -1067,10 +1070,13 @@ class Mission(Plugin[MissionEventListener]):
     @app_commands.rename(idx=_('airbase'))
     @app_commands.describe(idx=_('Airbase for warehouse information'))
     @app_commands.autocomplete(idx=utils.airbase_autocomplete)
-    async def airbase_info(self, interaction: discord.Interaction,
-                           _server: app_commands.Transform[Server, utils.ServerTransformer(
-                               status=[Status.RUNNING, Status.PAUSED])],
-                           idx: int):
+    async def airbase_info(
+            self,
+            interaction: discord.Interaction,
+            _server: app_commands.Transform[Server, utils.ServerTransformer(status=[Status.RUNNING, Status.PAUSED])],
+            coalition: Coalition,
+            idx: int
+    ):
         if _server.status not in [Status.RUNNING, Status.PAUSED]:
             await interaction.response.send_message(_("Server {} is not running.").format(_server.display_name),
                                                     ephemeral=True)
@@ -1121,10 +1127,13 @@ class Mission(Plugin[MissionEventListener]):
     @app_commands.rename(idx=_('airbase'))
     @app_commands.describe(idx=_('Airbase for ATIS information'))
     @app_commands.autocomplete(idx=utils.airbase_autocomplete)
-    async def atis(self, interaction: discord.Interaction,
-                   _server: app_commands.Transform[Server, utils.ServerTransformer(
-                       status=[Status.RUNNING, Status.PAUSED])],
-                   idx: int):
+    async def atis(
+            self,
+            interaction: discord.Interaction,
+            _server: app_commands.Transform[Server, utils.ServerTransformer(status=[Status.RUNNING, Status.PAUSED])],
+            coalition: Coalition,
+            idx: int
+    ):
         if _server.status not in [Status.RUNNING, Status.PAUSED]:
             await interaction.response.send_message(_("Server {} is not running.").format(_server.display_name),
                                                     ephemeral=True)
@@ -1145,13 +1154,19 @@ class Mission(Plugin[MissionEventListener]):
     @airbase.command(description=_('Capture an airbase'))
     @utils.app_has_roles(['DCS Admin', 'GameMaster'])
     @app_commands.guild_only()
+    @app_commands.describe(coalition=_("Coalition of the airbase prior to capturing"))
     @app_commands.rename(idx=_('airbase'))
     @app_commands.describe(idx=_('Airbase to capture'))
+    @app_commands.describe(to_coalition=_("Coalition to change to"))
     @app_commands.autocomplete(idx=utils.airbase_autocomplete)
-    async def capture(self, interaction: discord.Interaction,
-                      server: app_commands.Transform[Server, utils.ServerTransformer(
-                          status=[Status.RUNNING, Status.PAUSED])],
-                      idx: int, coalition: Literal['Red', 'Blue', 'Neutral']):
+    async def capture(
+            self,
+            interaction: discord.Interaction,
+            server: app_commands.Transform[Server, utils.ServerTransformer(status=[Status.RUNNING, Status.PAUSED])],
+            coalition: Coalition,
+            idx: int,
+            to_coalition: Literal['Red', 'Blue', 'Neutral']
+    ):
         if server.status not in [Status.RUNNING, Status.PAUSED]:
             await interaction.response.send_message(_("Server {} is not running.").format(server.display_name),
                                                     ephemeral=True)
@@ -1159,24 +1174,30 @@ class Mission(Plugin[MissionEventListener]):
 
         await interaction.response.defer(ephemeral=utils.get_ephemeral(interaction))
         airbase = server.current_mission.airbases[idx]
-        data = await server.send_to_dcs_sync({
+        data: dict | None = await server.send_to_dcs_sync({
             "command": "getAirbase",
             "name": airbase['name']
         }, timeout=60)
-        ret_coalition = 'Red' if data['coalition'] == 1 else 'Blue' if data['coalition'] == 2 else 'Neutral'
-        if ret_coalition == coalition:
-            await interaction.followup.send(_('Airbase \"{}\" belonged to coalition {} already.').format(
-                airbase['name'], coalition.lower()), ephemeral=True)
+        if not data:
+            await interaction.followup.send(_("No data received from DCS, aborting."), ephemeral=True)
             return
 
+        ret_coalition = 'Red' if data['coalition'] == 1 else 'Blue' if data['coalition'] == 2 else 'Neutral'
+        if ret_coalition == to_coalition:
+            await interaction.followup.send(_('Airbase \"{}\" belonged to coalition {} already.').format(
+                airbase['name'], to_coalition.lower()), ephemeral=True)
+            return
+
+        change_coalition = 1 if to_coalition == 'Red' else 2 if to_coalition == 'Blue' else 0
         await server.send_to_dcs_sync({
             "command": "captureAirbase",
             "name": airbase['name'],
-            "coalition": 1 if coalition == 'Red' else 2 if coalition == 'Blue' else 0
+            "coalition": change_coalition
         }, timeout=60)
+        airbase['coalition'] = change_coalition
         await interaction.followup.send(
             _("Airbase \"{}\": Coalition changed to **{}**.\n:warning: Auto-capturing is now **disabled**!").format(
-                airbase['name'], coalition.lower()))
+                airbase['name'], to_coalition.lower()))
 
     warehouse = Group(name='warehouse', description=_('Commands to manage warehouses'))
 
@@ -1269,7 +1290,7 @@ class Mission(Plugin[MissionEventListener]):
                 message = _("Do you really want to set all {} values in your warehouse to {}?").format(
                     category, value)
                 if not await utils.yn_question(interaction, message):
-                    await interaction.followup.send(_("Aborted."))
+                    await interaction.followup.send(_("Aborted."), ephemeral=True)
                     return
 
                 await Mission.manage_category(_server, airbase, category, value)
@@ -1297,10 +1318,16 @@ class Mission(Plugin[MissionEventListener]):
     @app_commands.autocomplete(idx=utils.airbase_autocomplete)
     @app_commands.autocomplete(category=wh_category_autocomplete)
     @app_commands.autocomplete(item=wh_item_autocomplete)
-    async def set(self, interaction: discord.Interaction,
-                        _server: app_commands.Transform[Server, utils.ServerTransformer(
-                            status=[Status.RUNNING, Status.PAUSED])],
-                        idx: int, category: str, item: str | None = None, value: int = 0):
+    async def set(
+            self,
+            interaction: discord.Interaction,
+            _server: app_commands.Transform[Server, utils.ServerTransformer(status=[Status.RUNNING, Status.PAUSED])],
+            coalition: Coalition,
+            idx: int,
+            category: str,
+            item: str | None = None,
+            value: int = 0
+    ):
         await self._manage_warehouse(interaction, _server, idx, category, item, value)
 
     @warehouse.command(description=_('Get warehouses items'))
@@ -1312,10 +1339,15 @@ class Mission(Plugin[MissionEventListener]):
     @app_commands.autocomplete(idx=utils.airbase_autocomplete)
     @app_commands.autocomplete(category=wh_category_autocomplete)
     @app_commands.autocomplete(item=wh_item_autocomplete)
-    async def get(self, interaction: discord.Interaction,
-                  _server: app_commands.Transform[Server, utils.ServerTransformer(
-                      status=[Status.RUNNING, Status.PAUSED])],
-                  idx: int, category: str | None = None, item: str | None = None):
+    async def get(
+            self,
+            interaction: discord.Interaction,
+            _server: app_commands.Transform[Server, utils.ServerTransformer(status=[Status.RUNNING, Status.PAUSED])],
+            coalition: Coalition,
+            idx: int,
+            category: str | None = None,
+            item: str | None = None
+    ):
         await self._manage_warehouse(interaction, _server, idx, category, item)
 
     @staticmethod
@@ -1377,10 +1409,13 @@ class Mission(Plugin[MissionEventListener]):
     @app_commands.rename(idx=_('airbase'))
     @app_commands.describe(idx=_('Airbase for warehouse information'))
     @app_commands.autocomplete(idx=utils.airbase_autocomplete)
-    async def export(self, interaction: discord.Interaction,
-                     _server: app_commands.Transform[Server, utils.ServerTransformer(
-                         status=[Status.RUNNING, Status.PAUSED])],
-                     idx: int):
+    async def export(
+            self,
+            interaction: discord.Interaction,
+            _server: app_commands.Transform[Server, utils.ServerTransformer(status=[Status.RUNNING, Status.PAUSED])],
+            coalition: Coalition,
+            idx: int
+    ):
         if _server.status not in [Status.RUNNING, Status.PAUSED]:
             await interaction.response.send_message(_("Server {} is not running.").format(_server.display_name),
                                                     ephemeral=True)
@@ -1826,9 +1861,11 @@ class Mission(Plugin[MissionEventListener]):
                    ):
         ephemeral = utils.get_ephemeral(interaction)
         await interaction.response.defer(ephemeral=ephemeral)
-        _member = DataObjectFactory().new(Member, name=member.name, node=self.node, member=member)
+        _member = cast(Member, await DataObjectFactory().new(
+            Member, name=member.name, node=self.node, member=member).prep())
         if isinstance(user, discord.Member):
-            _new_member = DataObjectFactory().new(Member, name=user.name, node=self.node, member=user)
+            _new_member = cast(Member, await DataObjectFactory().new(
+                Member, name=user.name, node=self.node, member=user).prep())
             ucid = _new_member.ucid
             if ucid == _member.ucid:
                 if _member.verified:
@@ -1872,8 +1909,7 @@ class Mission(Plugin[MissionEventListener]):
         for server_name, server in self.bot.servers.items():
             player = server.get_player(ucid=ucid)
             if player:
-                player.member = self.bot.get_member_by_ucid(player.ucid)
-                player.verified = True
+                await player.prep()
                 break
         else:
             server = None
@@ -1940,7 +1976,7 @@ class Mission(Plugin[MissionEventListener]):
                     await unlink_member(user, ucid)
             elif utils.is_ucid(user):
                 ucid = user
-                member = self.bot.get_member_by_ucid(ucid)
+                member = await self.bot.get_member_by_ucid(ucid)
                 if not member:
                     await interaction.followup.send(_('Player is not linked!'), ephemeral=True)
                     return
@@ -2010,7 +2046,7 @@ class Mission(Plugin[MissionEventListener]):
             await interaction.response.defer(ephemeral=ephemeral)
         if isinstance(member, str):
             ucid = member
-            member = self.bot.get_member_by_ucid(ucid)
+            member = await self.bot.get_member_by_ucid(ucid)
         player: Player | None = None
         for server in self.bot.servers.values():
             if isinstance(member, discord.Member):
@@ -2041,7 +2077,7 @@ class Mission(Plugin[MissionEventListener]):
                           player: app_commands.Transform[Player, utils.PlayerTransformer(active=True)]):
         report = Report(self.bot, 'mission', 'player-info.json')
         env = await report.render(player=player)
-        await interaction.response.send_message(embed=env.embed, ephemeral=utils.get_ephemeral(interaction))
+        await interaction.response.send_message(embed=env.embed, ephemeral=True)
 
     @command(description=_('Shows player information'))
     @utils.app_has_role('DCS Admin')
@@ -2079,7 +2115,7 @@ class Mission(Plugin[MissionEventListener]):
                     WHERE discord_id = -1 AND name IS NOT NULL 
                     ORDER BY last_seen DESC
                 """):
-                    matched_member = self.bot.match_user(dict(row), True)
+                    matched_member = await self.bot.match_user(dict(row), True)
                     if matched_member:
                         unmatched.append({"name": row['name'], "ucid": row['ucid'], "match": matched_member})
             if len(unmatched) == 0:
@@ -2132,7 +2168,7 @@ class Mission(Plugin[MissionEventListener]):
                         ORDER BY last_seen DESC
                     """, (member.id, ))
                     async for row in cursor:
-                        matched_member = self.bot.match_user(dict(row), True)
+                        matched_member = await self.bot.match_user(dict(row), True)
                         if not matched_member:
                             suspicious.append({"name": row['name'], "ucid": row['ucid'], "mismatch": member})
                         elif matched_member.id != member.id:
@@ -2178,7 +2214,7 @@ class Mission(Plugin[MissionEventListener]):
                 ephemeral=True)
 
         await interaction.response.defer(ephemeral=True)
-        member = DataObjectFactory().new(Member, name=interaction.user.name, node=self.node, member=interaction.user)
+        member = await DataObjectFactory().new(Member, name=interaction.user.name, node=self.node, member=interaction.user).prep()
         if member.ucid and not utils.is_ucid(member.ucid):
             await send_token(member.ucid)
             return
@@ -2187,7 +2223,7 @@ class Mission(Plugin[MissionEventListener]):
                                            _("You already have a verified DCS account!\n"
                                              "Are you sure you want to re-link your account? "
                                              "(Ex: Switched from Steam to Standalone)"), ephemeral=True):
-                await interaction.followup.send(_('Aborted.'))
+                await interaction.followup.send(_('Aborted.'), ephemeral=True)
                 return
             member.unlink()
 
@@ -2427,6 +2463,7 @@ class Mission(Plugin[MissionEventListener]):
             try:
                 channel_id = server.channels.get(Channel.STATUS, -1)
                 if channel_id == -1:
+                    self.log.warning(f"No status channel set for server {server.name}")
                     continue
                 channel = self.bot.get_channel(channel_id)
                 if not channel:
@@ -2435,6 +2472,7 @@ class Mission(Plugin[MissionEventListener]):
                 if not channel.permissions_for(self.bot.member).manage_channels:
                     return
                 if channel.type in [discord.ChannelType.forum, discord.ChannelType.public_thread]:
+                    self.log.debug(f"Channel name could not be updated, wrong channel type: {channel.type.name}")
                     continue
 # TODO: Alternative implementation, if Discord decides to no longer use system messages for a thread rename
 #                    for thread in channel.threads:
@@ -2826,7 +2864,7 @@ class Mission(Plugin[MissionEventListener]):
             await interaction.response.edit_message(view=None)
             await interaction.message.add_reaction('✅')
 
-        elif custom_id.startswith('ban_'):
+        elif custom_id.startswith('ban_profanity_') or custom_id.startswith('ban_evade_'):
             config = self.get_config()
             if custom_id.startswith('ban_profanity_'):
                 ucid = custom_id[len('ban_profanity_'):]

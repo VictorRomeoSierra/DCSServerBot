@@ -13,6 +13,7 @@ from discord.utils import MISSING
 from psycopg.errors import UniqueViolation
 from psycopg.rows import dict_row
 from services.bot import DCSServerBot
+from typing import cast
 
 from .filter import StatisticsFilter, PeriodFilter, CampaignFilter, MissionFilter, PeriodTransformer, SquadronFilter, \
     TheatreFilter
@@ -53,9 +54,9 @@ class UserStatistics(Plugin[UserStatisticsEventListener]):
 
     async def cog_load(self) -> None:
         await super().cog_load()
+        utils.safe_start(self.refresh_views)
         if self.locals:
             utils.safe_start(self.persistent_highscore)
-            utils.safe_start(self.refresh_views)
             self.refresh_views.add_exception_type(psycopg.DatabaseError)
             if not self.locals.get(DEFAULT_TAG, {}).get('squadrons', {}).get('self_join', True):
                 super().change_commands({
@@ -67,8 +68,8 @@ class UserStatistics(Plugin[UserStatisticsEventListener]):
 
     async def cog_unload(self):
         if self.locals:
-            await utils.safe_cancel(self.refresh_views)
             await utils.safe_cancel(self.persistent_highscore)
+        await utils.safe_cancel(self.refresh_views)
         await super().cog_unload()
 
     async def migrate(self, new_version: str, conn: psycopg.AsyncConnection | None = None) -> None:
@@ -251,7 +252,11 @@ class UserStatistics(Plugin[UserStatisticsEventListener]):
         embed = discord.Embed(title=_('Info about Squadron {}').format(row['name']),
                               description=row['description'])
         if row['role']:
-            embed.add_field(name="Role", value=self.bot.get_role(row['role']).name)
+            role = self.bot.get_role(row['role'])
+            if role:
+                embed.add_field(name="Role", value=role.name)
+            else:
+                self.log.error(f"Role {row['role']} not found in your Discord!")
         await interaction.response.send_message(embed=embed)
 
     @squadron.command(description='Edit a squadron')
@@ -300,15 +305,19 @@ class UserStatistics(Plugin[UserStatisticsEventListener]):
             cursor = await conn.execute("SELECT role FROM squadrons WHERE id = %s", (squadron_id,))
             role = (await cursor.fetchone())[0]
             if isinstance(user, str):
-                member = self.bot.get_member_by_ucid(ucid=user, verified=True)
+                member = await self.bot.get_member_by_ucid(ucid=user, verified=True)
                 ucid = user
-            else:
+            elif user:
                 member = user
                 ucid = await self.bot.get_ucid_by_member(member, verified=True)
                 if not ucid:
                     await interaction.followup.send(
                         f"Member {member.mention} needs to be linked to join this squadron!", ephemeral=True)
                     return
+            else:
+                await interaction.followup.send(_("You need to provide an existing user."), ephemeral=True)
+                return
+
             if not member:
                 prefix = f"User {ucid}"
             else:
@@ -391,7 +400,7 @@ class UserStatistics(Plugin[UserStatisticsEventListener]):
         async with interaction.client.apool.connection() as conn:
             async for row in await conn.execute(sql, {"squadron_id": squadron_id, "user": user}):
                 if row[1]:
-                    member = self.bot.get_member_by_ucid(row[0], verified=True)
+                    member = await self.bot.get_member_by_ucid(row[0], verified=True)
                     role = self.bot.get_role(row[1])
                     if member:
                         try:
@@ -525,8 +534,8 @@ class UserStatistics(Plugin[UserStatisticsEventListener]):
                 WHERE (now() AT TIME ZONE 'utc') BETWEEN c.start AND COALESCE(c.stop, now() AT TIME ZONE 'utc') 
             """, (squadron_id,)):
                 squadron = utils.get_squadron(node=self.node, squadron_id=squadron_id)
-                squadron_obj = DataObjectFactory().new(Squadron, node=self.node, name=squadron['name'],
-                                                       campaign_id=row[0])
+                squadron_obj = await DataObjectFactory().new(Squadron, node=self.node, name=squadron['name'],
+                                                               campaign_id=row[0]).prep()
                 ret.append({"id": row[0], "name": row[1], "points": squadron_obj.points})
         return ret
 
@@ -587,15 +596,16 @@ class UserStatistics(Plugin[UserStatisticsEventListener]):
     async def donate(self, interaction: discord.Interaction, squadron_id: int, points: int,
                      server: app_commands.Transform[Server, utils.ServerTransformer] | None = None):
         await interaction.response.defer()
-        campaign_id, name = utils.get_running_campaign(self.node, server)
+        campaign_id, name = await utils.get_running_campaign_async(self.node, server)
         if not campaign_id:
             await interaction.followup.send(_("You don't have an active campaign."), ephemeral=True)
             return
         squadron = utils.get_squadron(self.node, squadron_id=squadron_id)
-        squadron_obj = DataObjectFactory().new(Squadron, node=self.node, name=squadron['name'],
-                                               campaign_id=campaign_id)
+        squadron_obj = cast(Squadron, await DataObjectFactory().new(
+            Squadron, node=self.node, name=squadron['name'], campaign_id=campaign_id).prep()
+        )
         squadron_obj.points += points
-        squadron_obj.audit(event='Admin donate', points=points, remark='')
+        await squadron_obj.audit(event='Admin donate', points=points, remark='')
         await interaction.followup.send(_("{} points donated to squadron {}.").format(points, squadron['name']),
                                         ephemeral=utils.get_ephemeral(interaction))
 

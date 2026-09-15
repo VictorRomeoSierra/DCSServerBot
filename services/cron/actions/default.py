@@ -87,12 +87,12 @@ async def cmd(node: Node, cmd: str):
         node.log.info(out)
 
 
-async def popup(node: Node, server: Server, message: str, to: str | None = 'all', timeout: int | None = 10):
+async def popup(_node: Node, server: Server, message: str, to: str | None = 'all', timeout: int | None = 10):
     if server.status == Status.RUNNING:
         await server.sendPopupMessage(Coalition(to), message, timeout)
 
 
-async def broadcast(node: Node, message: str, to: str | None = 'all', timeout: int | None = 10):
+async def broadcast(_node: Node, message: str, to: str | None = 'all', timeout: int | None = 10):
     bus = ServiceRegistry.get(ServiceBus)
     for server in [x for x in bus.servers.values() if x.status == Status.RUNNING]:
         await server.sendPopupMessage(Coalition(to), message, timeout)
@@ -136,10 +136,11 @@ async def purge_channel(node: Node, channel: int | list[int], older_than: int = 
                 after = None
             deleted_messages = await channel.purge(limit=None, after=after, before=before, check=check, bulk=True)
             node.log.debug(f"Purged {len(deleted_messages)} messages from channel {channel.name}.")
-        except discord.NotFound:
-            node.log.error(f"Cron: Can't delete messages in channel {channel.name}: Not found")
         except discord.Forbidden:
             node.log.error(f"Cron: Can't delete messages in channel {channel.name}: Missing permissions")
+            raise
+        except discord.NotFound:
+            node.log.error(f"Cron: Can't delete message in channel {channel.name}: Not found")
         except discord.HTTPException:
             node.log.error(f"Cron: Failed to delete message in channel {channel.name}", exc_info=True)
 

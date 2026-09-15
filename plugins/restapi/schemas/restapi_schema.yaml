@@ -1,3 +1,50 @@
+schema;auth:
+  type: map
+  nullable: false
+  mapping:
+    api_key: {type: text, nullable: false}
+    jwt:
+      type: map
+      nullable: false
+      mapping:
+        key: {type: text, nullable: false}
+        jwks_url: {type: url, nullable: false}
+
+schema;security:
+  type: map
+  nullable: false
+  mapping:
+    trusted:
+      type: seq
+      nullable: false
+      sequence:
+        - {type: str, nullable: false, unique: true, range: {min: 1}}
+    default:
+      type: map
+      nullable: false
+      mapping:
+        local: {type: str, nullable: false, enum: ['none', 'api_key', 'jwt', 'disabled']}
+        trusted: {type: str, nullable: false, enum: ['none', 'api_key', 'jwt', 'disabled']}
+        remote: {type: str, nullable: false, enum: ['none', 'api_key', 'jwt', 'disabled']}
+
+schema;endpoint:
+  type: map
+  nullable: false
+  mapping:
+    regex;(.+):
+      type: map
+      nullable: false
+      allowempty: true
+      mapping:
+        enabled: { type: bool, nullable: false, default: true }
+        security:
+          type: map
+          nullable: false
+          mapping:
+            local: {type: str, nullable: false, enum: ['none', 'api_key', 'jwt', 'disabled']}
+            trusted: {type: str, nullable: false, enum: ['none', 'api_key', 'jwt', 'disabled']}
+            remote: {type: str, nullable: false, enum: ['none', 'api_key', 'jwt', 'disabled']}
+
 type: map
 nullable: false
 mapping:
@@ -6,7 +53,10 @@ mapping:
     nullable: false
     mapping:
       prefix: {type: str, nullable: false}
-      api_key: {type: text, nullable: false}
+      auth:
+        include: 'auth'
+      security:
+        include: 'security'
       alerting:
         type: map
         nullable: false
@@ -22,26 +72,4 @@ mapping:
               - {type: str, nullable: false}
           enrichment_timeout_secs: {type: number, nullable: false}
       endpoints:
-        type: map
-        nullable: false
-        mapping:
-          servers:
-            type: map
-            nullable: false
-            mapping:
-              filter:
-                type: seq
-                nullable: false
-                func: is_server
-                sequence:
-                  - type: str
-                    nullable: false
-                    unique: true
-              include_weather: {type: bool, nullable: false, default: true}
-          server_attendance:
-            type: map
-            nullable: true
-            mapping:
-              enabled: {type: bool, nullable: false, default: true}
-          regex;(.+):
-            type: any
+        include: 'endpoint'

@@ -66,6 +66,7 @@ class ServiceBus(Service):
         self.intercom_channel = PubSub(self.node, 'intercom', cpool_url, self.handle_rpc)
         self.broadcasts_channel = PubSub(self.node, 'broadcasts', lpool_url, self.handle_broadcast_event)
         self._lock = asyncio.Lock()
+        self._registering_nodes: set[str] = set()
 
     async def start(self):
         await super().start()
@@ -104,6 +105,9 @@ class ServiceBus(Service):
     async def switch(self, master: bool):
         await super().switch(master)
         if master:
+            if master and not self.master:
+                await self.intercom_channel.purge()
+                await self.broadcasts_channel.purge()
             asyncio.create_task(self.register_local_servers(master))
             for node in await self.node.get_active_nodes():
                 await self.send_to_node({
@@ -122,10 +126,33 @@ class ServiceBus(Service):
                 if not row:
                     self.log.warning("No master available, can't register.")
                     return
-                master = row[0]
+                master_node = row[0]
 
-            if master not in await self.node.get_active_nodes():
-                self.log.debug(f"Master node {master} is not active (yet), waiting ...")
+            # Retry loop: master might not yet be in active_nodes
+            # if it's busy with slow startup (DB migrations, etc.)
+            max_retries = 10
+            delay = 2
+            for attempt in range(max_retries):
+                # Abort if we became master ourselves during retry
+                if self.node.claimed_master:
+                    self.log.debug("This node is now master, aborting agent registration.")
+                    return
+                # Abort on shutdown
+                if self.node.is_shutdown.is_set():
+                    return
+
+                if master_node in await self.node.get_active_nodes():
+                    break  # master is ready, proceed
+
+                self.log.debug(f"Master node {master_node} is not active yet "
+                               f"(attempt {attempt + 1}/{max_retries}), retrying in {delay}s ...")
+
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 30)
+            else:
+                # loop exited without break — exhausted retries
+                self.log.warning(f"Master node {master_node} never became active "
+                                 f"after {max_retries} retries, giving up.")
                 return
 
             await self.send_to_node({
@@ -238,7 +265,8 @@ class ServiceBus(Service):
                 "node": self.node.name,
                 "dcs_port": int(server.instance.dcs_port),
                 "webgui_port": int(server.instance.webgui_port),
-                "maintenance": server.maintenance
+                "maintenance": server.maintenance,
+                "config": server.locals
             }
         }, timeout=timeout)
 
@@ -255,10 +283,6 @@ class ServiceBus(Service):
         await self.bot.wait_until_ready()
 
     async def register_local_servers(self, master: bool):
-        # we only run once
-        if self._lock.locked():
-            return
-
         # wait for the bot service to be started
         if master:
             await self._wait_for_bot()
@@ -293,7 +317,7 @@ class ServiceBus(Service):
             for i, name in enumerate(calls.keys()):
                 server = self.servers[name]
                 if isinstance(ret[i], TimeoutError) or isinstance(ret[i], asyncio.TimeoutError):
-                    self.log.debug(f'  => Timeout while trying to contact DCS server "{server.name}".')
+                    self.log.warning(f'  => Timeout while trying to contact DCS server "{server.name}".')
                     server.status = Status.SHUTDOWN
                     self.log.info(f"  => Local DCS-Server \"{server.name}\" registered as DOWN (not responding).")
                     num += 1
@@ -325,36 +349,50 @@ class ServiceBus(Service):
 
     async def register_remote_node(self, name: str, public_ip: str, dcs_version: str):
         from core import NodeProxy
-        from ..bot.service import BotService
+        from services.bot import BotService
 
         # in case of a race condition during master takeovers, ignore this registration
         if name == self.node.name:
             return
 
-#        if self.node.all_nodes.get(name):
-#            self.log.debug(f"Node {name} already registered, skipping registration request.")
-#            return
-
-        node = NodeProxy(self.node, name, public_ip, dcs_version)
-        if not await node.is_alive(self.node.config.get('cluster', {}).get('heartbeat', 30)):
-            self.log.warning(f"Node {name} is not alive (anymore). Skipping registration request.")
+        if name in self._registering_nodes:
+            self.log.debug(f"Registration for node {name} already in progress, skipping duplicate request.")
             return
 
-        self.log.info(f"- Registering remote node {name} ...")
-        # we did not find a configuration for this node, load it from remote
-        if not node.locals:
-            node.locals = await node.get_config()
-            if not node.locals:
-                self.log.warning(f'No configuration found for node "{node.name}" in nodes.yaml!')
+        existing_node = self.node.all_nodes.get(name)
+        has_servers = any(s.node.name == name for s in self.servers.values() if s.is_remote)
+        if existing_node and has_servers and await existing_node.is_alive():
+            # The node re-announced itself => it was restarted. Our node/server state for it
+            # is stale, so the handshake must be completed again (server init + status resync).
+            # Never swallow an explicit registration request.
+            self.log.info(f"Node {name} re-requested registration, re-sending the handshake.")
+            await self.register_remote_servers(existing_node)
+            return
 
-        self.node.all_nodes[node.name] = node
-        while not self.bot:
-            await asyncio.sleep(1)
-            service = ServiceRegistry.get(BotService)
-            if service:
-                self.bot = ServiceRegistry.get(BotService).bot
-        await self.bot.wait_until_ready()
-        await self.register_remote_servers(node)
+        self._registering_nodes.add(name)
+        try:
+            node = NodeProxy(self.node, name, public_ip, dcs_version)
+            if not await node.is_alive(self.node.config.get('cluster', {}).get('heartbeat', 30)):
+                self.log.warning(f"Node {name} is not alive (anymore). Skipping registration request.")
+                return
+
+            self.log.info(f"- Registering remote node {name} ...")
+            # we did not find a configuration for this node, load it from remote
+            if not node.locals:
+                node.locals = await node.get_config()
+                if not node.locals:
+                    self.log.warning(f'No configuration found for node "{node.name}" in nodes.yaml!')
+
+            self.node.all_nodes[node.name] = node
+            while not self.bot:
+                await asyncio.sleep(1)
+                service = ServiceRegistry.get(BotService)
+                if service:
+                    self.bot = ServiceRegistry.get(BotService).bot
+            await self.bot.wait_until_ready()
+            await self.register_remote_servers(node)
+        finally:
+            self._registering_nodes.discard(name)
 
     async def unregister_remote_node(self, node: Node):
         # unregister event for a non-registered node received or for myself in case of a race condition, ignoring
@@ -447,6 +485,7 @@ class ServiceBus(Service):
 
         # update the database and check for server name changes
         self.log.debug(f'  => Checking the database for server {server_name} ...')
+        _server_name: str | None = None
         async with self.apool.connection() as conn:
             cursor = await conn.execute("""
                 SELECT server_name 
@@ -455,14 +494,15 @@ class ServiceBus(Service):
             """, (self.node.name, data['port']))
             if cursor.rowcount == 1:
                 _server_name = (await cursor.fetchone())[0]
-                if _server_name != server_name:
-                    if utils.findDCSInstances(_server_name) and not self.servers.get(_server_name):
-                        self.log.info(f'Auto-renaming server "{_server_name}" to "{server_name}"')
-                        await server.rename(server_name)
-                    else:
-                        self.log.warning(f'Registration of server "{server_name}" aborted due to conflict.')
-                        self.servers.pop(server_name, None)
-                        return False
+
+        if _server_name and _server_name != server_name:
+            if utils.findDCSInstances(_server_name) and not self.servers.get(_server_name):
+                self.log.info(f'Auto-renaming server "{_server_name}" to "{server_name}"')
+                await server.rename(server_name)
+            else:
+                self.log.warning(f'Registration of server "{server_name}" aborted due to conflict.')
+                self.servers.pop(server_name, None)
+                return False
         self.log.debug(f'  => Database for server {server_name} checked.')
         return True
 
@@ -490,32 +530,35 @@ class ServiceBus(Service):
                 SET banned_by = excluded.banned_by, reason = excluded.reason, 
                     banned_at = excluded.banned_at, banned_until = excluded.banned_until
             """, (ucid, banned_by, reason, until.replace(tzinfo=None)))
-        for server in self.servers.values():
-            if server.status not in [Status.PAUSED, Status.RUNNING, Status.STOPPED]:
-                continue
-            await server.send_to_dcs({
-                "command": "ban",
-                "ucid": ucid,
-                "reason": reason,
-                "banned_until": until_str
-            })
-            player = server.get_player(ucid=ucid)
-            if player:
-                player.banned = True
+        asyncio.create_task(self.send_to_node({
+            "command": "rpc",
+            "service": "ServiceBus",
+            "method": "propagate_event",
+            "params": {
+                "command": "onPlayerBanned",
+                "data": {
+                    "ucid": ucid,
+                    "reason": reason,
+                    "banned_at": datetime.now(tz=timezone.utc).isoformat(),
+                    "banned_until": until_str
+                }
+            }
+        }))
 
     async def unban(self, ucid: str):
         async with self.apool.connection() as conn:
             await conn.execute("UPDATE bans SET banned_until = NOW() AT TIME ZONE 'UTC' WHERE ucid = %s", (ucid, ))
-        for server in self.servers.values():
-            if server.status not in [Status.PAUSED, Status.RUNNING, Status.STOPPED]:
-                continue
-            await server.send_to_dcs({
-                "command": "unban",
-                "ucid": ucid
-            })
-            player = server.get_player(ucid=ucid)
-            if player:
-                player.banned = False
+        asyncio.create_task(self.send_to_node({
+            "command": "rpc",
+            "service": "ServiceBus",
+            "method": "propagate_event",
+            "params": {
+                "command": "onPlayerUnbanned",
+                "data": {
+                    "ucid": ucid
+                }
+            }
+        }))
 
     async def bans(self, *, expired: bool = False) -> list[dict]:
         if expired:
@@ -542,7 +585,7 @@ class ServiceBus(Service):
 
     async def init_remote_server(self, server_name: str, status: str, instance: str, home: str,
                                  settings: dict, options: dict, node: Node | str, channels: dict, dcs_port: int,
-                                 webgui_port: int, maintenance: bool) -> None:
+                                 webgui_port: int, maintenance: bool, config: dict) -> None:
         from core import InstanceProxy
 
         # init event for an unregistered remote node received or a race condition due to master switches, ignoring
@@ -558,7 +601,7 @@ class ServiceBus(Service):
                     bus=self
                 )
                 if not server.locals:
-                    server.locals = await server.get_config()
+                    server.locals = config
                     if not server.locals:
                         self.log.warning(f'No configuration found for server "{server.name}" in servers.yaml!')
 
@@ -849,11 +892,16 @@ class ServiceBus(Service):
         return None
 
     async def propagate_event(self, command: str, data: dict, server: Server | None = None):
-        tasks = [
-            asyncio.create_task(listener.processEvent(command, server, deepcopy(data)))
-            for listener in self.eventListeners
-            if listener.has_event(command)
-        ]
+        listeners_to_check = [l for l in self.eventListeners if l.has_event(command)]
+        tasks = []
+        for i, listener in enumerate(listeners_to_check):
+            # We use a thread to deepcopy to avoid blocking the event loop for large messages
+            if i < len(listeners_to_check) - 1:
+                payload = await asyncio.to_thread(deepcopy, data)
+            else:
+                payload = data
+            tasks.append(asyncio.create_task(listener.processEvent(command, server, payload)))
+
         await asyncio.gather(*tasks, return_exceptions=True)
 
     async def start_udp_listener(self):
@@ -1065,22 +1113,44 @@ class ServiceBus(Service):
 
                             if self.master:
                                 tasks = []
-                                for listener in self.eventListeners:
-                                    if listener.has_event(command):
-                                        task = asyncio.create_task(
-                                            listener.processEvent(command, server, deepcopy(data))
-                                        )
-                                        tasks.append(task)
+                                listeners_to_check = [l for l in self.eventListeners if l.has_event(command)]
+                                for i, listener in enumerate(listeners_to_check):
+                                    # We use a thread to deepcopy to avoid blocking the event loop for large messages
+                                    if i < len(listeners_to_check) - 1:
+                                        payload = await asyncio.to_thread(deepcopy, data)
+                                    else:
+                                        payload = data
+                                    task = asyncio.create_task(
+                                        listener.processEvent(command, server, payload),
+                                        name=f"{listener.plugin_name}:{command}"
+                                    )
+                                    tasks.append(task)
 
                                 if tasks:
                                     try:
-                                        results = await asyncio.gather(*tasks, return_exceptions=True)
-                                        for listener, result in zip(self.eventListeners, results):
-                                            if isinstance(result, Exception):
+                                        # We use a timeout to detect hangs.
+                                        done, pending = await asyncio.wait(tasks, timeout=60.0)
+
+                                        if pending:
+                                            for task in pending:
                                                 self.log.error(
-                                                    f"Exception in listener {listener.plugin_name}: {result!r}")
+                                                    f"HANG DETECTED: Task {task.get_name()} for server {server.name} timed out!")
+                                                task.cancel()  # Optional: cancel to avoid memory leaks
+
+                                        for task in done:
+                                            # Find which listener this task belonged to
+                                            plugin_name = task.get_name().split(':')[0]
+                                            try:
+                                                result = task.result()
+                                                if isinstance(result, Exception):
+                                                    self.log.error(f"Exception in listener {plugin_name}: {result!r}")
+                                            except asyncio.CancelledError:
+                                                pass
+                                            except Exception as e:
+                                                self.log.error(f"Exception in listener {plugin_name}: {e!r}")
+
                                     except Exception as e:
-                                        self.log.error(f"Catastrophic error in gather: {e!r}")
+                                        self.log.error(f"Catastrophic error in wait: {e!r}")
                             else:
                                 await self.send_to_node(data)
 

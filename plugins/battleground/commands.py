@@ -1,8 +1,7 @@
 import discord
 
-from core import Plugin, utils, Channel, Coalition, Server, get_translation
+from core import Plugin, utils, Channel, Coalition, Server, get_translation, Group
 from discord import app_commands
-from discord.app_commands import Group
 from services.bot import DCSServerBot
 
 _ = get_translation(__name__.split('.')[1])
@@ -58,8 +57,7 @@ class Battleground(Plugin):
     async def reset(self, interaction: discord.Interaction,
                     server: app_commands.Transform[Server, utils.ServerTransformer]):
         async with self.apool.connection() as conn:
-            async with conn.transation():
-                await conn.execute("DELETE FROM bg_geometry WHERE server = %s", (server.name, ))
+            await conn.execute("DELETE FROM bg_geometry WHERE server = %s", (server.name, ))
         # noinspection PyUnresolvedReferences
         await interaction.response.send_message(_("Recon data deleted for server {}.").format(server.name),
                                                 ephemeral=True)

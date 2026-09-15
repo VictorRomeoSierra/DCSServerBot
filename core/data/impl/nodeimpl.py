@@ -41,7 +41,7 @@ from psycopg import sql
 from psycopg.errors import ConnectionTimeout, UniqueViolation, UndefinedTable, UndefinedColumn
 from psycopg.types.json import Json
 from psycopg_pool import ConnectionPool, AsyncConnectionPool
-from typing import Awaitable, Callable, Any
+from typing import Awaitable, Callable, Any, cast
 from typing_extensions import override
 from urllib.parse import urlparse, quote, unquote
 from version import __version__
@@ -118,6 +118,7 @@ class NodeImpl(Node):
         self.cpool: AsyncConnectionPool | None = None
         self._heartbeat_conn: psycopg.AsyncConnection | None = None
         self._master = None
+        self._ready = False
         self._claimed_master =None
 
     @property
@@ -162,7 +163,7 @@ class NodeImpl(Node):
             await self.get_dcs_branch_and_version()
         await self.init_db()
         # Do we have a cluster?
-        if len(self.all_nodes) > 1:
+        if len(self.all_nodes) > 1 or self.is_federation():
             self._claimed_master = await self.heartbeat()
             if self.is_shutdown.is_set():
                 return
@@ -458,6 +459,9 @@ class NodeImpl(Node):
 
         self.log.debug("- Database pools initialized.")
 
+    def is_federation(self):
+        return self.apool != self.cpool
+
     async def close_db(self):
         if self._heartbeat_conn and not self._heartbeat_conn.closed:
             try:
@@ -482,7 +486,7 @@ class NodeImpl(Node):
 
     async def init_instances(self):
         grouped = defaultdict(list)
-        for server_name, instance_name in utils.findDCSInstances():
+        for instance_name, server_name in utils.findDCSInstances().items():
             if instance_name in self.locals.get('instances', []):
                 grouped[server_name].append(instance_name)
         duplicates = {
@@ -1061,7 +1065,7 @@ class NodeImpl(Node):
     async def register(self):
         self._public_ip = self.locals.get('public_ip')
         if not self._public_ip:
-            self._public_ip = await utils.get_public_ip(self)
+            self._public_ip = await utils.get_public_ip()
             self.log.info(f"- Public IP registered as: {self.public_ip}")
         if 'DCS' in self.locals:
             if self.locals['DCS'].get('autoupdate', False):
@@ -1201,13 +1205,22 @@ class NodeImpl(Node):
 
             active_nodes = set(await self.get_active_nodes())
             all_nodes = set(self.all_nodes.keys())
+            ready_nodes = await self.get_ready_nodes()
+            bus = cast(ServiceBus, ServiceRegistry.get(ServiceBus))
+            bot = cast(BotService, ServiceRegistry.get(BotService))
 
             # check if suspect nodes came back again
-            for node_name in {name: self.suspect[name] for name in active_nodes if name in self.suspect}:
+            for node_name in {name: self.suspect[name] for name in ready_nodes if name in self.suspect}:
                 node = self.suspect.pop(node_name)
                 self.all_nodes[node.name] = node
                 self.log.info(f"Node {node.name} is alive again, asking for registration ...")
-                await ServiceRegistry.get(ServiceBus).register_remote_servers(node)
+                await bus.register_remote_servers(node)
+                await bot.alert(
+                    title=_("Node {node} is back up!").format(node=node.name),
+                    message=_("Node {node} was re-added to the cluster.").format(node=node.name),
+                    mention=False,
+                    warn=False
+                )
 
             # remove nodes that are no longer active
             for node_name in all_nodes - active_nodes:
@@ -1219,8 +1232,8 @@ class NodeImpl(Node):
                 if not node:
                     continue
                 self.log.error(f"Node {node.name} is not responding.")
-                await ServiceRegistry.get(ServiceBus).unregister_remote_node(node)
-                await ServiceRegistry.get(BotService).alert(
+                await bus.unregister_remote_node(node)
+                await bot.alert(
                     title=_("Node {node} is not responding").format(node=node.name),
                     message=_("Node {node} was unregistered from the cluster.").format(node=node.name)
                 )
@@ -1345,15 +1358,20 @@ class NodeImpl(Node):
                 finally:
                     if (not cancelled and not self.node.is_shutdown.is_set()
                             and self.cpool is not None and not self.cpool.closed):
-                        async with self.cpool.connection() as conn2:
-                            await conn2.execute("""
-                                INSERT INTO nodes (guild_id, node) VALUES (%s, %s) 
-                                ON CONFLICT (guild_id, node) DO UPDATE 
-                                SET last_seen = (NOW() AT TIME ZONE 'UTC')
-                            """, (self.guild_id, self.name))
-        except UndefinedTable:
-            # we should only be here when the CLUSTER table does not exist
-            # it will be created directly afterward
+                        try:
+                            async with self.cpool.connection() as conn2:
+                                await conn2.execute("""
+                                    INSERT INTO nodes (guild_id, node, ready)
+                                    VALUES (%s, %s, %s)
+                                    ON CONFLICT (guild_id, node) DO UPDATE
+                                        SET last_seen = (NOW() AT TIME ZONE 'UTC'),
+                                            ready     = EXCLUDED.ready
+                                """, (self.guild_id, self.name, self._ready))
+                        except Exception:
+                            pass  # inner exception is already propagating
+        except (UndefinedTable, UndefinedColumn):
+            # We should only be here when the CLUSTER table does not exist or needs to be updated.
+            # It will be created directly afterward.
             return True
 
     @tasks.loop(seconds=5.0)
@@ -1372,6 +1390,14 @@ class NodeImpl(Node):
         except FatalException as ex:
             self.log.critical(ex)
             exit(SHUTDOWN)
+        except (psycopg.OperationalError, psycopg.InterfaceError) as ex:
+            self.log.warning(f"Database connection error in heartbeat: {ex}")
+            if self._heartbeat_conn and not self._heartbeat_conn.closed:
+                try:
+                    await self._heartbeat_conn.close()
+                except Exception:
+                    pass
+            self._heartbeat_conn = None
         except Exception as ex:
             self.log.exception(ex)
             await self.restart()
@@ -1386,6 +1412,27 @@ class NodeImpl(Node):
             """).format(interval=sql.Literal(f"{self.locals.get('cluster', {}).get('heartbeat', 30)} seconds"))
             cursor = await conn.execute(query, (self.guild_id, self.name))
             return [row[0] async for row in cursor]
+
+    async def set_ready(self) -> None:
+        """Mark this node as fully started (its services can serve RPCs)."""
+        self._ready = True
+        if self.cpool and not self.cpool.closed:
+            async with self.cpool.connection() as conn:
+                await conn.execute("""
+                    UPDATE nodes SET ready = TRUE WHERE guild_id = %s AND node = %s
+                """, (self.guild_id, self.name))
+
+    async def get_ready_nodes(self) -> set[str]:
+        async with self.cpool.connection() as conn:
+            query = sql.SQL("""
+                SELECT node FROM nodes 
+                WHERE guild_id = %s
+                AND node <> %s
+                AND ready = TRUE
+                AND last_seen > (NOW() AT TIME ZONE 'UTC' - interval {interval})
+            """).format(interval=sql.Literal(f"{self.locals.get('cluster', {}).get('heartbeat', 30)} seconds"))
+            cursor = await conn.execute(query, (self.guild_id, self.name))
+            return {row[0] async for row in cursor}
 
     @override
     async def shell_command(self, cmd: str, timeout: int = 60) -> tuple[str, str] | None:
@@ -1428,33 +1475,56 @@ class NodeImpl(Node):
                 return (await cursor.fetchone())[0]
 
     @override
-    async def write_file(self, filename: str, url: str, overwrite: bool = False) -> UploadStatus:
-        if os.path.exists(filename) and not overwrite:
+    async def write_file(self, target: str, source: str | int, overwrite: bool = False) -> UploadStatus:
+        if os.path.exists(target) and not overwrite:
             return UploadStatus.FILE_EXISTS
 
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, proxy=self.proxy, proxy_auth=self.proxy_auth) as response:
-                if response.status == 200:
-                    try:
-                        # make sure the directory exists
-                        os.makedirs(os.path.dirname(filename), exist_ok=True)
-                        async with aiofiles.open(filename, mode='wb') as outfile:
-                            await outfile.write(await response.read())
-                            return UploadStatus.OK
-                    except Exception as ex:
-                        self.log.error(ex)
-                        return UploadStatus.WRITE_ERROR
-                else:
-                    return UploadStatus.READ_ERROR
+        if isinstance(source, str):
+            if source.startswith('http'):
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(source, proxy=self.proxy, proxy_auth=self.proxy_auth) as response:
+                        if response.status == 200:
+                            try:
+                                # make sure the directory exists
+                                os.makedirs(os.path.dirname(target), exist_ok=True)
+                                async with aiofiles.open(target, mode='wb') as outfile:
+                                    await outfile.write(await response.read())
+                                    return UploadStatus.OK
+                            except Exception as ex:
+                                self.log.error(ex)
+                                return UploadStatus.WRITE_ERROR
+                        else:
+                            return UploadStatus.READ_ERROR
+            elif self.node.master:
+                try:
+                    shutil.copy2(source, target)
+                    return UploadStatus.OK
+                except Exception as ex:
+                    self.log.error(ex)
+                    return UploadStatus.WRITE_ERROR
+            else:
+                self.log.warning("Trying to write a file from an Agent to the Master node. This is not supported.")
+                return UploadStatus.WRITE_ERROR
+        else:
+            async with self.apool.connection() as conn:
+                cursor = await conn.execute("SELECT data FROM files WHERE id = %s", (source,), binary=True)
+                data = (await cursor.fetchone())[0]
+                await conn.execute("DELETE FROM files WHERE id = %s", (source,))
+            try:
+                async with aiofiles.open(target, mode='wb') as out:
+                    await out.write(data)
+                return UploadStatus.OK
+            except Exception as ex:
+                self.log.error(ex)
+                return UploadStatus.WRITE_ERROR
 
     @override
     async def list_directory(self, path: str, *, pattern: str | list[str] = '*',
                              order: SortOrder = SortOrder.DATE,
-                             is_dir: bool = False, ignore: list[str] = None, traverse: bool = False
+                             is_dir: bool = False, ignore: list[str] | None = None, traverse: bool = False
                              ) -> tuple[str, list[str]]:
         directory = Path(os.path.expandvars(path))
         ignore = ignore or []
-        ret = []
         sort_key = os.path.getmtime if order == SortOrder.DATE else str
         if isinstance(pattern, str):
             pattern = [pattern]
@@ -1877,7 +1947,7 @@ class NodeImpl(Node):
                 await instance.server.reload()
 
     @override
-    async def find_all_instances(self) -> list[tuple[str, str]]:
+    async def find_all_instances(self) -> dict[str, str]:
         return utils.findDCSInstances()
 
     @override

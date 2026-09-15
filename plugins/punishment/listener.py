@@ -257,7 +257,10 @@ class PunishmentEventListener(EventListener["Punishment"]):
             return
 
         # no penalty configured for this event
-        penalty = next((item for item in config['penalties'] if item['event'] == data['eventName']), None)
+        penalty = next(
+            (item for item in config.get('penalties', []) if item.get('event') == data.get('eventName')),
+            None
+        )
         if not penalty:
             return
 
@@ -518,9 +521,7 @@ class PunishmentEventListener(EventListener["Punishment"]):
         asyncio.create_task(self.bus.send_to_node(s_event.copy()))
 
         initiator = server.get_player(name=s_event.get('initiator', {}).get('name'))
-        self.log.debug(f"_give_kill(): initiator: {initiator}")
         target = server.get_player(name=s_event.get('target', {}).get('name'))
-        self.log.debug(f"_give_kill(): target: {target}")
 
         # remove the pending task if there is one
         if target:
@@ -625,6 +626,7 @@ class PunishmentEventListener(EventListener["Punishment"]):
 
         elif data['eventName'] in ['S_EVENT_SHOT', 'S_EVENT_HIT']:
             initiator = server.get_player(name=data.get('initiator', {}).get('name'))
+            init_name = initiator.name if initiator else 'AI'
             target = server.get_player(name=data.get('target', {}).get('name'))
             # ignore teamkills
             if (
@@ -672,6 +674,7 @@ class PunishmentEventListener(EventListener["Punishment"]):
                                    f"where player {orig_name} was predicted.")
 
             # store the shot with the highest PBK or the latest hit event
+            self.log.debug(f"Punishment: Storing {data['eventName']}: {init_name} -> {target.name}.")
             self.pending_kill[target.ucid] = (now, data.copy())
 
         elif data['eventName'] == 'S_EVENT_LAND':
@@ -703,7 +706,7 @@ class PunishmentEventListener(EventListener["Punishment"]):
             if shot_time == -1 or not s_event:
                 # create a repair window to repair the ejection seat
                 if data['eventName'] == 'S_EVENT_EJECTION':
-                    repair_window = self.get_config(server).get('repair_timeout', 0)
+                    repair_window = self.get_config(server).get('csar_timeout', 0)
                     if repair_window > 0:
                         task = asyncio.create_task(self._repair_window(initiator, repair_window, data['eventName']))
                         self.pending_repair[initiator.ucid] = task

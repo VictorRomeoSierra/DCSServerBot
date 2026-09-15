@@ -238,7 +238,7 @@ class TournamentEventListener(EventListener["Tournament"]):
             cursor = await conn.execute("""
                 SELECT p.name, t.player_ucid FROM tm_players t JOIN players p ON t.player_ucid = p.ucid 
                 WHERE t.tournament_id = %s AND t.ip_hash = %s AND t.player_ucid != %s
-            """, (tournament['id'], utils.hash_ip_addr(player.ipaddr), player.ucid))
+            """, (tournament['tournament_id'], utils.hash_ip_addr(player.ipaddr), player.ucid))
             row = await cursor.fetchone()
             if row:
                 await self.audit(
@@ -250,7 +250,7 @@ class TournamentEventListener(EventListener["Tournament"]):
                 VALUES (%s, %s, %s)
                 ON CONFLICT (tournament_id, player_ucid) DO UPDATE
                     SET ip_hash = EXCLUDED.ip_hash
-            """, (tournament['id'], player.ucid, utils.hash_ip_addr(player.ipaddr)))
+            """, (tournament['tournament_id'], player.ucid, utils.hash_ip_addr(player.ipaddr)))
 
     async def disqualify(self, server: Server, player: Player, reason: str) -> None:
         await server.kick(player, reason)
@@ -278,10 +278,9 @@ class TournamentEventListener(EventListener["Tournament"]):
         if data['eventName'] == 'S_EVENT_BIRTH':
             tournament = self.tournaments[server.name]
             initiator = data['initiator']
-            player = server.get_player(name=initiator['name'])
-
-            # ignore multicrew members
-            if player.sub_slot != 0:
+            player = server.get_player(name=initiator.get('name'))
+            # ignore AI and multicrew members
+            if not player or player.sub_slot != 0:
                 return
 
             # check if we have the necessary number of players
@@ -322,17 +321,17 @@ class TournamentEventListener(EventListener["Tournament"]):
                 await server.kick(player, "All seats are taken, you are not allowed to join anymore!")
 
         elif data['eventName'] == 'S_EVENT_SHOT':
-            initiator = server.get_player(name=data['initiator']['name'])
+            initiator = server.get_player(name=data['initiator'].get('name'))
             target = server.get_player(name=data.get('target', {}).get('name'))
-            if target:
+            if initiator and target:
                 asyncio.create_task(self.inform_streamer(server, _("{} player {} shot an {} at {} player {}").format(
                     initiator.coalition.value.title(), initiator.display_name, data['weapon']['name'],
                     target.coalition.value, target.display_name), coalition=initiator.coalition))
 
         elif data['eventName'] == 'S_EVENT_HIT':
-            initiator = server.get_player(name=data['initiator']['name'])
+            initiator = server.get_player(name=data['initiator'].get('name'))
             target = server.get_player(name=data['target'].get('name'))
-            if target:
+            if initiator and target:
                 asyncio.create_task(self.inform_streamer(server, _("{} player {} hit {} player {}").format(
                     initiator.coalition.value.title(), initiator.display_name, target.coalition.value,
                     target.display_name), coalition=initiator.coalition))
@@ -340,7 +339,7 @@ class TournamentEventListener(EventListener["Tournament"]):
         elif data['eventName'] == 'S_EVENT_PLAYER_LEAVE_UNIT':
             if not data['initiator']:
                 return
-            player = server.get_player(name=data['initiator']['name'])
+            player = server.get_player(name=data['initiator'].get('name'))
             if player:
                 coalition = player.coalition.value.title() if player.coalition else Coalition.NEUTRAL.value.title()
                 asyncio.create_task(self.inform_streamer(server, _("{} player {} is out!").format(
@@ -349,8 +348,8 @@ class TournamentEventListener(EventListener["Tournament"]):
         elif data['eventName'] in ['S_EVENT_UNIT_LOST']:
             config = self.get_config(server)
             pattern = config.get('remove_on_death')
-            initiator = server.get_player(name=data['initiator']['name'])
-            if pattern and re.search(pattern, initiator.unit_name):
+            initiator = server.get_player(name=data['initiator'].get('name'))
+            if initiator and pattern and re.search(pattern, initiator.unit_name):
                 self.log.debug(f"The unit {initiator.unit_name} will be removed from the match.")
                 match_id = await self.get_active_match(server)
                 match = await self.plugin.get_match(match_id)
@@ -433,7 +432,7 @@ class TournamentEventListener(EventListener["Tournament"]):
             asyncio.create_task(self.plugin.render_status_embed(tournament['tournament_id'],
                                                                 phase=TOURNAMENT_PHASE.MATCH_FINISHED))
             message = _("Squadron {squadron} is the winner of the match!").format(squadron=squadron['name'])
-            message += _("\nServer will be shut down in 60 seonds ...")
+            message += _("\nServer will be shut down in 60 seconds ...")
             asyncio.create_task(server.sendPopupMessage(Coalition.ALL, message, 60))
             await asyncio.sleep(60)
             asyncio.create_task(self.cleanup(server))
@@ -478,6 +477,9 @@ class TournamentEventListener(EventListener["Tournament"]):
     async def onMatchFinished(self, server: Server, data: dict) -> None:
         winner = data['winner']
         match_id = await self.get_active_match(server)
+        if not match_id:
+            return
+
         if self.tasks.get(server.name):
             task = self.tasks.pop(server.name)
             task.cancel()
@@ -521,7 +523,7 @@ class TournamentEventListener(EventListener["Tournament"]):
         asyncio.create_task(self.render_aar(server, data))
 
         # check if the match is finished
-        await self.check_match_finished(server, match_id)
+        asyncio.create_task(self.check_match_finished(server, match_id))
 
     async def wait_until_choices_finished(self, server: Server):
         config = self.get_config(server)
@@ -618,6 +620,8 @@ class TournamentEventListener(EventListener["Tournament"]):
         if player.squadron and player.squadron.squadron_id == squadron['id']:
             return
 
+        campaign_id, campaign_name = await utils.get_running_campaign_async(self.node, server)
+        squadron_member = False
         async with self.apool.connection() as conn:
             # Check if the player is a member of the squadron even if it is not linked to them as they might be in
             # more than one squadron
@@ -625,34 +629,33 @@ class TournamentEventListener(EventListener["Tournament"]):
                 SELECT * FROM squadron_members WHERE player_ucid = %s AND squadron_id = %s
             """, (player.ucid, squadron['id']))
             if cursor.rowcount == 1:
-                campaign_id, campaign_name = utils.get_running_campaign(self.node, server)
-                player.squadron = DataObjectFactory().new(Squadron, node=self.node, name=squadron['name'],
-                                                          campaign_id=campaign_id)
-                return
+                squadron_member = True
 
             # else, if auto_join is enabled, make them a member of the squadron
             elif config.get('auto_join', False):
                 await conn.execute("""
                     INSERT INTO squadron_members (squadron_id, player_ucid) VALUES (%s, %s)
                 """, (squadron['id'], player.ucid))
-                campaign_id, campaign_name = utils.get_running_campaign(self.node, server)
-                # assign the squadron to the player
-                player.squadron = DataObjectFactory().new(Squadron, node=self.node, name=squadron['name'],
-                                                          campaign_id=campaign_id)
-                # we need to give the member the role
-                if player.member and 'role' in squadron:
-                    try:
-                        await player.member.add_roles(self.bot.get_role(squadron['role']))
-                    except discord.Forbidden:
-                        await self.bot.audit('permission "Manage Roles" missing.',
-                                             user=self.bot.member)
-            else:
-                asyncio.create_task(server.kick(player, _("You are not a squadron member.\n"
-                                                          "Please ask your squadron leader to add you.")))
-                asyncio.create_task(self.audit(server,
-                                               f"Unregistered player {player.name} ({player.ucid}) "
-                                               f"tried to join the running match on the {side} side."))
-                return
+                squadron_member = True
+
+        if squadron_member:
+            # assign the squadron to the player
+            player.squadron = await DataObjectFactory().new(Squadron, node=self.node, name=squadron['name'],
+                                                              campaign_id=campaign_id).prep()
+            # we need to give the member the role
+            if player.member and 'role' in squadron:
+                try:
+                    await player.member.add_roles(self.bot.get_role(squadron['role']))
+                except discord.Forbidden:
+                    await self.bot.audit('permission "Manage Roles" missing.',
+                                         user=self.bot.member)
+        else:
+            asyncio.create_task(server.kick(player, _("You are not a squadron member.\n"
+                                                      "Please ask your squadron leader to add you.")))
+            asyncio.create_task(self.audit(server,
+                                           f"Unregistered player {player.name} ({player.ucid}) "
+                                           f"tried to join the running match on the {side} side."))
+            return
 
         await self.inform_streamer(server, _("Player {name} joined the match in their {unit}.").format(
             name=player.name, unit=player.unit_display_name), coalition=player.coalition)

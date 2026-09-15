@@ -57,6 +57,8 @@ LOGLEVEL = {
     'FATAL': logging.FATAL
 }
 
+async_error_rc: int | None = None
+
 
 class Main:
 
@@ -184,6 +186,7 @@ class Main:
         await self.node.register()
         db_available = True
         async with ServiceRegistry(node=self.node) as registry:
+            await self.node.set_ready()
             self.log.info("DCSServerBot {} started.".format("MASTER" if self.node.master else "AGENT"))
             try:
                 while not self.node.is_shutdown.is_set():
@@ -197,18 +200,18 @@ class Main:
                     # switch master
                     if self.node.claimed_master:
                         self.log.info("Taking over as the MASTER node ...")
+
                         # stop all agent-only services
                         tasks = []
                         for cls in [x for x in registry.services().keys() if registry.agent_only(x)]:
                             tasks.append(registry.get(cls).stop())
                         await asyncio.gather(*tasks)
+
                         # start all master-only services
                         tasks = []
                         for cls in [x for x in registry.services().keys() if registry.master_only(x)]:
                             tasks.append(self.start_service(registry, cls))
                         await asyncio.gather(*tasks)
-                        # now we are the real master
-                        self.node.commit_claimed_master()
 
                         # switch all others services / register the agent nodes
                         tasks = []
@@ -220,20 +223,23 @@ class Main:
                             if service:
                                 tasks.append(service.switch(True))
                         await asyncio.gather(*tasks)
+
+                        # now we are the real master
+                        self.node.commit_claimed_master()
                     else:
                         self.log.info("Second MASTER found, stepping back to AGENT configuration.")
+
                         # stop all master-only services
                         tasks = []
                         for cls in [x for x in registry.services().keys() if registry.master_only(x)]:
                             tasks.append(registry.get(cls).stop())
                         await asyncio.gather(*tasks)
+
                         # start all agent-only services
                         tasks = []
                         for cls in [x for x in registry.services().keys() if registry.agent_only(x)]:
                             tasks.append(self.start_service(registry, cls))
                         await asyncio.gather(*tasks)
-                        # now we are the agent
-                        self.node.commit_claimed_master()
 
                         # switch all others services
                         tasks = []
@@ -245,6 +251,9 @@ class Main:
                             if service:
                                 tasks.append(service.switch(False))
                         await asyncio.gather(*tasks)
+
+                        # now we are the agent
+                        self.node.commit_claimed_master()
             except OperationalError:
                 db_available = False
                 raise
@@ -254,16 +263,24 @@ class Main:
             finally:
                 self.log.warning("Aborting the main loop ...")
                 if db_available:
-                    await self.node.unregister()
+                    try:
+                        await asyncio.wait_for(self.node.unregister(), timeout=5.0)
+                    except (asyncio.TimeoutError, Exception) as ex:
+                        self.log.error(f"Node unregister failed (forcing exit anyway): {ex}")
 
 
 def handle_exception(loop, context):
+    global async_error_rc
+
     # Extract exception details from context
     exception = context.get('exception')
     message = context.get('message')
 
     # Log detailed information
     if exception:
+        # restart on AssertionErrors
+        if isinstance(exception, AssertionError):
+            async_error_rc = -1
         log.error(f"Async error: {message}", exc_info=exception)
     else:
         log.error(f"Async error: {message}")
@@ -402,8 +419,8 @@ if __name__ == "__main__":
         rc = -1
     except asyncio.CancelledError:
         log.warning("Main loop cancelled.")
-        # do not restart again
-        rc = -2
+        # restart only in specific cases
+        rc = async_error_rc or -2
     except (YAMLError, FatalException) as ex:
         log.exception(ex)
         input("Press any key to continue ...")
@@ -420,10 +437,10 @@ if __name__ == "__main__":
         rc = ex.code
         if rc not in [0, -1, -2]:
             log.exception(ex)
-    except:
+    except BaseException as ex:
+        log.exception("Unhandled exception in main runner.")
         console.print_exception(show_locals=True, max_frames=1)
-        # do not restart on unknown errors
-        rc = -2
+        rc = async_error_rc or -2
     finally:
         log.info("DCSServerBot stopped.")
         fault_log.close()

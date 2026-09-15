@@ -39,7 +39,7 @@ DEFAULT:            # Default section - true for all your servers.
   - unit_type: instructor
     discord: Donators
     message: This slot is reserved for Donators!
-  - unit_type: observer
+  - unit_type: observer   # Lock the observer role to a specific discord side and discord role
     side: 2               # side 1 = red, 2 = blue, not given - both sides
     discord: '@everyone'  # Only the "everyone" role needs the @ at the beginning, all other roles don't.
     message: This slot is reserved for members of https://invite.link!
