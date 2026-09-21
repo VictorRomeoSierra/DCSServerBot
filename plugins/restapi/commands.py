@@ -2663,13 +2663,13 @@ class RestAPI(Plugin):
                          end_time: datetime | None = Query(default=None)):
         where = ""
         if start_time:
-            where += " AND time >= %(start_time)"
+            where += " AND time >= %(start_time)s"
         if end_time:
-            where += " AND time <= %(end_time)"
+            where += " AND time <= %(end_time)s"
         if module:
-            where += " AND init_type = %(module)"
+            where += " AND init_type = %(module)s"
         if tanker:
-            where += " AND tanker = %(tanker)"
+            where += " AND tanker = %(tanker)s"
         async with self.apool.connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cursor:
                 await cursor.execute(f"""
