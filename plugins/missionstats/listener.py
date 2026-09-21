@@ -333,10 +333,7 @@ class MissionStatisticsEventListener(EventListener["MissionStatistics"]):
             player = server.get_player(name=data['initiator'].get('name'))
             if player:
                 tanker = data['target']['unit_type']
-                # VRS (temp, reported upstream): the Lua sends no comment when nothing was transferred, and
-                # json.loads() of the dict default / None raised. Also keep `data` intact - it is read again below.
-                comment = data.get('comment')
-                stats = json.loads(comment) if comment else {"lbs": 0, "secs": 0.0}
+                data = json.loads(data.get('comment', {"lbs": 0, "secs": 0.0}))
                 async with self.apool.connection() as conn:
                     await conn.execute("""
                         UPDATE refuelingstats
@@ -348,12 +345,12 @@ class MissionStatisticsEventListener(EventListener["MissionStatistics"]):
                           AND init_type = %s 
                           AND tanker = %s
                           AND transfer_time IS NULL
-                    """, (stats['lbs'], stats.get('full'), stats['secs'],
+                    """, (data['lbs'], data.get('full'), data['secs'],
                           server.mission_id, player.ucid, player.unit_type, tanker))
                 events_channel = self.bot.get_channel(server.channels.get(Channel.EVENTS, -1))
                 if events_channel:
                     coalition = self.COALITION[data['initiator']['coalition']]
-                    message = self.EVENT_TEXTS[coalition]['refueling'].format(player.display_name, stats['lbs'], tanker)
+                    message = self.EVENT_TEXTS[coalition]['refueling'].format(player.display_name, data['lbs'], tanker)
                     asyncio.create_task(events_channel.send(message))
 
         # is an embed update necessary?
