@@ -400,13 +400,16 @@ def check_roles(roles: Iterable[str | int], member: discord.Member | None = None
     """
     if not member or not isinstance(member, discord.Member):
         return False
-    for role in member.roles:
-        for valid_role in roles:
-            if isinstance(valid_role, int) and role.id == valid_role:
-                return True
-            elif isinstance(valid_role, str) and role.name == valid_role:
-                return True
-    return False
+
+    role_ids: set[int] = set()
+    role_names: set[str] = set()
+    for valid_role in roles:
+        if isinstance(valid_role, int):
+            role_ids.add(valid_role)
+        elif isinstance(valid_role, str):
+            role_names.add(valid_role)
+
+    return any(role.id in role_ids or role.name in role_names for role in member.roles)
 
 
 @deprecated("Use app_has_role instead")
@@ -853,7 +856,10 @@ def match(name: str, member_list: list[discord.Member], min_score: int = 70) -> 
     ]:
         return None
 
-    name: str | None = normalize_name(name)
+    name = normalize_name(name)
+    if not name:
+        return None
+
     weights = [3, 2, 1]
     user_lists = [
         [normalize_name(getattr(member, attr)) for member in member_list]
@@ -864,12 +870,14 @@ def match(name: str, member_list: list[discord.Member], min_score: int = 70) -> 
 
     for user_list, weight in zip(user_lists, weights):
         for idx, user in enumerate(user_list):
-            score = fuzz.ratio(name, user)
-            if score > max_score:
-                best_match_index = idx if score >= min_score else None
-                max_score = score if score >= min_score else 0
+            if not user:
+                continue
+            score = fuzz.ratio(name, user) * weight
+            if score > max_score and score >= min_score:
+                best_match_index = idx
+                max_score = score
 
-    return member_list[best_match_index] if best_match_index else None
+    return member_list[best_match_index] if best_match_index is not None else None
 
 
 def find_similar_names(list1: list[str], list2: list[str], threshold: int = 90) -> list[tuple[str, str, int]]:
@@ -911,7 +919,6 @@ async def get_all_linked_members(
     The function streams rows from the DB, looks up each member in the
     guild cache and stops as soon as 25 matches have been found.
     """
-    guild = interaction.guild
     search_lc = search.lower() if search else None
 
     results: list[discord.Member] = []
@@ -925,9 +932,9 @@ async def get_all_linked_members(
             mid = row[0]
             ucid = row[1]
 
-            member = guild.get_member(mid)
+            member = await interaction.client.get_member(mid)
             if not member:
-                continue  # member not cached – skip
+                continue  # member not there – skip
 
             if search_lc and not (search_lc in member.display_name.lower() or search_lc in ucid):
                 continue
@@ -1036,20 +1043,31 @@ class ServerTransformer(app_commands.Transformer):
         try:
             server: Server | None = interaction.client.get_server(interaction)
             is_admin = self.is_admin(interaction)
+            current_lc = current.casefold() if current else None
 
-            if (not current and server and server.status != Status.UNREGISTERED and
+            if (not current_lc and server and server.status != Status.UNREGISTERED and
                     (not self.status or server.status in self.status)):
                 return [app_commands.Choice[str](name=server.name, value=server.name)]
-            return [
-                app_commands.Choice[str](name=name, value=name)
-                for name, value in interaction.client.servers.items()
-                if (value.status != Status.UNREGISTERED and
-                    (not self.status or value.status in self.status) and
-                    (not self.maintenance or value.maintenance == self.maintenance) and
-                    (not is_admin or not value.locals.get('managed_by') or utils.check_roles(value.locals.get('managed_by'), interaction.user)) and
-                    (not current or current.casefold() in name.casefold())
-                )
-            ][:25]
+
+            choices: list[app_commands.Choice[str]] = []
+            for name, value in interaction.client.servers.items():
+                if value.status == Status.UNREGISTERED:
+                    continue
+                if self.status and value.status not in self.status:
+                    continue
+                if self.maintenance and value.maintenance != self.maintenance:
+                    continue
+                if current_lc and current_lc not in name.casefold():
+                    continue
+                if (is_admin and value.locals.get('managed_by') and
+                        not utils.check_roles(value.locals.get('managed_by'), interaction.user)):
+                    continue
+
+                choices.append(app_commands.Choice[str](name=name, value=name))
+                if len(choices) == 25:
+                    break
+
+            return choices
         except Exception as ex:
             interaction.client.log.exception(ex)
             return []
@@ -1186,12 +1204,18 @@ async def mission_autocomplete(interaction: discord.Interaction, current: str) -
         server: Server = await ServerTransformer().transform(interaction, interaction.namespace.server)
         if not server:
             return []
+
+        current_lc = current.casefold() if current else None
         base_dir = await server.get_missions_dir()
-        return sorted([
-            app_commands.Choice[int](name=get_name(base_dir, x), value=idx)
-            for idx, x in enumerate(await get_cached_mission_list(server))
-            if not current or current.casefold() in get_name(base_dir, x).casefold()
-        ], key=lambda choice: choice.name)[:25]
+        choices: list[app_commands.Choice[int]] = []
+
+        for idx, path in enumerate(await get_cached_mission_list(server)):
+            name = get_name(base_dir, path)
+            if current_lc and current_lc not in name.casefold():
+                continue
+            choices.append(app_commands.Choice[int](name=name, value=idx))
+
+        return sorted(choices, key=lambda choice: choice.name)[:25]
     except Exception as ex:
         interaction.client.log.exception(ex)
         return []
@@ -1247,7 +1271,7 @@ class UserTransformer(app_commands.Transformer):
                 else:
                     return value
             elif value.isnumeric():
-                return interaction.guild.get_member(int(value))
+                return await interaction.client.get_member(int(value))
             else:
                 return None
         else:
@@ -1901,7 +1925,7 @@ class ServerUploadHandler(NodeUploadHandler):
         if not channel_id:
             channel_id = bot.locals.get('channels', {}).get('admin')
 
-        if not server and message.channel.id == channel_id:
+        if not server and ((message.channel.id == channel_id) or isinstance(message.channel, discord.DMChannel)):
             ctx = await bot.get_context(message)
             server = await utils.server_selection(
                 bot,

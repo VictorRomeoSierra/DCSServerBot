@@ -1,6 +1,5 @@
 import discord
 
-from contextlib import suppress
 from core import Plugin, utils, get_translation, Group
 from datetime import timedelta
 from discord import app_commands, Permissions
@@ -148,25 +147,38 @@ class Discord(Plugin):
 
         # check roles
         guild = self.bot.guilds[0]
-        admin_roles = []
-        admins = []
-        elevated_roles = []
-        elevated = []
-        everyone_ping = []
-        external_apps = []
+        members_intent = self.bot.intents.members  # role.members needs GUILD_MEMBERS
+        admin_roles, admins = [], []
+        elevated_roles, elevated = [], []
+        everyone_ping, external_apps = [], []
         for role in guild.roles:
             if role.permissions.administrator:
                 admin_roles.append(role)
-                admins.extend(role.members)
+                if members_intent:
+                    admins.extend(role.members)
             elif role.permissions.value & Permissions.elevated().value > 0:
                 elevated_roles.append(role)
-                elevated.extend(role.members)
+                if members_intent:
+                    elevated.extend(role.members)
             else:
                 if role.permissions.mention_everyone:
                     everyone_ping.append(role)
                 if role.permissions.use_external_apps:
                     external_apps.append(role)
-        all_bots = [x for x in guild.members if x.bot]
+        bot_ids = {x.id for x in guild.members if x.bot} if members_intent else set()
+
+        def _roles(entries: list[discord.Role], mention: bool = False) -> str:
+            if not entries:
+                return _("none")
+            return '\n'.join(x.mention if mention else x.name for x in entries)
+
+        def _members(entries: list[discord.Member], mention: bool = False) -> str:
+            if not members_intent:
+                return _("unavailable without the 'Server Members Intent'")
+            if not entries:
+                return _("none")
+            return '\n'.join((x.mention if mention else x.display_name) +
+                             (' (🤖)' if x.id in bot_ids else '') for x in entries)
 
         # check channels
         channels_for_everyone = []
@@ -178,25 +190,24 @@ class Discord(Plugin):
 
         embed = discord.Embed(colour=discord.Colour.blue())
         embed.title = f"Healthcheck for {guild.name}"
+
         # Roles
-        embed.add_field(name=_("Admin Roles"), value='\n'.join([x.name for x in admin_roles]))
-        embed.add_field(name=_("Members"), value='\n'.join([
-            x.display_name + (' (🤖)' if x in all_bots else '') for x in admins
-        ]))
+        embed.add_field(name=_("Admin Roles"), value=_roles(admin_roles))
+        embed.add_field(name=_("Members"), value=_members(admins))
         embed.add_field(name=utils.print_ruler(header="Elevated Roles"), value='_ _', inline=False)
-        embed.add_field(name=_("Elevated Roles"), value='\n'.join([x.mention for x in elevated_roles]))
-        embed.add_field(name=_("Members"), value='\n'.join([
-            x.mention + (' (🤖)' if x in all_bots else '') for x in elevated
-        ]))
+        embed.add_field(name=_("Elevated Roles"), value=_roles(elevated_roles, mention=True))
+        embed.add_field(name=_("Members"), value=_members(elevated, mention=True))
         embed.add_field(name=utils.print_ruler(header="⚠️ Critical Roles ⚠️"), value='_ _', inline=False)
         if everyone_ping or external_apps:
-            embed.add_field(name=_("Everyone Ping"), value='\n'.join([x.name for x in everyone_ping]))
-            embed.add_field(name=_("External Apps"), value='\n'.join([x.name for x in external_apps]))
-            embed.set_footer(text="🤖 = Discord Bot")
+            embed.add_field(name=_("Everyone Ping"), value=_roles(everyone_ping))
+            embed.add_field(name=_("External Apps"), value=_roles(external_apps))
+            if members_intent:
+                embed.set_footer(text="🤖 = Discord Bot")
             view = HealthcheckView(everyone_ping, external_apps)
         else:
             embed.add_field(name='_ _', value=_("No critical permissions found."), inline=False)
             view = None
+
         # Channels
         if len(channels_for_everyone) > 1:
             embed.add_field(name=utils.print_ruler(header=_("Channels")), value='_ _', inline=False)
@@ -250,14 +261,17 @@ class Discord(Plugin):
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
         # ignore ourselves adding the initial reactions
-        if payload.message_id != self.reaction_message_id or payload.member.id == self.bot.user.id:
+        if payload.message_id != self.reaction_message_id or payload.user_id == self.bot.user.id:
+            return
+        member = payload.member or await self.bot.get_member(payload.user_id)
+        if not member:
             return
         if payload.emoji.name == '🤖':
-            self.log.warning(f"Member {payload.member.display_name} fell into the bot trap!")
-            if payload.member.id != self.bot.owner_id:
-                await self.bot.audit(_("Kicked for falling into the bot trap."), member=payload.member)
+            self.log.warning(f"Member {member.display_name} fell into the bot trap!")
+            if member.id != self.bot.owner_id:
+                await self.bot.audit(_("Kicked for falling into the bot trap."), member=member)
                 try:
-                    await payload.member.kick(reason="Bot user")
+                    await member.kick(reason="Bot user")
                 except discord.Forbidden:
                     self.log.error('DCSServerBot is missing permission "Kick, Approve and Reject Members"!')
             else:
@@ -269,15 +283,15 @@ class Discord(Plugin):
                 role = self.bot.get_role(config.get('role'))
                 if role:
                     try:
-                        await payload.member.add_roles(role)
-                        self.log.debug(f"Added role {role.name} to {payload.member.display_name}")
+                        await member.add_roles(role)
+                        self.log.debug(f"Added role {role.name} to {member.display_name}")
                     except discord.Forbidden:
                         self.log.warning('DCSServerBot is missing permission "Manage Roles"!')
                 else:
                     self.log.warning(f"Role {config['role']} not found for emoji {payload.emoji.name}")
             else:
                 message = await self.bot.get_channel(payload.channel_id).fetch_message(payload.message_id)
-                await message.remove_reaction(payload.emoji, payload.member)
+                await message.remove_reaction(payload.emoji, member)
 
     @commands.Cog.listener()
     async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent):
@@ -291,7 +305,11 @@ class Discord(Plugin):
             return
         role = self.bot.get_role(config.get('role'))
         if role:
-            member = self.bot.guilds[0].get_member(int(payload.user_id))
+            member = await self.bot.get_member(int(payload.user_id))
+            if not member:
+                # we should never be here
+                self.log.warning(f"Member {payload.user_id} not found!")
+                return
             try:
                 await member.remove_roles(role)
                 self.log.info(f"Removed role {role.name} from {member.display_name}")
@@ -300,8 +318,8 @@ class Discord(Plugin):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        # ignore my own messages
-        if message.author.id == self.bot.user.id:
+        # ignore my own messages or DMs
+        if (message.author.id == self.bot.user.id) or not isinstance(message.author, discord.Member):
             return
         config = self.get_config().get('ping_everyone')
         if not config:
