@@ -58,16 +58,12 @@ class DCSServerBot(commands.Bot):
         self._audit_cursor = None
         self._member_snapshots = {}
 
-    async def start(self, token: str, *, reconnect: bool = True) -> None:
-        self.synced: bool = False
-        if not self.intents.members:
-            interval = max(15, self.locals.get('audit_log', {}).get('poll_interval', 30))
-            self.audit_poll.change_interval(seconds=interval)
-            self.audit_poll.start()
-        await super().start(token, reconnect=reconnect)
-
     async def connect(self, *, reconnect: bool = True) -> None:
         try:
+            if not self.intents.members:
+                interval = max(15, self.locals.get('audit_log', {}).get('poll_interval', 30))
+                self.audit_poll.change_interval(seconds=interval)
+                self.audit_poll.start()
             await super().connect(reconnect=reconnect)
         except PrivilegedIntentsRequired:
             self.log.critical(
@@ -76,6 +72,19 @@ If you have less than 10.000 users in your Discord server, please enable these I
 If you have more than 10.000 player, you have to set `privileged_intents: false` in your config/services/bot.yaml."""
             )
             exit(-2)
+
+    async def _announce_major_upgrade(self) -> None:
+        """Tell the audit channel about an update the launcher deliberately did not apply.
+
+        Scheduled, never awaited: ``setup_hook`` runs before the Discord connection is ready and ``audit()`` needs
+        the guild cache. The launcher has already logged the same sentence to the bot log.
+        """
+        try:
+            await self.wait_until_ready()
+            # the pair is what the launcher recorded; the checker cannot know it is set when this runs
+            await self.audit(message=utils.upgrade_message(*self.node.major_upgrade))  # type: ignore[arg-type]
+        except Exception as ex:
+            self.log.warning(f"Could not announce the pending major upgrade: {ex}")
 
     async def close(self):
         try:
@@ -138,9 +147,19 @@ If you have more than 10.000 player, you have to set `privileged_intents: false`
 
     async def setup_hook(self) -> None:
         self.log.info('- Loading Plugins ...')
+        # An update the launcher held back (a major version step, see run.py) is announced from here: the launcher
+        # has no Discord connection, and this is where one exists and the audit channel is known.
+        if self.node.major_upgrade:
+            asyncio.create_task(self._announce_major_upgrade())
         # we need to keep the order for our default plugins...
         for plugin in self.plugins:
             await self.load_plugin(plugin.lower())
+        # let the plugins register their admin web UI pages (no-op when no WebService runs on
+        # this node). This mirrors where the Discord plugins are loaded: after the cogs, from the
+        # same list, so a page and a command of one plugin can never disagree about loading.
+        from core.plugin_manager import PluginManager
+        self.plugin_manager = PluginManager(self.node)
+        await self.plugin_manager.load_plugins(self.plugins)
         # clean up remote servers (if any)
         for key in [key for key, value in self.bus.servers.items() if value.is_remote]:
             self.bus.servers.pop(key)
@@ -365,6 +384,11 @@ If you have more than 10.000 player, you have to set `privileged_intents: false`
 
                 self.log.info('  => Registering Discord Commands (this might take a bit) ...')
                 self.tree.copy_global_to(guild=self.guilds[0])
+                # Commands imported before this bot existed still need their parameter
+                # trimming applied; this is the last moment it can be done before publishing.
+                for cmd in self.tree.walk_commands():
+                    if isinstance(cmd, Command):
+                        cmd.bind(self)
                 app_cmds = await self.tree.sync(guild=self.guilds[0])
                 app_ids: dict[str, int] = {}
                 for app_cmd in app_cmds:
@@ -502,8 +526,6 @@ If you have more than 10.000 player, you have to set `privileged_intents: false`
                 embed.set_author(name=member.display_name, icon_url=member.avatar)
                 if 'error' in kwargs:
                     embed.set_thumbnail(url="https://github.com/Special-K-s-Flightsim-Bots/DCSServerBot/blob/master/images/warning.png?raw=true")
-                else:
-                    embed.set_thumbnail(url=member.avatar)
                 if member != self.member:
                     embed.description = f'<@{member.id}> ' + message
                 else:
@@ -648,9 +670,7 @@ If you have more than 10.000 player, you have to set `privileged_intents: false`
 
     def get_servers(self, manager: discord.Member | None = None) -> dict[str, "Server"]:
         def check_server_roles(server: "Server") -> bool:
-            if server.locals.get('managed_by') and not utils.check_roles(server.locals.get('managed_by'), manager):
-                return False
-            return True
+            return utils.holds_scope(server.locals.get('managed_by'), utils.member_scope_tokens(manager))
 
         return {k: v for k,v in self.servers.items() if check_server_roles(v)}
 

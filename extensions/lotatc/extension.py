@@ -26,7 +26,7 @@ from watchdog.observers import Observer
 _ = get_translation(__name__.split('.')[1])
 
 UPDATER_CODE = '4dctdtna'
-MISSION_SCRIPTING = 'dofile(lfs.writedir().."Mods\\services\\LotAtc\\lua utils\\lotatcMissionServer.lua")'
+MISSION_SCRIPTING = 'dofile(lfs.writedir().."Mods/services/LotAtc/lua utils/lotatcMissionServer.lua")'
 
 __all__ = [
     "LotAtc"
@@ -402,7 +402,7 @@ class LotAtc(InstallableExtension, FileSystemEventHandler):
                 self.log.info(f"A new LotAtc update is available. Updating to version {version} ...")
                 await asyncio.to_thread(self.do_update)
                 if version != self.get_inst_version()[1]:
-                    self.log.error(f"LotAtc update failed: {version} is not the expected version {self.get_inst_version()[1]}!")
+                    self.log.error(f"LotAtc update failed: {self.get_inst_version()[1]} is not the expected version {version}!")
                     return
 
                 self.log.info("LotAtc installation updated.")

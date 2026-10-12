@@ -36,16 +36,18 @@ try:
     from ruamel.yaml import YAML
     yaml = YAML()
 except ModuleNotFoundError as ex:
+    import shutil
     import subprocess
 
     print(f"Module {ex.name} is not installed, fixing ...")
-    cmd = [
-        sys.executable,
-        '-m', 'piptools', 'sync', 'requirements.txt'
-    ]
-    if os.path.exists("requirements.local"):
-        cmd.append('requirements.local')
-    subprocess.run(cmd)
+    if shutil.which('uv'):
+        cmd = ['uv', 'pip', 'sync', '--python', sys.executable, 'requirements.txt']
+        if os.path.exists("requirements.local"):
+            cmd.append("requirements.local")
+        subprocess.run(cmd)
+    else:
+        print("uv was not found in your PATH - install it from https://docs.astral.sh/uv/ to "
+              "repair the environment.")
     exit(-1)
 
 LOGLEVEL = {
@@ -165,17 +167,29 @@ class Main:
         if autoupdate:
             cloud_drive = self.node.locals.get('cluster', {}).get('cloud_drive', True)
             if (cloud_drive and self.node.master) or not cloud_drive:
-                await self.node.upgrade()
-                if self.node.is_shutdown.is_set():
-                    return
+                # A major step (one of the first three version numbers moved) is never applied unattended: the
+                # installer and the migrations behind it belong to an operator, who runs /node upgrade or
+                # update.cmd. What is waiting is announced from BotService once Discord is connected.
+                if await self.node.upgrade_is_major():
+                    # the pair was just set by that call; the checker cannot know it
+                    self.log.warning(utils.upgrade_message(*self.node.major_upgrade))  # type: ignore[arg-type]
+                else:
+                    await self.node.upgrade()
+                    if self.node.is_shutdown.is_set():
+                        return
         elif self.node.master and await self.node.upgrade_pending():
-            self.log.warning(
-                "New update for DCSServerBot available!\nUse /node upgrade or enable autoupdate to apply it.")
+            self.log.warning(utils.upgrade_message())
 
         me = psutil.Process(os.getpid())
         ProcessManager(
             auto_affinity=self.node.locals.get('auto_affinity', {}).get('enabled', False),
-            excluded_cores=self.node.locals.get('auto_affinity', {}).get('excluded_cores', [])
+            excluded_cores=self.node.locals.get('auto_affinity', {}).get('excluded_cores', []),
+            reuse_cores=self.node.locals.get('auto_affinity', {}).get('reuse_cores', True),
+            max_core_sharing=self.node.locals.get('auto_affinity', {}).get("max_core_sharing", 2),
+            growth_load_threshold=self.node.locals.get('auto_affinity', {}).get("growth_load_threshold", 70.0),
+            steal_load_threshold=self.node.locals.get('auto_affinity', {}).get("steal_load_threshold", 85.0),
+            idle_load_threshold=self.node.locals.get('auto_affinity', {}).get("idle_load_threshold", 20.0),
+            steal_streak=self.node.locals.get('auto_affinity', {}).get("steal_streak", 3)
         ).assign_process(
             me,
             min_cores=self.node.locals.get('auto_affinity', {}).get('min_cores', 1),

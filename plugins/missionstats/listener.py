@@ -257,7 +257,7 @@ class MissionStatisticsEventListener(EventListener["MissionStatistics"]):
         elif data['eventName'] in ['S_EVENT_UNIT_LOST', 'S_EVENT_PLAYER_LEAVE_UNIT']:
             initiator = data['initiator']
             # no stats for Neutral
-            coalition: Coalition = self.COALITION[initiator['coalition']]
+            coalition: Coalition = self.COALITION[initiator.get('coalition', 0)]
             if coalition == Coalition.NEUTRAL:
                 return
 
@@ -318,7 +318,7 @@ class MissionStatisticsEventListener(EventListener["MissionStatistics"]):
 
         elif data['eventName'] == 'S_EVENT_REFUELING':
             player = server.get_player(name=data['initiator'].get('name'))
-            if player:
+            if player and data.get('target'):
                 tanker = data['target']['unit_type']
                 async with self.apool.connection() as conn:
                     await conn.execute("""
@@ -331,9 +331,9 @@ class MissionStatisticsEventListener(EventListener["MissionStatistics"]):
 
         elif data['eventName'] == 'S_EVENT_REFUELING_STOP':
             player = server.get_player(name=data['initiator'].get('name'))
-            if player:
+            if player and data.get('target'):
                 tanker = data['target']['unit_type']
-                data = json.loads(data.get('comment', {"lbs": 0, "secs": 0.0}))
+                comment = json.loads(data.get('comment', {"lbs": 0, "secs": 0.0}))
                 async with self.apool.connection() as conn:
                     await conn.execute("""
                         UPDATE refuelingstats
@@ -345,12 +345,14 @@ class MissionStatisticsEventListener(EventListener["MissionStatistics"]):
                           AND init_type = %s 
                           AND tanker = %s
                           AND transfer_time IS NULL
-                    """, (data['lbs'], data.get('full'), data['secs'],
+                    """, (comment['lbs'], comment.get('full'), comment['secs'],
                           server.mission_id, player.ucid, player.unit_type, tanker))
                 events_channel = self.bot.get_channel(server.channels.get(Channel.EVENTS, -1))
                 if events_channel:
                     coalition = self.COALITION[data['initiator']['coalition']]
-                    message = self.EVENT_TEXTS[coalition]['refueling'].format(player.display_name, data['lbs'], tanker)
+                    message = self.EVENT_TEXTS[coalition]['refueling'].format(
+                        player.name, comment['lbs'], tanker
+                    )
                     asyncio.create_task(events_channel.send(message))
 
         # is an embed update necessary?

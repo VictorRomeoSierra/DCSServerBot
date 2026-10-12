@@ -1,0 +1,92 @@
+{#-
+  ONE table component — the dashboard's list and every standalone list page render THIS markup.
+
+  A partial on purpose. The dashboard's state panel selects one table by tab and the standalone
+  Servers/Nodes/Instances/Players pages select one by their spec, but the card, the sortable header
+  row, the per-resource row shapes, the players search form and the empty state are ONE rendering —
+  a page that drew them again would be a second copy that drifts the first time a column is added.
+
+  IT COMPUTES NOTHING. `table` is a services.webservice.readmodels.views.TableView (rows in the
+  validated order, one column view per header with its link, its arrow and its `aria-sort`), `view`
+  a ViewState (so the search counts and the echoed query come from the same record the rows do) and
+  `empty` the read models' own copy. No direction logic, no count, no figure is derived here.
+
+  IT IS TRANSLATED AT RENDER. The strings the read models and pages own (a column label, a status
+  word, an empty-state sentence, the table label) are rendered through the environment's own `_`
+  (`{{ _(column.label) }}`), and the two sentences that carry figures — the "Sorted by …" tag and
+  the column tooltip — are composed here from the same translated atoms with Jinja's `{% trans %}`.
+  English stays the msgid, so a wrapped-but-untranslated string renders exactly as before.
+
+  THE SEARCH IS A GET FORM (the players table only): it filters server-side on `?q=`, so it works
+  with JavaScript off, is linkable and mutates nothing. `search_action`/`search_clear`/
+  `search_hidden` are passed by the renderer, because the dashboard's search posts back to `/?tab=…`
+  and the standalone page's posts back to `/players`.
+
+  THE WRITE CONTROLS (`pages/actions.py`) are rendered by the servers and players branches below, as
+  FORMS — a POST per control, carrying the session's CSRF token and the target in the BODY — and only
+  when the renderer passed `row_controls` for the page (`writes=True` on the page spec, and the
+  dashboard's Servers tab) and for that row. `row_controls` is DATA and is keyed by the row's own
+  identity: a server's NAME (the record `pages/actions.server_controls` built — the strip, the menu,
+  the glyphs, the two names per control) or a player's `(server, ucid)` (a form with a message field,
+  W3). This file still derives nothing and renders NO control for a row the map has no entry for. The
+  SERVER strip itself is the partial `_strip.html`, one component used by both screens; a player
+  control is a small form of its own shape, and so is a NODE row's lifecycle trio (W4c-revised:
+  restart / shut down / upgrade, Admin-only, keyed by the node's name). When no row has a control,
+  the column is not rendered at all — no header, no empty cell — so a page with nothing to offer
+  looks exactly as it did before writes existed. A control is OMITTED, never rendered disabled. The
+  INSTANCE table has no write at all.
+-#}
+{% import "_icons.html" as icons %}
+<div class="card">
+  <div class="hd"><h3>{{ _(table.label) }}</h3><div class="spacer"></div>
+    {%- set active_column = table.columns | selectattr('active') | first %}
+    <span class="tag">{% trans label=_(active_column.label), direction=_(('descending' if table.direction == 'desc' else 'ascending')) %}Sorted by {{ label }}, {{ direction }}{% endtrans %}</span>
+    <span class="tag">{% if row_controls is defined and row_controls %}{% trans %}actions{% endtrans %}{% else %}{% trans %}read-only{% endtrans %}{% endif %}</span></div>
+
+  {% if table.name == 'players' %}
+  <form class="search" method="get" action="{{ search_action }}" role="search">
+    <label for="q">{% trans %}Search players{% endtrans %}</label>
+    <input type="search" id="q" name="q" value="{{ view.search.query }}" placeholder="{% trans %}name or UCID, e.g. Viper-1 or 4b1f9c22{% endtrans %}">
+    {% for key, value in search_hidden.items() %}<input type="hidden" name="{{ key }}" value="{{ value }}">{% endfor %}
+    <button type="submit">{% trans %}Search{% endtrans %}</button>
+    <a href="{{ search_clear }}">{% trans %}Clear{% endtrans %}</a>
+  </form>
+  <p class="sub search-state">{% if view.search.active %}{% trans query=view.search.query, filtered=view.search.filtered, total=view.search.total %}Filter: name or UCID contains {{ query }} · {{ filtered }} of {{ total }} players{% endtrans %} · <a href="{{ search_clear }}">{% trans %}clear{% endtrans %}</a>{% else %}{% trans count=view.search.total %}{{ count }} player(s) online{% endtrans %}{% endif %}</p>
+  {% endif %}
+
+  {% if table.rows %}
+  <div class="tbl sbar">
+    <table>
+      <thead>
+        <tr>
+          {% for column in table.columns %}<th scope="col" aria-sort="{{ column.aria_sort }}" class="{{ 'num' if column.kind == 'num' else 'txt' }}"><a class="sort" href="{{ column.link }}" title="{% if column.active %}{% trans label=_(column.label), here=_(('descending' if table.direction == 'desc' else 'ascending')), next=_(('descending' if column.direction == 'desc' else 'ascending')) %}Sorted by {{ label }}, {{ here }} — click to sort {{ next }}{% endtrans %}{% else %}{% trans label=_(column.label), next=_(('descending' if column.direction == 'desc' else 'ascending')) %}Sort by {{ label }}, {{ next }}{% endtrans %}{% endif %}">{{ _(column.label) }} <span class="ar" aria-hidden="true">{{ column.arrow }}</span></a></th>{% endfor %}
+          {% if row_controls is defined and row_controls %}<th scope="col" class="acts">{% trans %}Actions{% endtrans %}</th>{% endif %}
+        </tr>
+      </thead>
+      <tbody>
+      {% if table.name == 'servers' %}
+        {% for row in table.rows %}<tr><td><b>{% if row.link %}<a class="srv-name" href="{{ row.link }}">{{ row.name }}</a>{% else %}{{ row.name }}{% endif %}</b><div class="meta">{% trans %}node{% endtrans %} {{ row.node_name }}{% if row.instance_name %} · {% trans %}instance{% endtrans %} {{ row.instance_name }}{% endif %}{% if row.port %} ·:{{ row.port }}{% endif %}</div></td><td>{{ row.node_name }}</td><td><span class="dot {{ row.status.dot }}" title="{{ row.status.raw }}" aria-hidden="true"></span> <span class="tag">{{ _(row.status.word) }}</span>{% if row.maintenance %} <span class="tag">{% trans %}maintenance{% endtrans %}</span>{% endif %}</td><td>{{ row.mission_name or '—' }}</td><td class="num">{{ row.mission_label }}</td><td class="num">{% trans count=row.active_players %}{{ count }} player(s){% endtrans %}</td>{% if row_controls is defined and row_controls %}<td class="acts">{% set strip = row_controls.get(row.name) %}{% if strip %}{% include "_strip.html" %}{% if strip.get('note') %}<span class="act-note">{{ _(strip.get('note')) }}</span>{% endif %}{% if strip.get('settings') %}<a class="act-btn cfg" href="{{ strip.settings.path }}" title="{{ say(strip.settings.title) }}" aria-label="{{ say(strip.settings.aria) }}">{{ icons.act('settings') }}</a>{% endif %}{% endif %}</td>{% endif %}</tr>
+        {% endfor %}
+      {% elif table.name == 'nodes' %}
+        {#- A NODE row MIRRORS the Servers row: the NAME (with its `master` tag and its declared-count
+            note) first, then a STATE cell (the ONLINE/OFFLINE tag, now a dot+word as the Servers row
+            renders its status), then the counters. A per-node bot VERSION is deliberately NOT a
+            column: the bot version is CLUSTER-wide, so a per-row cell would imply a fact the row does
+            not have. LAST SEEN is not a column either — it lives in the database, which the read
+            model (a pure, in-process model) does not read, and a wrong figure is worse than none. -#}
+        {% for row in table.rows %}{% set strip = row_controls.get(row.name) if row_controls is defined and row_controls else None %}<tr><td>{% if strip and strip.page %}<a class="srv-name" href="{{ strip.page }}"><b>{{ row.name }}</b></a>{% else %}<b>{{ row.name }}</b>{% endif %}{% if row.master %} <span class="tag">{% trans %}master{% endtrans %}</span>{% endif %}{% if not row.instances %}<div class="meta">{{ _(empty.node_instances) }}</div>{% endif %}</td><td><span class="dot {{ 'run' if row.online else 'dead' }}" aria-hidden="true"></span> <span class="tag">{% if row.online %}{% trans %}online{% endtrans %}{% else %}{% trans %}offline{% endtrans %}{% endif %}</span></td><td class="num">{{ row.instances }}</td><td class="num">{{ row.servers }}</td><td class="num">{{ row.players }}</td>{% if row_controls is defined and row_controls %}<td class="acts">{% if strip %}{% include "_strip.html" %}{% if strip.get('note') %}<span class="act-note">{{ _(strip.get('note')) }}</span>{% endif %}{% if strip.get('view') %}<a class="act-btn view" href="{{ strip.view.path }}" title="{{ say(strip.view.title) }}" aria-label="{{ say(strip.view.aria) }}">{{ icons.act('view') }}</a>{% endif %}{% if strip.get('download') %}<a class="act-btn dl" href="{{ strip.download.path }}" title="{{ say(strip.download.title) }}" aria-label="{{ say(strip.download.aria) }}">{{ icons.act('download') }}</a>{% endif %}{% if strip.get('settings') %}<a class="act-btn cfg" href="{{ strip.settings.path }}" title="{{ say(strip.settings.title) }}" aria-label="{{ say(strip.settings.aria) }}">{{ icons.act('settings') }}</a>{% endif %}{% endif %}</td>{% endif %}</tr>
+        {% endfor %}
+      {% elif table.name == 'instances' %}
+        {% for row in table.rows %}<tr><td><b>{{ row.name }}</b></td><td>{{ row.node_name }}</td><td>{% if row.link %}<a class="srv-name" href="{{ row.link }}">{{ row.server_name }}</a>{% else %}{{ row.server_name or '—' }}{% endif %}</td><td class="num">{{ row.dcs_port or '—' }}</td><td class="num">{{ row.webgui_port or '—' }}</td></tr>
+        {% endfor %}
+      {% elif table.name == 'players' %}
+        {% for row in table.rows %}<tr><td><b>{{ row.name }}</b></td><td class="mono">{{ row.ucid }}</td><td>{% if row.link %}<a class="srv-name" href="{{ row.link }}">{{ row.server_name }}</a>{% else %}{{ row.server_name }}{% endif %}</td><td>{{ row.slot }}</td>{% if row_controls is defined and row_controls %}<td class="acts">{% set strip = row_controls.get((row.server_name, row.ucid)) %}{% if strip %}{% include "_strip.html" %}{% endif %}</td>{% endif %}</tr>
+        {% endfor %}
+      {% endif %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="bd"><p class="empty">{% if table.name == 'players' and view.search.active %}{{ _(empty.players_matched) }}{% else %}{{ _(empty[table.name]) }}{% endif %}</p></div>
+  {% endif %}
+</div>

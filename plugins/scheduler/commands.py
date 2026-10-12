@@ -8,6 +8,8 @@ import random
 from contextlib import suppress
 from core import (Plugin, PluginRequiredError, utils, Status, Server, Coalition, Channel, Group, Node, Instance,
                   DEFAULT_TAG, get_translation, TRAFFIC_LIGHTS)
+from core.actions import ActionContext, call_action
+from core.data.impl.serverimpl import RenameError
 from datetime import datetime, timedelta, timezone
 from discord import app_commands, TextStyle
 from discord.ext import tasks
@@ -270,6 +272,15 @@ class Scheduler(Plugin[SchedulerListener]):
                 self.log.warning(f'  => DCS server "{server.name}" timeout while launching.')
             if not ignore_exception:
                 raise
+        except Exception as ex:
+            # The state loop fires this as a task and drops the reference, so a launch that fails
+            # for any other reason - a port already in use, a refusal from startup() - used to
+            # vanish without a line anywhere. Report it here, where the reason is still known.
+            self.log.error(f'  => DCS server "{server.name}" could not be started: {ex}')
+            with suppress(Exception):
+                await self.bot.audit(f"failed to start DCS server: {ex}", server=server)
+            if not ignore_exception:
+                raise
 
     @staticmethod
     def get_warn_times(config: dict) -> list[int]:
@@ -412,12 +423,12 @@ class Scheduler(Plugin[SchedulerListener]):
         if not os.path.isabs(filename):
             filename = os.path.join(await server.get_missions_dir(), filename)
         for idx, mission in enumerate(await server.getMissionList()):
-            if '.dcssb' in mission:
+            # the mission's two spellings, decided by the ONE normaliser (``.dcssb`` is a COMPONENT,
+            # never a substring): the primary is the logical path, the copy is its ``.dcssb`` sibling.
+            primary = utils.logical_mission_path(mission)
+            if primary != os.path.normpath(mission):
                 secondary = mission
-                primary = os.path.join(os.path.dirname(mission).replace('.dcssb', ''),
-                                       os.path.basename(mission))
             else:
-                primary = mission
                 secondary = os.path.join(os.path.dirname(mission), '.dcssb', os.path.basename(mission))
             if os.path.normpath(filename).lower() in [
                 os.path.normpath(primary).lower(),
@@ -853,17 +864,14 @@ class Scheduler(Plugin[SchedulerListener]):
     @check_state.before_loop
     async def before_check(self):
         await self.bot.wait_until_ready()
-        # wait for all servers to be registered
-        while True:
-            if all(server.status != Status.UNREGISTERED for server in self.bot.servers.values()):
-                break
+        self.loop.create_task(self._reset_maintenance_once())
+
+    async def _reset_maintenance_once(self):
+        while not all(server.status != Status.UNREGISTERED for server in self.bot.servers.values()):
             await asyncio.sleep(1)
-        # reset maintenance flag
         for server_name, server in self.bot.servers.items():
             config = self.get_config(server)
-            if server.maintenance:
-                if not config.get('startup', {}).get('clear_maintenance'):
-                    continue
+            if server.maintenance and config.get('startup', {}).get('clear_maintenance'):
                 server.maintenance = False
                 self.log.warning(f"Maintenance mode auto-cleared on server {server.name}.")
 
@@ -937,11 +945,13 @@ class Scheduler(Plugin[SchedulerListener]):
                         )
                     )
                     # wait until the server is loading
-                    await server.wait_for_status_change(status=[Status.LOADING], timeout=180)
                     embed.description += "\n- {}".format(_("Launching ..."))
                     embed.set_thumbnail(url=TRAFFIC_LIGHTS['amber'])
                     await msg.edit(embed=embed)
-                    # wait for the startup
+                    # Await the launch itself: it returns once the server is up, and raises the real
+                    # reason when it is not. Waiting for LOADING first hid every failure that happens
+                    # before the status moves - a port already in use, a refused desanitize - behind a
+                    # 180s timeout and three "crashed during startup" retries, with the cause unprinted.
                     await task
                     if maintenance:
                         embed = utils.create_warning_embed(
@@ -1423,7 +1433,14 @@ class Scheduler(Plugin[SchedulerListener]):
         ephemeral = utils.get_ephemeral(interaction)
         await interaction.response.defer(thinking=True, ephemeral=ephemeral)
         old_name = server.name
-        await server.rename(new_name, True)
+        try:
+            await server.rename(new_name, True)
+        except RenameError as ex:
+            # A refused rename (a collision, or a reserved / empty name) is the user's to act on:
+            # answer with the refusal's own sentence — the same string the console action returns —
+            # rather than let it escape as a generic interaction failure. Nothing was written.
+            await interaction.followup.send(str(ex), ephemeral=ephemeral)
+            return
         await self.bot.audit(f"renamed from {old_name}", server=server, user=interaction.user)
         await interaction.followup.send(
             _("Server \"{old_name}\" renamed to \"{new_name}\".").format(old_name=old_name, new_name=new_name),
@@ -1621,22 +1638,16 @@ class Scheduler(Plugin[SchedulerListener]):
                     ):
                 await interaction.followup.send(_("Aborted."), ephemeral=ephemeral)
                 return
-            server.maintenance = True
-            server.restart_pending = False
-            server.on_empty.clear()
-            server.on_mission_end.clear()
-            server.on_coalition_win.clear()
-            message = _("Maintenance mode set for server \"{}\".").format(server.display_name)
-            if interaction.response.is_done():
-                await interaction.followup.send(message, ephemeral=ephemeral)
-            else:
-                await interaction.response.send_message(message, ephemeral=ephemeral)
-            await self.bot.audit("set maintenance flag", user=interaction.user, server=server)
+        # The change itself — and its trail — are the ACTION's (``plugins/scheduler/actions.py``),
+        # which is the SAME function the console's server-row control calls, so one flag has one
+        # implementation on every transport. The warning above stays here: an action cannot ask a
+        # person a question, and aborting a pending restart is the one consequence worth confirming.
+        ctx = ActionContext.from_interaction(interaction)
+        result = await call_action('set_maintenance', ctx, server_name=server.name)
+        if interaction.response.is_done():
+            await interaction.followup.send(result.message, ephemeral=ephemeral)
         else:
-            await interaction.response.send_message(
-                _("Server \"{}\" is already in maintenance mode.").format(server.display_name),
-                ephemeral=ephemeral
-            )
+            await interaction.response.send_message(result.message, ephemeral=ephemeral)
 
     @scheduler.command(description=_("Clears the server's maintenance flag"))
     @utils.app_has_role('DCS Admin')
@@ -1644,18 +1655,12 @@ class Scheduler(Plugin[SchedulerListener]):
     async def clear(self, interaction: discord.Interaction,
                     server: app_commands.Transform[Server, utils.ServerTransformer(maintenance=True)]):
         ephemeral = utils.get_ephemeral(interaction)
-        if server.maintenance:
-            server.maintenance = False
-            await interaction.response.send_message(
-                _("Maintenance mode cleared for server \"{}\".").format(server.display_name),
-                ephemeral=ephemeral
-            )
-            await self.bot.audit("cleared maintenance flag", user=interaction.user, server=server)
+        ctx = ActionContext.from_interaction(interaction)
+        result = await call_action('clear_maintenance', ctx, server_name=server.name)
+        if interaction.response.is_done():
+            await interaction.followup.send(result.message, ephemeral=ephemeral)
         else:
-            await interaction.response.send_message(
-                _("Server \"{}\" is not in maintenance mode.").format(server.display_name),
-                ephemeral=ephemeral
-            )
+            await interaction.response.send_message(result.message, ephemeral=ephemeral)
 
 
 async def setup(bot: DCSServerBot):

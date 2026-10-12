@@ -60,8 +60,9 @@ Also, you can configure how often the audit log is polled:
 
 ```yaml
 # config/services/bot.yaml
+privileged_intents: false # Do not use privileged intents
 audit_log:
-  poll_interval: 30  # 30 seconds, by default. Minimum: 15s. 
+  poll_interval: 30       # 30 seconds, by default. Minimum: 15s. 
 ```
 
 > [!CAUTION]
@@ -87,6 +88,25 @@ privileged intents in your [Discord developer portal](https://discord.com/develo
 > It was neither my decision to add this limitation to Discord nor do I like it.
 > I've also tried to convince Discord that there is no other option to achieve what we are doing here, 
 > but they just don't care. So I fear we have to live with it.
+
+### What will no longer work if I have more than 10.000 users?
+Besides the parameters listed above, these features will no longer be available in your bot.
+Most of them are cosmetic and not a great deal or there are other options.
+
+| Plugin     | Functionality          | Description                                                                                               |
+|------------|------------------------|-----------------------------------------------------------------------------------------------------------|
+| admin      | `greeting_dm`          | We can not greet new people with a DM.                                                                    |
+| admin      | `autorole_on_join`     | We can not give people a role on join. Use Discord's onboarding feature.                                  |
+| cloud      | auto-link on join      | People can not be auto-linked on Discord join, but will be auto-linked on their first DCS join.           |
+| discord    | `on_join` / `on_leave` | We do not get information about joined or left players, so this is inop.                                  |
+| gamemaster | chat replies           | You can no longer reply to the in-game chat by just chatting in the chat-replicatioon channel in Discord. |
+| userstats  | `wipe_stats_on_leave`  | We can not auto-delete statistics of players that left the Discord. Use `/prune` instead.                 |
+
+> [!IMPORTANT]
+> Please keep in mind that all file uploads to DCSServerBot can not happen to the configured admin channel(s) anymore.
+> If you have disabled privileged intents, you need to either
+> - upload into the bot's DM channel
+> - @mention the bot when uploading a file into the admin channel
 
 ## Non-Discord Installations
 DCSServerBot is made for Discord and I highly recommend using it with that. Nevertheless, there are people that do not

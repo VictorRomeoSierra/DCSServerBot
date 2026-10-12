@@ -10,6 +10,11 @@ __all__ = [
 
 COMMAND_LINE_ARGS = None
 
+# The programs this module defines arguments for.  Only these may consume the process argv:
+# any other importer (pytest, `python -m ...`, an embedder) owns its own flags, and parsing
+# them here kills the host process with a SystemExit(2) no `except Exception` can catch.
+OWNED_PROGRAMS = {'run.py', 'update.py', 'install.py', 'mizedit.py', 'restore.py', 'testdriver.py'}
+
 if not COMMAND_LINE_ARGS:
     program = os.path.basename(sys.argv[0])
     parser = argparse.ArgumentParser(prog=program, description="Welcome to DCSServerBot!",
@@ -37,8 +42,11 @@ if not COMMAND_LINE_ARGS:
         parser.add_argument('-m', '--mizfile', help='Mission to patch', required=True)
         parser.add_argument('-p', '--preset', help='Preset to use, can be comma-separated')
         parser.add_argument('-f', '--presets-file', help='Presets file', default='presets.yaml')
-    elif program == 'recover.py':
+    elif program == 'restore.py':
         parser.add_argument('-n', '--node', help='Node name', default=platform.node())
     elif program == 'testdriver.py':
         parser.add_argument('-n', '--node', help='Node name', default='TestNode')
-    COMMAND_LINE_ARGS = parser.parse_args()
+    if program in OWNED_PROGRAMS:
+        COMMAND_LINE_ARGS = parser.parse_args()
+    else:
+        COMMAND_LINE_ARGS = parser.parse_args([])

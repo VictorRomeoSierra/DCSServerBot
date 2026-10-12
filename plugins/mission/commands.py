@@ -15,7 +15,7 @@ import warnings
 from contextlib import suppress
 from core import utils, Plugin, Report, Status, Server, Coalition, Channel, Player, PluginRequiredError, MizFile, \
     Group, ReportEnv, command, PlayerType, DataObjectFactory, Member, DEFAULT_TAG, get_translation, \
-    UnsupportedMizFileException, cache_with_expiration
+    UnsupportedMizFileException, cache_with_expiration, ServerUploadHandler
 from datetime import datetime, timezone
 from discord import Interaction, app_commands, SelectOption
 from discord.app_commands import Range, describe
@@ -26,7 +26,7 @@ from openpyxl.utils import get_column_letter
 from pathlib import Path
 from psycopg.rows import dict_row
 from services.bot import DCSServerBot
-from typing import Literal, Type, cast
+from typing import Literal, Type, cast, Callable
 
 from .airbase import Info
 from .const import LIQUIDS
@@ -115,7 +115,7 @@ async def nosav_autocomplete(interaction: discord.Interaction, current: str) -> 
     """
     def get_name(base_dir: str, path: str):
         try:
-            return os.path.relpath(path, base_dir).replace('.dcssb' + os.path.sep, '')[:-4]
+            return os.path.relpath(utils.logical_mission_path(str(path)), base_dir)[:-4]
         except ValueError:
             return os.path.basename(path)[:-4]
 
@@ -200,9 +200,13 @@ class Mission(Plugin[MissionEventListener]):
         self.expire_token.add_exception_type(psycopg.DatabaseError)
         utils.safe_start(self.expire_token)
         if self.bot.locals.get('autorole', {}):
-            self.check_roles.add_exception_type(psycopg.DatabaseError)
-            self.check_roles.add_exception_type(discord.errors.DiscordException)
-            utils.safe_start(self.check_roles)
+            if self.bot.intents.members:
+                self.check_roles.add_exception_type(psycopg.DatabaseError)
+                self.check_roles.add_exception_type(discord.errors.DiscordException)
+                utils.safe_start(self.check_roles)
+            else:
+                self.log.warning("\"autorole\" is configured, but you do not have the Server Members Intent enabled in "
+                                 "your Discord Developer Portal!")
 
     async def cog_unload(self):
         tasks = []
@@ -218,7 +222,7 @@ class Mission(Plugin[MissionEventListener]):
     async def migrate(self, new_version: str, conn: psycopg.AsyncConnection | None = None) -> None:
         function_name = f"migrate_{new_version.replace('.', '_')}"
         migrate_module = importlib.import_module('.migrate', package=__package__)
-        migrate_function = getattr(migrate_module, function_name, None)
+        migrate_function = cast(Callable, getattr(migrate_module, function_name, None))
         if callable(migrate_function):
             if inspect.iscoroutinefunction(migrate_function):
                 await migrate_function(self)
@@ -588,9 +592,9 @@ class Mission(Plugin[MissionEventListener]):
                                            ephemeral=ephemeral):
                     try:
                         await server.node.remove_file(filename)
-                        if '.dcssb' in filename:
+                        primary = utils.logical_mission_path(str(filename))
+                        if primary != os.path.normpath(str(filename)):
                             secondary = filename
-                            primary = filename.replace(os.path.sep + '.dcssb', '')
                             await server.node.remove_file(primary)
                         else:
                             secondary = os.path.join(os.path.dirname(filename), '.dcssb', os.path.basename(filename))
@@ -902,9 +906,9 @@ class Mission(Plugin[MissionEventListener]):
                                             ephemeral=True)
             return
 
-        if '.dcssb' in filename:
-            new_file = os.path.join(os.path.dirname(filename).replace('.dcssb', ''),
-                                    os.path.basename(filename))
+        primary = utils.logical_mission_path(str(filename))
+        if primary != os.path.normpath(str(filename)):
+            new_file = primary
             orig_file = filename + '.orig'
         else:
             new_file = filename
@@ -2446,15 +2450,14 @@ class Mission(Plugin[MissionEventListener]):
             rows = await cursor.fetchall()
             for row in rows:
                 for server in self.bot.servers.values():
-                    if server.status not in [Status.PAUSED, Status.RUNNING, Status.STOPPED]:
-                        continue
-                    await server.send_to_dcs({
-                        "command": "unban",
-                        "ucid": row[0]
-                    })
                     player = server.get_player(ucid=row[0])
                     if player:
                         player.banned = False
+                    if server.status in [Status.PAUSED, Status.RUNNING, Status.STOPPED]:
+                        await server.send_to_dcs({
+                            "command": "unban",
+                            "ucid": row[0]
+                        })
                 # delete unbanned accounts from the database
                 await conn.execute("DELETE FROM bans WHERE ucid = %s", (row[0], ))
 
@@ -2587,36 +2590,36 @@ class Mission(Plugin[MissionEventListener]):
 
     @tasks.loop(minutes=5.0, count=1)
     async def check_roles(self):
-        # Removing stale roles needs role.members (GUILD_MEMBERS intent).
-        # Without the intent, role members cannot be enumerated - the online role
-        # is maintained by the connect/disconnect events instead.
-        if self.bot.intents.members:
-            role = self.bot.get_role(self.bot.locals.get('autorole', {}).get('online'))
-            if role:
-                online_members: set[discord.Member] = set()
-                for server in self.bot.servers.values():
-                    for player in server.get_active_players():
-                        if player.member:
-                            online_members.add(player.member)
-                try:
-                    for member in (set(role.members) - online_members):
-                        await member.remove_roles(role)
-                except discord.Forbidden:
-                    await self.bot.audit('permission "Manage Roles" missing.', user=self.bot.member)
-                    return
-        else:
-            self.log.debug("Stale online-role cleanup skipped: no members intent.")
+        role = self.bot.get_role(self.bot.locals.get('autorole', {}).get('online'))
+        if role:
+            online_members: set[discord.Member] = set()
+            for server in self.bot.servers.values():
+                for player in server.get_active_players():
+                    if player.member:
+                        online_members.add(player.member)
+            try:
+                for member in (set(role.members) - online_members):
+                    await member.remove_roles(role)
+            except discord.Forbidden:
+                await self.bot.audit('permission "Manage Roles" missing.', user=self.bot.member)
+                return
 
         role = self.bot.get_role(self.bot.locals.get('autorole', {}).get('linked'))
         if role:
             linked_members: set[discord.Member] = set()
             async with self.apool.connection() as conn:
-                async for row in await conn.execute(""" ... same SQL ... """):
+                async for row in await conn.execute("""
+                    SELECT DISTINCT discord_id FROM players 
+                    WHERE discord_id <> -1 AND manual IS TRUE
+                      AND last_seen > (CURRENT_TIMESTAMP - interval '1 day')
+                """):
                     member = await self.bot.get_member(row[0])
                     if member:
                         linked_members.add(member)
             holders = set(role.members) if self.bot.intents.members else set()
             for member in (linked_members - holders):
+                if role in member.roles:
+                    continue
                 await member.add_roles(role)
                 self.log.debug(f"=> Member {member.display_name} is linked and got the {role.name} role.")
 
@@ -2732,14 +2735,8 @@ class Mission(Plugin[MissionEventListener]):
             return
 
         ctx = await self.bot.get_context(message)
-        server: Server | None = self.bot.get_server(message, admin_only=True)
+        server = await ServerUploadHandler.get_server(message)
         if not server:
-            server: Server | None = await utils.server_selection(
-                self.bot, ctx, title=_("To which server do you want to upload?")
-            )
-
-        if not server:
-            await message.channel.send(_("Aborted."))
             return
 
         if server.status not in [Status.PAUSED, Status.RUNNING]:
@@ -2753,7 +2750,10 @@ class Mission(Plugin[MissionEventListener]):
             coalition: str | None = await utils.selection(
                 ctx,
                 title=_("Upload to all warehouses of this coalition:"),
-                options=[SelectOption(label="Blue", value="BLUE"), SelectOption(label="Red", value="RED")]
+                options=[
+                    SelectOption(label="Blue", value="BLUE"),
+                    SelectOption(label="Red", value="RED")
+                ]
             )
             if not coalition:
                 await message.channel.send(_("Aborted."))

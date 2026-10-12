@@ -13,7 +13,7 @@ from core import Server, Mission, Node, Status, utils, Instance, FatalException,
 from core.autoexec import Autoexec
 from core.data.dataobject import DataObjectFactory
 from core.data.impl.instanceimpl import InstanceImpl
-from core.data.impl.serverimpl import ServerImpl
+from core.data.impl.serverimpl import ServerImpl, RenameError
 from core.data.proxy.serverproxy import ServerProxy
 from core.process import ProcessManager
 from core.pubsub import PubSub
@@ -68,8 +68,27 @@ class ServiceBus(Service):
         self._lock = asyncio.Lock()
         self._registering_nodes: set[str] = set()
 
+    def _assert_listen_port_free(self):
+        """Refuse to start when the node's own listener port is already taken.
+
+        That listener binds with SO_REUSEADDR, so a second bot process on this PC binds the very
+        same port successfully and then silently loses the messages of one of the two clusters. The
+        failure reads as servers that report nothing, not as a conflict, so the refusal - and the
+        fix in nodes.yaml - is what makes it visible.
+        """
+        host = self.node.listen_address
+        port = self.node.listen_port.port
+        if not utils.is_port_free(host, port, udp=True):
+            raise FatalException(
+                f"Listen port {port} on {host} is already in use and this node would bind it anyway "
+                f"(the listener sets SO_REUSEADDR), then silently lose its servers' messages. Another "
+                f"bot process on this PC - for example a second cluster - is most likely holding it. "
+                f"Refusing to start: give this node its own 'listen_port' in nodes.yaml."
+            )
+
     async def start(self):
         await super().start()
+        self._assert_listen_port_free()
         try:
             # Start the DCS listener
             self.executor = ThreadPoolExecutor(thread_name_prefix='ServiceBus',
@@ -98,6 +117,8 @@ class ServiceBus(Service):
             ))
             await self.switch(self.master)
 
+        except FatalException:
+            raise
         except Exception as ex:
             # we can't run without the servicebus, so better restart
             raise FatalException(repr(ex)) from ex
@@ -507,10 +528,28 @@ class ServiceBus(Service):
         return True
 
     def rename_server(self, server: Server, new_name: str):
+        # Refuse an empty, reserved or case-insensitively duplicate name BEFORE touching the
+        # registry: assigning below would otherwise overwrite a live entry and silently drop the
+        # other server from the fleet. The collision check folds case, the same rule the core guard
+        # (``ServerImpl._rename_refusal``) and the console's ``_name_collision`` use.
+        if not isinstance(new_name, str) or not new_name.strip():
+            raise RenameError('A server name must not be empty.')
+        folded = new_name.strip().casefold()
+        if folded == 'n/a':
+            raise RenameError(f'Server name "{new_name}" is reserved and cannot be used.')
+        for existing in self.servers.values():
+            if existing is None or existing is server:
+                continue
+            existing_name = str(getattr(existing, 'name', '') or '')
+            if existing_name and existing_name.casefold() == folded:
+                raise RenameError(
+                    f'Server name "{new_name}" is already used by server "{existing_name}".')
         self.servers[new_name] = server
-        if server.name in self.servers:
+        # Only drop the old key when it actually differs — a same-name call would pop the key it
+        # just wrote.
+        if server.name != new_name and server.name in self.servers:
             self.servers.pop(server.name, None)
-        if server.name in self.udp_server.message_queue:
+        if server.name != new_name and server.name in self.udp_server.message_queue:
             self.udp_server.message_queue[server.name].put_nowait({})
             self.udp_server.message_queue[new_name] = asyncio.Queue()
             asyncio.create_task(self.udp_server.process_messages(new_name))
@@ -631,6 +670,12 @@ class ServiceBus(Service):
             self.log.error(f"No configuration found for instance {instance} in nodes.yaml")
         except Exception as ex:
             self.log.exception(str(ex), exc_info=True)
+
+    async def set_remote_node_version(self, node: str, dcs_version: str) -> None:
+        remote = self.node.all_nodes.get(node)
+        if remote:
+            remote.dcs_version = dcs_version
+            self.log.info(f"- DCS version of node {node} updated to {dcs_version}.")
 
     async def send_to_node(self, data: dict, *, node: Node | str | None = None):
         if isinstance(node, Node):
@@ -1151,6 +1196,20 @@ class ServiceBus(Service):
 
                                     except Exception as e:
                                         self.log.error(f"Catastrophic error in wait: {e!r}")
+
+                                # players of an agent-hosted server exist on the master only
+                                # (its ServerProxy holds them), so push the count to the owner
+                                if server.is_remote:
+                                    num_players = len(server.get_active_players())
+                                    if num_players != server.num_players:
+                                        server.num_players = num_players
+                                        asyncio.create_task(self.send_to_node({
+                                            "command": "rpc",
+                                            "object": "Server",
+                                            "server_name": server.name,
+                                            "params": {"num_players": num_players}
+                                        }, node=server.node.name))
+
                             else:
                                 await self.send_to_node(data)
 
