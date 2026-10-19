@@ -10,9 +10,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, TypeVar
 
-from core import Status, UploadStatus, utils
+from core import Coalition, Status, UploadStatus, utils
 from core.actions import (
     TRANSPORT_DISCORD,
     TRANSPORT_SERVICE,
@@ -20,12 +21,14 @@ from core.actions import (
     audit_action,
 )
 from core.action_results import (
+    ActionResult,
     MissionControlResult,
     MissionDownloadResult,
     MissionListResult,
     MissionLoadResult,
     MissionUploadResult,
     PlayerActionResult,
+    PlayerScreenshotResult,
     ServerControlResult,
 )
 
@@ -47,20 +50,20 @@ async def start_server(ctx: Any, server_name: str) -> ServerControlResult:
     if server.status != Status.STOPPED:
         return ServerControlResult(
             success=False,
-            message=f"Server '{server.display_name}' is {server.status.value}, not stopped.",
+            message=f"Server '{_server_label(server, server_name)}' is {server.status.value}, not stopped.",
             server_name=server_name,
         )
     try:
         await server.start()
         return ServerControlResult(
             success=True,
-            message=f"Server '{server.display_name}' started.",
+            message=f"Server '{_server_label(server, server_name)}' started.",
             server_name=server_name,
         )
     except (TimeoutError, asyncio.TimeoutError):
         return ServerControlResult(
             success=False,
-            message=f"Timeout while starting server '{server.display_name}'.",
+            message=f"Timeout while starting server '{_server_label(server, server_name)}'.",
             server_name=server_name,
         )
     except Exception as ex:
@@ -85,20 +88,20 @@ async def stop_server(ctx: Any, server_name: str) -> ServerControlResult:
     if server.status not in (Status.RUNNING, Status.PAUSED):
         return ServerControlResult(
             success=False,
-            message=f"Server '{server.display_name}' is {server.status.value}, not running or paused.",
+            message=f"Server '{_server_label(server, server_name)}' is {server.status.value}, not running or paused.",
             server_name=server_name,
         )
     try:
         await server.stop()
         return ServerControlResult(
             success=True,
-            message=f"Server '{server.display_name}' stopped.",
+            message=f"Server '{_server_label(server, server_name)}' stopped.",
             server_name=server_name,
         )
     except (TimeoutError, asyncio.TimeoutError):
         return ServerControlResult(
             success=False,
-            message=f"Timeout while stopping server '{server.display_name}'.",
+            message=f"Timeout while stopping server '{_server_label(server, server_name)}'.",
             server_name=server_name,
         )
     except Exception as ex:
@@ -128,7 +131,7 @@ async def restart_server(ctx: Any, server_name: str) -> ServerControlResult:
     if server.status not in (Status.RUNNING, Status.PAUSED, Status.STOPPED):
         return ServerControlResult(
             success=False,
-            message=f"Server '{server.display_name}' is {server.status.value}.",
+            message=f"Server '{_server_label(server, server_name)}' is {server.status.value}.",
             server_name=server_name,
         )
     try:
@@ -137,13 +140,13 @@ async def restart_server(ctx: Any, server_name: str) -> ServerControlResult:
         await server.start()
         return ServerControlResult(
             success=True,
-            message=f"Server '{server.display_name}' restarted.",
+            message=f"Server '{_server_label(server, server_name)}' restarted.",
             server_name=server_name,
         )
     except (TimeoutError, asyncio.TimeoutError):
         return ServerControlResult(
             success=False,
-            message=f"Timeout while restarting server '{server.display_name}'.",
+            message=f"Timeout while restarting server '{_server_label(server, server_name)}'.",
             server_name=server_name,
         )
     except Exception as ex:
@@ -189,14 +192,18 @@ async def startup_server(ctx: Any, server_name: str, modify_mission: bool = True
     """Start up a SHUTDOWN DCS server (the DCS-level Startup; process-level Start is another action).
 
     ``modify_mission`` / ``use_orig`` mirror the arguments ``Server.startup`` takes and the Discord
-    command passes (``plugins/scheduler/commands.py``).
+    command passes (``plugins/scheduler/commands.py``), and both are REPRODUCED here: the values reach
+    ``Server.startup`` unchanged, so a startup from the console runs the extensions exactly as
+    ``/server startup`` does. The console's Startup dialog declares the two as its own checkboxes
+    (``services/webservice/pages/actions.py``), so the operator makes the choice rather than the
+    route deciding it.
 
     ``maintenance`` mirrors ``/server startup``'s own default: a TRUE value
     CLEARS the maintenance flag on a successful start, so the server rejoins the rotation — a server
     that stays flagged after an explicit startup would be skipped by the scheduler while looking up.
     Pass ``False`` to leave the flag exactly as it is. A flag that could not be cleared is reported
-    in the message instead of being claimed. The ``delay`` warning popups and the extension runs of
-    that command are still NOT reproduced here — see the W-R3 marker above.
+    in the message instead of being claimed. The ``delay`` warning popups of that command are still
+    NOT reproduced here — see the W-R3 marker above.
     """
     server = ctx.resolve_server(server_name)
     if server is None:
@@ -208,7 +215,7 @@ async def startup_server(ctx: Any, server_name: str, modify_mission: bool = True
     if server.status != Status.SHUTDOWN:
         return ServerControlResult(
             success=False,
-            message=f"Server '{server.display_name}' is {server.status.value}, not shut down.",
+            message=f"Server '{_server_label(server, server_name)}' is {server.status.value}, not shut down.",
             server_name=server_name,
         )
     try:
@@ -216,7 +223,7 @@ async def startup_server(ctx: Any, server_name: str, modify_mission: bool = True
     except (TimeoutError, asyncio.TimeoutError):
         return ServerControlResult(
             success=False,
-            message=f"Timeout while starting up server '{server.display_name}'.",
+            message=f"Timeout while starting up server '{_server_label(server, server_name)}'.",
             server_name=server_name,
         )
     except Exception as ex:
@@ -232,13 +239,13 @@ async def startup_server(ctx: Any, server_name: str, modify_mission: bool = True
         if failure is not None:
             return ServerControlResult(
                 success=False,
-                message=(f"Server '{server.display_name}' started up, but the maintenance flag "
+                message=(f"Server '{_server_label(server, server_name)}' started up, but the maintenance flag "
                          f"could not be cleared: {failure}"),
                 server_name=server_name,
             )
     return ServerControlResult(
         success=True,
-        message=f"Server '{server.display_name}' started up.",
+        message=f"Server '{_server_label(server, server_name)}' started up.",
         server_name=server_name,
     )
 
@@ -269,7 +276,7 @@ async def shutdown_server(ctx: Any, server_name: str, force: bool = False,
     if server.status not in (Status.RUNNING, Status.PAUSED):
         return ServerControlResult(
             success=False,
-            message=f"Server '{server.display_name}' is {server.status.value}, not running or paused.",
+            message=f"Server '{_server_label(server, server_name)}' is {server.status.value}, not running or paused.",
             server_name=server_name,
         )
     try:
@@ -277,7 +284,7 @@ async def shutdown_server(ctx: Any, server_name: str, force: bool = False,
     except (TimeoutError, asyncio.TimeoutError):
         return ServerControlResult(
             success=False,
-            message=f"Timeout while shutting down server '{server.display_name}'.",
+            message=f"Timeout while shutting down server '{_server_label(server, server_name)}'.",
             server_name=server_name,
         )
     except Exception as ex:
@@ -294,13 +301,13 @@ async def shutdown_server(ctx: Any, server_name: str, force: bool = False,
         verb = "set" if maintenance else "cleared"
         return ServerControlResult(
             success=False,
-            message=(f"Server '{server.display_name}' shut down, but the maintenance flag could "
+            message=(f"Server '{_server_label(server, server_name)}' shut down, but the maintenance flag could "
                      f"not be {verb}: {failure}"),
             server_name=server_name,
         )
     return ServerControlResult(
         success=True,
-        message=f"Server '{server.display_name}' shut down.",
+        message=f"Server '{_server_label(server, server_name)}' shut down.",
         server_name=server_name,
     )
 
@@ -320,20 +327,20 @@ async def pause_mission(ctx: Any, server_name: str) -> MissionControlResult:
     if server.status != Status.RUNNING:
         return MissionControlResult(
             success=False,
-            message=f"Server '{server.display_name}' is {server.status.value}, not running.",
+            message=f"Server '{_server_label(server, server_name)}' is {server.status.value}, not running.",
             server_name=server_name,
         )
     if server.current_mission is None:
         return MissionControlResult(
             success=False,
-            message=f"No active mission on server '{server.display_name}'.",
+            message=f"No active mission on server '{_server_label(server, server_name)}'.",
             server_name=server_name,
         )
     try:
         await server.current_mission.pause()
         return MissionControlResult(
             success=True,
-            message=f"Mission on server '{server.display_name}' paused.",
+            message=f"Mission on server '{_server_label(server, server_name)}' paused.",
             server_name=server_name,
         )
     except Exception as ex:
@@ -358,20 +365,20 @@ async def unpause_mission(ctx: Any, server_name: str) -> MissionControlResult:
     if server.status != Status.PAUSED:
         return MissionControlResult(
             success=False,
-            message=f"Server '{server.display_name}' is {server.status.value}, not paused.",
+            message=f"Server '{_server_label(server, server_name)}' is {server.status.value}, not paused.",
             server_name=server_name,
         )
     if server.current_mission is None:
         return MissionControlResult(
             success=False,
-            message=f"No active mission on server '{server.display_name}'.",
+            message=f"No active mission on server '{_server_label(server, server_name)}'.",
             server_name=server_name,
         )
     try:
         await server.current_mission.unpause()
         return MissionControlResult(
             success=True,
-            message=f"Mission on server '{server.display_name}' unpaused.",
+            message=f"Mission on server '{_server_label(server, server_name)}' unpaused.",
             server_name=server_name,
         )
     except Exception as ex:
@@ -401,13 +408,13 @@ async def restart_mission(
     if server.status not in (Status.RUNNING, Status.PAUSED, Status.STOPPED):
         return MissionControlResult(
             success=False,
-            message=f"Server '{server.display_name}' is {server.status.value}.",
+            message=f"Server '{_server_label(server, server_name)}' is {server.status.value}.",
             server_name=server_name,
         )
     if server.current_mission is None:
         return MissionControlResult(
             success=False,
-            message=f"No active mission on server '{server.display_name}'.",
+            message=f"No active mission on server '{_server_label(server, server_name)}'.",
             server_name=server_name,
         )
     try:
@@ -416,13 +423,13 @@ async def restart_mission(
         await server.restart(modify_mission=modify_mission)
         return MissionControlResult(
             success=True,
-            message=f"Mission on server '{server.display_name}' restarted.",
+            message=f"Mission on server '{_server_label(server, server_name)}' restarted.",
             server_name=server_name,
         )
     except (TimeoutError, asyncio.TimeoutError):
         return MissionControlResult(
             success=False,
-            message=f"Timeout while restarting mission on '{server.display_name}'.",
+            message=f"Timeout while restarting mission on '{_server_label(server, server_name)}'.",
             server_name=server_name,
         )
     except Exception as ex:
@@ -452,7 +459,7 @@ async def rotate_mission(
     if server.status not in (Status.RUNNING, Status.PAUSED, Status.STOPPED):
         return MissionControlResult(
             success=False,
-            message=f"Server '{server.display_name}' is {server.status.value}.",
+            message=f"Server '{_server_label(server, server_name)}' is {server.status.value}.",
             server_name=server_name,
         )
     try:
@@ -461,13 +468,13 @@ async def rotate_mission(
         await server.loadNextMission(modify_mission=modify_mission, use_orig=use_orig)
         return MissionControlResult(
             success=True,
-            message=f"Mission rotated on server '{server.display_name}'.",
+            message=f"Mission rotated on server '{_server_label(server, server_name)}'.",
             server_name=server_name,
         )
     except (TimeoutError, asyncio.TimeoutError):
         return MissionControlResult(
             success=False,
-            message=f"Timeout while rotating mission on '{server.display_name}'.",
+            message=f"Timeout while rotating mission on '{_server_label(server, server_name)}'.",
             server_name=server_name,
         )
     except Exception as ex:
@@ -499,7 +506,7 @@ async def load_mission(
     if server.status not in (Status.RUNNING, Status.PAUSED, Status.STOPPED):
         return MissionLoadResult(
             success=False,
-            message=f"Server '{server.display_name}' is {server.status.value}.",
+            message=f"Server '{_server_label(server, server_name)}' is {server.status.value}.",
             server_name=server_name,
         )
 
@@ -634,7 +641,7 @@ async def set_active_mission(ctx: Any, server_name: str, mission: int | str,
     if server is None:
         return MissionListResult(success=False, message=f"Server '{server_name}' not found.",
                                  server_name=server_name)
-    display = getattr(server, "display_name", None) or server.name
+    display = _server_label(server, server_name)
     if server.status in MISSION_ACTIVE_REFUSED_STATES:
         return MissionListResult(success=False, message=MISSION_ACTIVE_LOADING_REFUSAL,
                                  server_name=server_name)
@@ -738,25 +745,27 @@ async def message_player(ctx: Any, server_name: str, ucid: str, message: str, mo
     player = server.get_player(ucid=ucid, active=True)
     if player is None:
         return await _audited(ctx, PlayerActionResult(
-            success=False, message=f"Player not found on server '{server.display_name}'.",
+            success=False,
+            message=f"Player not found on server '{_server_label(server, server_name)}'.",
             ucid=ucid), server)
 
-    name = getattr(player, "display_name", None) or getattr(player, "name", "") or ucid
+    name = _player_label(player, ucid)
+    label = _server_label(server, server_name)
     try:
         if mode == "chat":
             await player.sendChatMessage(body, sender)
-            sent = f"Chat message sent to {name} on server '{server.display_name}'."
+            sent = f"Chat message sent to {name} on server '{label}'."
         else:
             # ``timeout`` stays at the domain method's own default (-1 = the server's configured
             # ``message_timeout``): the Discord commands pass an explicit duration for popups, and
             # the console's control has no field for one, so the default is the honest choice.
             await player.sendPopupMessage(body, sender=sender)
-            sent = f"Popup sent to {name} on server '{server.display_name}'."
+            sent = f"Popup sent to {name} on server '{label}'."
         result = PlayerActionResult(success=True, message=sent, player_name=name, ucid=ucid)
     except (TimeoutError, asyncio.TimeoutError):
         result = PlayerActionResult(
             success=False,
-            message=f"Timeout while messaging {name} on server '{server.display_name}'.",
+            message=f"Timeout while messaging {name} on server '{label}'.",
             player_name=name, ucid=ucid)
     except Exception as ex:
         log.exception("message_player failed")
@@ -765,15 +774,230 @@ async def message_player(ctx: Any, server_name: str, ucid: str, message: str, mo
     return await _audited(ctx, result, server)
 
 
-async def _audited(ctx: Any, result: PlayerActionResult,
-                   server: Any = None) -> PlayerActionResult:
+#: How long the console waits for the screenshot it asked the server to take, in seconds — the
+#: numbers the Discord command uses. DCS writes the capture itself, so the file appears a moment
+#: after the request; a node flagged ``slow_system`` is given three times the wait.
+SCREENSHOT_TIMEOUT = 10
+SCREENSHOT_TIMEOUT_SLOW = 30
+
+#: How often the wait above looks for the new file, in seconds. One constant, because the cadence is
+#: part of the behaviour (a capture appears within a second or two, and polling faster than DCS writes
+#: only burns calls on the node).
+SCREENSHOT_POLL_SECONDS = 1
+
+#: The settings path that decides whether a server may be asked for a screenshot at all
+#: (``servers.yaml``: ``advanced.server_can_screenshot``). The server-side capture is a DCS feature
+#: of its own, so a server without it cannot answer — a refusal, not a failure.
+SCREENSHOT_SETTING = "advanced.server_can_screenshot"
+
+
+@action
+async def screenshot_player(ctx: Any, server_name: str, ucid: str) -> PlayerScreenshotResult:
+    """Take a screenshot of ONE player's screen, on a RUNNING server that allows it.
+
+    Mirrors the Discord command that does the same thing (``plugins/mission/commands.py``): the same
+    ``Player.makeScreenshot`` call, the same "wait for a NEW file to appear" loop and the same
+    ``SCREENSHOT_SETTING`` gate — with the console's TYPED refusals instead of a followup message.
+
+    WHICH FILE IS NEW is decided by comparing the server's screenshot list before and after the
+    request, never by taking the newest name: the server's list is written by DCS on its own
+    schedule, so a name alone cannot tell a fresh capture from one that was already there.
+
+    The KEY (not the image) comes back in the result — see
+    :class:`~core.action_results.PlayerScreenshotResult`. Reading the bytes is the transport's own
+    step, because the file is served by the SERVER's web GUI, not by this action's process.
+    """
+    server = ctx.resolve_server(server_name)
+    if server is None:
+        return await _audited(ctx, PlayerScreenshotResult(
+            success=False, message=f"Server '{server_name}' not found.", ucid=ucid))
+
+    label = _server_label(server, server_name)
+    if server.status != Status.RUNNING:
+        return await _audited(ctx, PlayerScreenshotResult(
+            success=False,
+            message=f"Server '{label}' is {server.status.value}, not running — a screenshot needs "
+                    f"the mission up.",
+            ucid=ucid), server)
+
+    if not server.settings.get('advanced', {}).get('server_can_screenshot', False):
+        return await _audited(ctx, PlayerScreenshotResult(
+            success=False,
+            message=f"Server '{label}' can not take screenshots (advanced.server_can_screenshot).",
+            ucid=ucid), server)
+
+    player = server.get_player(ucid=ucid, active=True)
+    if player is None:
+        return await _audited(ctx, PlayerScreenshotResult(
+            success=False, message=f"Player not found on server '{label}'.", ucid=ucid), server)
+
+    name = _player_label(player, ucid)
+    try:
+        before = await player.getScreenshots()
+        await player.makeScreenshot()
+        wait = (SCREENSHOT_TIMEOUT_SLOW if server.node.locals.get('slow_system', False)
+                else SCREENSHOT_TIMEOUT)
+        after: list[str] = []
+        for _ in range(wait):
+            await asyncio.sleep(SCREENSHOT_POLL_SECONDS)
+            after = await player.getScreenshots()
+            if len(after) > len(before):
+                break
+        if len(after) <= len(before):
+            result = PlayerScreenshotResult(
+                success=False,
+                message=f"Timeout while waiting for the screenshot of {name} on server '{label}'.",
+                player_name=name, ucid=ucid)
+        else:
+            key = after[-1]
+            # DCS 2.9.11+ answers with the file's name only; older servers answer with a path.
+            if 'screenshots' not in key:
+                key = '/screenshots/' + key
+            result = PlayerScreenshotResult(
+                success=True, message=f"Screenshot of {name} on server '{label}' taken.",
+                player_name=name, ucid=ucid, screenshot=key)
+    except (TimeoutError, asyncio.TimeoutError):
+        result = PlayerScreenshotResult(
+            success=False,
+            message=f"Timeout while taking the screenshot of {name} on server '{label}'.",
+            player_name=name, ucid=ucid)
+    except Exception as ex:
+        log.exception("screenshot_player failed")
+        result = PlayerScreenshotResult(success=False, message=f"Failed to take the screenshot: {ex}",
+                                        player_name=name, ucid=ucid)
+    return await _audited(ctx, result, server)
+
+
+_R = TypeVar("_R", bound=ActionResult)
+
+
+async def _audited(ctx: Any, result: _R, server: Any = None) -> _R:
     """Write the trail for *result* and return it (design §5.3 D1).
 
-    ONE place, so every exit of :func:`message_player` — the success, the four typed refusals and the
-    failed send — leaves exactly one entry, and none of them can forget the one mechanism.
+    ONE place, so every exit of :func:`message_player` and :func:`message_server` — the successes,
+    the typed refusals and the failed sends — leaves exactly one entry, and none of them can forget
+    the one mechanism.
     """
     await audit_action(ctx, result, server=server)
     return result
+
+
+# ── Server-wide messages ────────────────────────────────────────────────────
+#
+# The SERVER twin of ``message_player``: ONE message to everybody on a server, or to one coalition
+# of it. WHICH recipients a mode can reach is a DOMAIN fact, not a console choice:
+#
+# * ``popup`` -> ``Server.sendPopupMessage``, which hands the coalition on to DCS
+#   (``to: 'coalition', id: <value>``), so ``all``, ``red`` and ``blue`` all arrive;
+# * ``chat`` -> ``Server.sendChatMessage``, which sends ``Coalition.ALL`` as one server-wide line and
+#   FANS OUT every other coalition to the active players of that side — one TARGETED line per player
+#   (``net.send_chat_to``, the primitive ``Player.sendChatMessage`` posts). DCS has no
+#   coalition-scoped chat broadcast, so the fan-out is what delivers the choice; both modes therefore
+#   reach the same three recipients.
+
+#: The recipients each mode can reach: the allow-list this action holds, mirrored by the console's
+#: dialogs. Both modes carry the same three - see the section note above.
+SERVER_MESSAGE_RECIPIENTS: dict[str, tuple[str, ...]] = {
+    "chat": ("all", "red", "blue"),
+    "popup": ("all", "red", "blue"),
+}
+
+#: The ``Coalition`` each recipient word names.
+SERVER_MESSAGE_COALITIONS: dict[str, Coalition] = {
+    "all": Coalition.ALL,
+    "red": Coalition.RED,
+    "blue": Coalition.BLUE,
+}
+
+#: How each recipient is NAMED in a result's sentence.
+SERVER_MESSAGE_LABELS: dict[str, str] = {
+    "all": "everyone",
+    "red": "the Red coalition",
+    "blue": "the Blue coalition",
+}
+
+
+def _recipient_choices(allowed: tuple[str, ...]) -> str:
+    """The recipient allow-list as a sentence fragment: ``'all', 'red' or 'blue'``."""
+    quoted = [f"'{word}'" for word in allowed]
+    if len(quoted) == 1:
+        return quoted[0]
+    return ", ".join(quoted[:-1]) + f" or {quoted[-1]}"
+
+
+@action
+async def message_server(ctx: Any, server_name: str, message: str, mode: str = "popup",
+                         coalition: str = "all", sender: str | None = None) -> ServerControlResult:
+    """Send a message to EVERYBODY on a server, or to one of its coalitions.
+
+    Mirrors :func:`message_player` one level up — the same domain calls, the same mode split
+    (``popup`` default, ``chat``), the same length limit — addressed to the whole server instead of
+    one player. ``coalition`` picks the audience: ``all``, ``red`` or ``blue``.
+
+    A message that is empty or only whitespace is refused WITHOUT calling the domain method, exactly
+    as the player twin does. ``coalition`` is validated against the mode's OWN allow-list
+    (:data:`SERVER_MESSAGE_RECIPIENTS`), so a crafted body cannot address a message to something the
+    mode cannot deliver; every recipient of that list is deliverable on any server whose process can
+    take the message (the popup addresses the coalition in DCS, the chat line fans out per player of
+    the side), so no server-side configuration is required to pick one.
+
+    ``sender`` is the label the message appears to come from; ``None`` sends it anonymous, exactly as
+    the domain methods' own default does.
+
+    The trail is written HERE, once, whatever the transport — including for a REFUSAL, because one
+    entry per attempt is what an operator wants after an incident.
+    """
+    server = ctx.resolve_server(server_name)
+    if server is None:
+        return await _audited(ctx, ServerControlResult(
+            success=False, message=f"Server '{server_name}' not found.", server_name=server_name))
+
+    body = (message or "").strip()
+    if not body:
+        return await _audited(ctx, ServerControlResult(
+            success=False, message="Message must not be empty.", server_name=server_name), server)
+    if len(body) > MAX_MESSAGE_LENGTH:
+        return await _audited(ctx, ServerControlResult(
+            success=False, message=f"Message is longer than {MAX_MESSAGE_LENGTH} characters.",
+            server_name=server_name), server)
+
+    mode = (mode or "").strip().lower() or MESSAGE_MODES[0]
+    if mode not in MESSAGE_MODES:
+        return await _audited(ctx, ServerControlResult(
+            success=False, message=f"Unknown message mode '{mode}' (use 'popup' or 'chat').",
+            server_name=server_name), server)
+
+    recipient = (coalition or "").strip().lower() or "all"
+    allowed = SERVER_MESSAGE_RECIPIENTS[mode]
+    if recipient not in allowed:
+        return await _audited(ctx, ServerControlResult(
+            success=False,
+            message=f"Unknown recipient '{recipient}' (use {_recipient_choices(allowed)}).",
+            server_name=server_name), server)
+
+    name = _server_label(server, server_name)
+    label = SERVER_MESSAGE_LABELS[recipient]
+
+    target = SERVER_MESSAGE_COALITIONS[recipient]
+    try:
+        if mode == "chat":
+            await server.sendChatMessage(target, body, sender)
+            sent = f"Chat message sent to {label} on server '{name}'."
+        else:
+            # ``timeout`` stays at the domain method's own default (-1 = the server's configured
+            # ``message_timeout``): the console's control has no field for one.
+            await server.sendPopupMessage(target, body, sender=sender)
+            sent = f"Popup sent to {label} on server '{name}'."
+        result = ServerControlResult(success=True, message=sent, server_name=server_name)
+    except (TimeoutError, asyncio.TimeoutError):
+        result = ServerControlResult(
+            success=False, message=f"Timeout while messaging {label} on server '{name}'.",
+            server_name=server_name)
+    except Exception as ex:
+        log.exception("message_server failed")
+        result = ServerControlResult(success=False, message=f"Failed to send the message: {ex}",
+                                     server_name=server_name)
+    return await _audited(ctx, result, server)
 
 
 # ── Player control: kick / ban / mute (W4b) ─────────────────────────────────
@@ -842,8 +1066,68 @@ def parse_ban_days(value: Any) -> tuple[int | None, str]:
 
 
 def _player_label(player: Any, ucid: str) -> str:
-    """The name a player write's copy uses — the object's own, never anything the browser sent."""
-    return getattr(player, "display_name", None) or getattr(player, "name", "") or ucid
+    """The name a player write's copy uses — the object's own PLAIN name, never anything the browser sent.
+
+    The domain carries the name twice: ``name`` is the plain string and ``display_name`` is that same
+    string ESCAPED for Discord's markdown (``core/data/player.py``: ``utils.escape_string``), so
+    ``[TAG] Test Pilot`` reads back as ``\\[TAG\\] Test Pilot``. The sentence built from this label is
+    read in the console (:class:`~core.action_results.PlayerActionResult`'s message is what its notice
+    renders) and the Discord commands compose their own wording with ``display_name``, so the plain
+    attribute comes FIRST; a display name stays the last candidate before the ucid, for a double that
+    carries nothing else.
+    """
+    return getattr(player, "name", "") or getattr(player, "display_name", None) or ucid
+
+
+def _server_label(server: Any, fallback: str) -> str:
+    """The server name these sentences use — the plain name, read the way :func:`_player_label` does.
+
+    ``Server.display_name`` is likewise the name escaped for Discord's markdown (``core/data/server.py``:
+    ``SRS-1`` reads back as ``SRS\\-1``), and every sentence built here is read in the console. The
+    caller's own ``server_name`` is the last resort.
+    """
+    return getattr(server, "name", "") or getattr(server, "display_name", None) or fallback
+
+
+def _mission_label(mission: Any, fallback: str) -> str:
+    """The mission name these sentences use — the plain name, read the way :func:`_server_label` does.
+
+    ``Mission.display_name`` is the mission name escaped for Discord's markdown
+    (``core/data/mission.py``: ``utils.escape_string``), so ``[TAG]_Test*Pilot`` reads back as
+    ``\\[TAG\\]\\_Test\\*Pilot``; the console renders it into a browser. The caller's own last resort
+    — the mission's filename — is used when the double carries neither name.
+    """
+    return getattr(mission, "name", "") or getattr(mission, "display_name", None) or fallback
+
+
+def _caller_ban_targets(ctx: Any) -> list[str]:
+    """The servers a ban issued through *ctx* covers.
+
+    Every server in the caller's view whose ``managed_by`` names one of the caller's roles; an empty
+    list means the caller is unscoped and the ban is bot-wide.
+    """
+    scope = getattr(ctx, "_scope", None)
+    if scope is None or getattr(scope, "unrestricted", False):
+        return []
+    names: list[str] = []
+    for name, server in ctx.servers.items():
+        try:
+            managed_by = server.locals.get("managed_by")
+        except AttributeError:
+            managed_by = None
+        if not managed_by:
+            continue
+        try:
+            if scope.allows(managed_by):
+                names.append(name)
+        except Exception:
+            log.exception("ban scope: the scope could not be applied to '%s', skipping it.", name)
+    return names
+
+
+def _ban_scope_label(targets: list[str]) -> str:
+    """The human-readable scope of a ban the ``server_name`` rows of *targets* cover."""
+    return "all servers" if not targets else ", ".join(targets)
 
 
 def _ban_service(ctx: Any) -> Any:
@@ -898,20 +1182,22 @@ async def kick_player(ctx: Any, server_name: str, ucid: str, reason: str = "") -
     player = server.get_player(ucid=ucid, active=True)
     if player is None:
         return await _audited(ctx, PlayerActionResult(
-            success=False, message=f"Player not found on server '{server.display_name}'.",
+            success=False,
+            message=f"Player not found on server '{_server_label(server, server_name)}'.",
             ucid=ucid), server)
 
     name = _player_label(player, ucid)
+    label = _server_label(server, server_name)
     try:
         await server.kick(player, body)
         result = PlayerActionResult(
             success=True,
-            message=f"Player {name} (ucid={ucid}) kicked from server '{server.display_name}'.",
+            message=f"Player {name} (ucid={ucid}) kicked from server '{label}'.",
             player_name=name, ucid=ucid)
     except (TimeoutError, asyncio.TimeoutError):
         result = PlayerActionResult(
             success=False,
-            message=f"Timeout while kicking {name} from server '{server.display_name}'.",
+            message=f"Timeout while kicking {name} from server '{label}'.",
             player_name=name, ucid=ucid)
     except Exception as ex:
         log.exception("kick_player failed")
@@ -934,6 +1220,10 @@ async def ban_player(ctx: Any, server_name: str, ucid: str, reason: str = "",
     ``sender`` is who the ban list names as ``banned_by``, mirroring ``BanModal``'s
     ``interaction.user.display_name``; ``None`` falls back to the transport's own audit actor, so a
     ban is never attributed to nobody.
+
+    The rows written are the CALLER's own scope — every server in the caller's view whose
+    ``managed_by`` names one of the caller's roles, one row each, or a single bot-wide row when the
+    caller is unscoped or manages no tagged server.
     """
     server = ctx.resolve_server(server_name)
     if server is None:
@@ -956,7 +1246,8 @@ async def ban_player(ctx: Any, server_name: str, ucid: str, reason: str = "",
     player = server.get_player(ucid=ucid, active=True)
     if player is None:
         return await _audited(ctx, PlayerActionResult(
-            success=False, message=f"Player not found on server '{server.display_name}'.",
+            success=False,
+            message=f"Player not found on server '{_server_label(server, server_name)}'.",
             ucid=ucid), server)
 
     service = _ban_service(ctx)
@@ -967,12 +1258,16 @@ async def ban_player(ctx: Any, server_name: str, ucid: str, reason: str = "",
 
     name = _player_label(player, ucid)
     banned_by = (sender or "").strip() or ctx.audit_actor
+    targets = _caller_ban_targets(ctx)
+    scope = _ban_scope_label(targets)
+    stamp = datetime.now(tz=timezone.utc)
     try:
-        await service.ban(ucid, banned_by, body, period)
+        for target in targets or [None]:
+            await service.ban(ucid, banned_by, body, period, server_name=target, banned_at=stamp)
         result = PlayerActionResult(
             success=True,
-            message=(f"Player {name} (ucid={ucid}) banned for {period} days."
-                     if period else f"Player {name} (ucid={ucid}) banned permanently."),
+            message=(f"Player {name} (ucid={ucid}) banned for {period} days on {scope}." if period
+                     else f"Player {name} (ucid={ucid}) banned permanently on {scope}."),
             player_name=name, ucid=ucid)
     except (TimeoutError, asyncio.TimeoutError):
         result = PlayerActionResult(success=False, message=f"Timeout while banning {name}.",
@@ -1001,7 +1296,8 @@ async def _set_muted(ctx: Any, server_name: str, ucid: str, mute: bool) -> Playe
     player = server.get_player(ucid=ucid, active=True)
     if player is None:
         return await _audited(ctx, PlayerActionResult(
-            success=False, message=f"Player not found on server '{server.display_name}'.",
+            success=False,
+            message=f"Player not found on server '{_server_label(server, server_name)}'.",
             ucid=ucid), server)
 
     name = _player_label(player, ucid)
@@ -1019,7 +1315,7 @@ async def _set_muted(ctx: Any, server_name: str, ucid: str, mute: bool) -> Playe
         verb = "muted" if mute else "unmuted"
         result = PlayerActionResult(
             success=True,
-            message=f"Player {name} on server '{server.display_name}' {verb}.",
+            message=f"Player {name} on server '{_server_label(server, server_name)}' {verb}.",
             player_name=name, ucid=ucid)
     except (TimeoutError, asyncio.TimeoutError):
         result = PlayerActionResult(success=False, message=f"Timeout while muting {name}.",
@@ -1103,16 +1399,17 @@ async def get_mission_info(ctx: Any, server_name: str) -> MissionListResult:
     if server.current_mission is None:
         return MissionListResult(
             success=False,
-            message=f"No active mission on server '{server.display_name}'.",
+            message=f"No active mission on server '{_server_label(server, server_name)}'.",
             server_name=server_name,
         )
     m = server.current_mission
+    label = _mission_label(m, m.filename)
     return MissionListResult(
         success=True,
-        message=f"Active mission: {m.display_name}",
+        message=f"Active mission: {label}",
         server_name=server_name,
         data={
-            "name": m.display_name,
+            "name": label,
             "filename": m.filename,
             "map": m.map,
             "start_time": m.start_time,
@@ -1461,7 +1758,7 @@ async def upload_mission(ctx: Any, server_name: str, name: str, source: bytes | 
     if server is None:
         return MissionUploadResult(success=False, message=f"Server '{server_name}' not found.",
                                    server_name=server_name)
-    display = getattr(server, "display_name", None) or server.name
+    display = _server_label(server, server_name)
     refusal = _refuse_upload(name)
     if refusal:
         return await _audited_upload(ctx, MissionUploadResult(
@@ -1605,7 +1902,7 @@ async def download_mission(ctx: Any, server_name: str, mission: int | str) -> Mi
     if server is None:
         return MissionDownloadResult(success=False, message=f"Server '{server_name}' not found.",
                                      server_name=server_name)
-    display = getattr(server, "display_name", None) or server.name
+    display = _server_label(server, server_name)
     base_dir = os.path.expandvars(await server.get_missions_dir())
     try:
         configured = await server.getMissionList()
@@ -1691,7 +1988,7 @@ async def get_mission_list(ctx: Any, server_name: str) -> MissionListResult:
     if server is None:
         return MissionListResult(success=False, message=f"Server '{server_name}' not found.",
                                  server_name=server_name)
-    display = getattr(server, "display_name", None) or server.name
+    display = _server_label(server, server_name)
     try:
         base_dir = os.path.expandvars(await server.get_missions_dir())
         configured = await server.getMissionList()
@@ -1773,7 +2070,7 @@ async def get_addable_missions(ctx: Any, server_name: str) -> MissionListResult:
     if server is None:
         return MissionListResult(success=False, message=f"Server '{server_name}' not found.",
                                  server_name=server_name)
-    display = getattr(server, "display_name", None) or server.name
+    display = _server_label(server, server_name)
     try:
         base_dir = await server.get_missions_dir()
         ignore = [".dcssb"]
@@ -1836,7 +2133,7 @@ async def add_mission(ctx: Any, server_name: str, path: str, *, autostart: bool 
     if server is None:
         return MissionListResult(success=False, message=f"Server '{server_name}' not found.",
                                  server_name=server_name)
-    display = getattr(server, "display_name", None) or server.name
+    display = _server_label(server, server_name)
     refusal = _refuse_add(path)
     if refusal:
         return MissionListResult(success=False, message=refusal, server_name=server_name)
@@ -1909,7 +2206,7 @@ async def delete_mission(ctx: Any, server_name: str, mission: int | str, *,
     if server is None:
         return MissionListResult(success=False, message=f"Server '{server_name}' not found.",
                                  server_name=server_name)
-    display = getattr(server, "display_name", None) or server.name
+    display = _server_label(server, server_name)
     try:
         missions = await server.getMissionList()
     except Exception as ex:
@@ -2247,7 +2544,7 @@ async def reorder_mission(ctx: Any, server_name: str, mission: int | str,
     if server is None:
         return MissionListResult(success=False, message=f"Server '{server_name}' not found.",
                                  server_name=server_name)
-    display = getattr(server, "display_name", None) or server.name
+    display = _server_label(server, server_name)
     if _mission_list_online(server):
         return MissionListResult(success=False, message=MISSION_LIST_OFFLINE_ONLY,
                                  server_name=server_name)

@@ -13,7 +13,8 @@ from core import (Plugin, DEFAULT_TAG, Side, DataObjectFactory, utils, Status, S
 from core.actions import ActionContext, call_action
 from datetime import datetime, timedelta, timezone
 from discord.ext import tasks
-from fastapi import FastAPI, APIRouter, Form, Query, HTTPException, Depends, File, UploadFile, Response
+from fastapi import (FastAPI, APIRouter, Form, Query, HTTPException, Depends, File, UploadFile, Response,
+                     BackgroundTasks)
 from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
 from pathlib import Path
 from starlette.requests import Request
@@ -27,9 +28,7 @@ from services.bot import DCSServerBot
 from services.servicebus import ServiceBus
 from services.webservice import WebService
 
-# ruamel YAML support
-from ruamel.yaml import YAML
-yaml = YAML()
+from core.utils.yaml_helper import new_yaml
 
 if TYPE_CHECKING:
     from plugins.srs.commands import SRS
@@ -72,11 +71,12 @@ from .models import (
     ServerStartResponse,
     ServerStopResponse,
     ServerRestartResponse,
+    ServerShutdownResponse,
+    NodeRestartResponse,
     MissionUploadResponse,
     GroupWaypointsResponse,
     MissionGroupResponse,
     MissionGroupsResponse,
-    MissionGroupSummary,
     MissionBullseyesResponse,
     MissionDrawingsResponse,
     MissionUnitResponse,
@@ -123,14 +123,14 @@ class RestAPI(Plugin):
             config = os.path.join(self.node.config_dir, 'plugins', f'{self.plugin_name}.yaml')
             if not os.path.exists(config):
                 return
-            data = yaml.load(Path(config).read_text(encoding='utf-8'))
+            data = new_yaml().load(Path(config).read_text(encoding='utf-8'))
             api_key = data.get(DEFAULT_TAG, {}).pop('api_key', None)
             if api_key:
                 data[DEFAULT_TAG]['auth'] = {
                     "api_key": api_key
                 }
                 with Path(config).open(mode='w', encoding='utf-8') as outfile:
-                    yaml.dump(data, outfile)
+                    new_yaml().dump(data, outfile)
 
     async def init_webservice(self):
         # give the webservice 10 seconds to launch on master switches
@@ -680,6 +680,24 @@ class RestAPI(Plugin):
             summary = "Restart a server instance.",
             tags = ["Instance Control"]
         )
+        add_secured_api_route(
+            "/instance/shutdown", self.instance_shutdown,
+            methods = ["POST"],
+            response_model = ServerShutdownResponse,
+            description = "Shut a server down (terminates the DCS process).",
+            summary = "Shut down a server instance.",
+            tags = ["Instance Control"]
+        )
+
+        # Node routes
+        add_secured_api_route(
+            "/node/restart", self.node_restart,
+            methods = ["POST"],
+            response_model = NodeRestartResponse,
+            description = "Restart a node, or all nodes. The bot reloads its configuration.",
+            summary = "Restart a node.",
+            tags = ["Node Control"]
+        )
 
         ## Mission routes
         add_secured_api_route(
@@ -822,7 +840,120 @@ class RestAPI(Plugin):
         except Exception as ex:
             self.log.exception(ex)
             raise HTTPException(status_code=500, detail=f"Failed to restart server: {str(ex)}")
-    
+
+    # Shut down a server (DCS process) based on the provided name.
+    # Endpoint:   /instance/shutdown
+    # Method:     [POST]
+    # Params:     - server_name   [required]
+    #             - force         [optional, default: False]
+    #             - maintenance   [optional, default: True]
+    #             - when_empty    [optional, default: False]
+    async def instance_shutdown(
+        self,
+        server_name: str = Query(...),
+        force: bool = Query(False, description="Kill the DCS process instead of a graceful shutdown "
+                                             "(a shutdown deferred by when_empty is always graceful)"),
+        maintenance: bool = Query(True, description="Set the maintenance flag, so the Scheduler does not start the "
+                                                    "server again"),
+        when_empty: bool = Query(False, description="If players are connected, shut down once the server is empty")
+    ):
+        """Shut a server down, like /server shutdown."""
+        resolved_server_name, server = self.get_resolved_server(server_name)
+        if not server:
+            raise HTTPException(status_code=404, detail=f"Server '{server_name}' not found.")
+
+        if server.status == Status.SHUTDOWN:
+            raise HTTPException(status_code=409, detail=f"Server '{resolved_server_name}' is already shut down.")
+
+        # /server shutdown asks to force a shutdown in these states, we cannot
+        if server.status in [Status.UNREGISTERED, Status.LOADING, Status.SHUTTING_DOWN] and not force:
+            raise HTTPException(status_code=409,
+                                detail=f"Server '{resolved_server_name}' is in {server.status.name} state, "
+                                       f"use force to shut it down.")
+
+        # force never cuts a session either: the deferred shutdown is a graceful one
+        if when_empty and server.is_populated():
+            # /server shutdown asks before replacing a pending action, we cannot
+            if server.restart_pending or server.on_empty:
+                raise HTTPException(status_code=409,
+                                    detail=f"An action is already pending on server '{resolved_server_name}'.")
+            # same as "later" in /server shutdown, run by the Scheduler on onServerEmpty
+            server.on_empty = {
+                "method": "shutdown",
+                "maintenance": maintenance
+            }
+            server.restart_pending = True
+            return {
+                "status": "pending",
+                "message": f"Server '{resolved_server_name}' will shut down when it is empty."
+            }
+
+        if maintenance:
+            server.maintenance = True
+        if server.on_empty:
+            server.on_empty.clear()
+
+        try:
+            if force:
+                await server.shutdown(force=True)
+            else:
+                # same as the Scheduler's teardown_dcs
+                await self.bus.send_to_node({"command": "onShutdown", "server_name": server.name})
+                await asyncio.sleep(1)
+                await server.shutdown()
+            if not maintenance and server.maintenance:
+                server.maintenance = False
+            await self.bot.audit("shut down DCS server through the RestAPI", server=server)
+            return {
+                "status": "success",
+                "message": f"Server '{resolved_server_name}' shut down."
+            }
+        except (TimeoutError, asyncio.TimeoutError):
+            raise HTTPException(status_code=504, detail="Timeout while shutting down server.")
+        except Exception as ex:
+            self.log.exception(ex)
+            raise HTTPException(status_code=500, detail=f"Failed to shut down server: {str(ex)}")
+
+    # Restart a node, or all nodes, like /node restart.
+    # Endpoint:   /node/restart
+    # Method:     [POST]
+    # Params:     - node_name     [optional, default: all nodes]
+    async def node_restart(
+        self,
+        background_tasks: BackgroundTasks,
+        node_name: str | None = Query(None, description="Node to restart (default: all nodes)")
+    ):
+        """Restart a node, or all nodes, like /node restart. The response is sent before the restart."""
+        if node_name and node_name not in self.node.all_nodes:
+            raise HTTPException(status_code=404, detail=f"Node '{node_name}' not found.")
+
+        try:
+            restarted = []
+            for n in await self.node.get_active_nodes():
+                if not node_name or n == node_name:
+                    await self.bus.send_to_node({
+                        "command": "rpc",
+                        "object": "Node",
+                        "method": "restart"
+                    }, node=n)
+                    restarted.append(n)
+            if not node_name or node_name == self.node.name:
+                # the RestAPI runs in this process: answer first, restart afterward
+                background_tasks.add_task(self.node.restart)
+                restarted.append(self.node.name)
+        except Exception as ex:
+            self.log.exception(ex)
+            raise HTTPException(status_code=500, detail=f"Failed to restart node: {str(ex)}")
+
+        if not restarted:
+            raise HTTPException(status_code=409, detail=f"Node '{node_name}' is not active.")
+        await self.bot.audit(f"restarted node(s) {', '.join(restarted)} through the RestAPI")
+        return {
+            "status": "success",
+            "message": f"Node(s) {', '.join(restarted)} restarting.",
+            "nodes": restarted
+        }
+
 
     # Return a listing of available missions
     # Endpoint:   /instance/missions
@@ -911,8 +1042,17 @@ class RestAPI(Plugin):
     # Restart the mission on the provided server.
     # Endpoint:   /instance/mission/restart
     # Method:     [POST]
-    # Params:     - server_name   [required]
-    async def instance_mission_restart(self, server_name: str = Query(...)):
+    # Params:     - server_name     [required]
+    #             - run_extensions  [optional, default: False]
+    #             - use_orig        [optional, default: True]
+    #             - when_empty      [optional, default: False]
+    async def instance_mission_restart(
+        self,
+        server_name: str = Query(...),
+        run_extensions: bool = Query(False, description="Run the extensions (MizEdit, RealWeather, ...) on the mission"),
+        use_orig: bool = Query(True, description="Start from the original mission (.orig)"),
+        when_empty: bool = Query(False, description="If players are connected, restart once the server is empty")
+    ):
         """Restart the mission on the provided server."""
         resolved_server_name, server = self.get_resolved_server(server_name)
         if not server:
@@ -921,8 +1061,27 @@ class RestAPI(Plugin):
         if server.status not in [Status.RUNNING, Status.PAUSED, Status.STOPPED]:
             raise HTTPException(status_code=409, detail=f"Server '{resolved_server_name}' is in {server.status.name} state.")
 
+        if when_empty and server.is_populated():
+            # /mission restart asks before replacing a pending action, we cannot
+            if server.restart_pending or server.on_empty:
+                raise HTTPException(status_code=409,
+                                    detail=f"An action is already pending on server '{resolved_server_name}'.")
+            # same as "later" in /mission restart, run by the Scheduler on onServerEmpty
+            server.on_empty = {
+                "method": "restart",
+                "run_extensions": run_extensions,
+                "use_orig": use_orig
+            }
+            server.restart_pending = True
+            return {
+                "status": "pending",
+                "message": f"Mission on server '{resolved_server_name}' will restart when the server is empty."
+            }
+
         try:
-            await server.restart(modify_mission=False)
+            if run_extensions and not server.locals.get('mission_rewrite', True) and server.status != Status.STOPPED:
+                await server.stop()
+            await server.restart(modify_mission=run_extensions, use_orig=use_orig)
             return {
                 "status": "success",
                 "message": f"Mission on server '{resolved_server_name}' restarted."

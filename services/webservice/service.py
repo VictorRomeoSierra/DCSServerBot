@@ -16,9 +16,7 @@ from starlette.requests import Request
 from typing_extensions import override
 from uvicorn import Config
 
-# ruamel YAML support
-from ruamel.yaml import YAML
-yaml = YAML()
+from core.utils.yaml_helper import new_yaml
 
 
 @ServiceRegistry.register(master_only=True, depends_on=[ServiceBus])
@@ -39,6 +37,8 @@ class WebService(Service):
         self.ui = None
         #: the upgrade poll's task — created in ``start()``, cancelled in ``stop()``
         self.upgrade_task = None
+        #: the render warm-up's task — created in ``start()``, cancelled in ``stop()``
+        self.warm_task = None
         if cfg:
             self.app = self._create_app()
             self.config = Config(
@@ -60,7 +60,7 @@ class WebService(Service):
         old_config = os.path.join(self.node.config_dir, 'plugins', 'restapi.yaml')
         new_config = os.path.join(self.node.config_dir, 'services', 'webservice.yaml')
         if os.path.exists(old_config) and not os.path.exists(new_config):
-            old = yaml.load(Path(old_config).read_text(encoding='utf-8'))
+            old = new_yaml().load(Path(old_config).read_text(encoding='utf-8'))
             new = old.copy()
             if 'prefix' in old.get(DEFAULT_TAG, {}):
                 old[DEFAULT_TAG] = {
@@ -71,12 +71,12 @@ class WebService(Service):
 
             if old:
                 with open(old_config, mode='w', encoding='utf-8') as old_out:
-                    yaml.dump(old, old_out)
+                    new_yaml().dump(old, old_out)
             else:
                 os.remove(old_config)
             if new:
                 with open(new_config, mode='w', encoding='utf-8') as new_out:
-                    yaml.dump(new, new_out)
+                    new_yaml().dump(new, new_out)
 
     def _create_app(self) -> FastAPI:
         """Create the FastAPI app and install the admin web shell on it.
@@ -204,6 +204,11 @@ class WebService(Service):
         # factory reads too).
         if frontend_enabled(self.get_config()):
             self.upgrade_task = asyncio.create_task(self._poll_upgrades())
+            # THE RENDER WARM-UP: the first page after a boot paid the whole schema parse (measured
+            # 781 ms for a node click against 39 ms once the caches were warm). Ask for the same
+            # things a page will ask for, ONCE, in a THREAD — so the FIRST click costs what the rest
+            # cost, and nothing here delays the console becoming available.
+            self.warm_task = asyncio.create_task(self._warm_render_caches())
 
     async def _poll_upgrades(self) -> None:
         """Sample the cluster for pending upgrades and refresh the cache the render reads.
@@ -226,8 +231,39 @@ class WebService(Service):
                 self.log.exception("WebService: the upgrade check sweep failed.")
             await asyncio.sleep(poller.sample_seconds)
 
+    async def _warm_render_caches(self) -> None:
+        """Pre-pay the first render: parse the schemas and run the notice checks, off the boot path.
+
+        The work itself lives in :func:`services.webservice.warmup.warm` so it can be tested without a
+        service; here it is only dispatched — in a THREAD (the parse is CPU work, and ``to_thread``
+        keeps it off the event loop) and with every failure contained. A console whose warm-up fails is
+        exactly the console we had before: correct, and slow on the first click.
+        """
+        from services.webservice import warmup
+
+        try:
+            # the shell's Jinja environment (``render`` reads it off the registrar): gave it the
+            # templates too, so the FIRST visit to a page does not pay its compile either
+            environment = getattr(self.ui, "environment", None)
+            parsed, checked, templates, seconds = await asyncio.to_thread(
+                warmup.warm, self.node.config_dir, environment)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.log.exception("WebService: the render warm-up failed; the first page will pay it.")
+            return
+        self.log.info(f"WebService: render warm-up done — {parsed} schemas parsed, "
+                      f"{checked} notices checked, {templates} templates compiled in {seconds:.1f}s.")
+
     @override
     async def stop(self):
+        if self.warm_task:
+            # the warm-up is a one-shot: if the service stops while it runs, end the WAIT for it (the
+            # thread itself finishes harmlessly in the background).
+            self.warm_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.warm_task
+            self.warm_task = None
         if self.upgrade_task:
             # the poll runs for the service's lifetime: end it with the service, and wait for the
             # cancellation so a master/agent switch cannot leave a poller sampling a stopped app.

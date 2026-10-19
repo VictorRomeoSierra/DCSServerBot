@@ -14,9 +14,7 @@ from psycopg import sql
 from typing import TYPE_CHECKING, cast
 from typing_extensions import override
 
-# ruamel YAML support
-from ruamel.yaml import YAML
-yaml = YAML()
+from core.utils.yaml_helper import new_yaml
 
 if TYPE_CHECKING:
     from core import Instance, Server
@@ -76,7 +74,7 @@ class NodeProxy(Node):
         _locals = dict()
         config_file = os.path.join(self.config_dir, 'nodes.yaml')
         if os.path.exists(config_file):
-            node: dict = yaml.load(Path(config_file).read_text(encoding='utf-8')).get(self.name)
+            node: dict = new_yaml().load(Path(config_file).read_text(encoding='utf-8')).get(self.name)
             if not node:
                 return {}
             for name, element in node.items():
@@ -262,7 +260,7 @@ class NodeProxy(Node):
     @override
     async def read_file_window(self, path: str, *, length: int, offset: int | None = None,
                                behind: int | None = None) -> tuple[bytes, int, int | float]:
-        """A WINDOW of a REMOTE node's file plus its size and identity (L1; see :meth:`Node.read_file_window`).
+        """A WINDOW of a REMOTE node's file plus its size and identity (see :meth:`Node.read_file_window`).
 
         The same one-shot ``files`` drop-box transport :meth:`read_file` uses: the agent writes ONLY
         the window into the row and answers with ``(row id, size, identity)``; this side reads the row,
@@ -349,7 +347,7 @@ class NodeProxy(Node):
                          ) -> list[tuple[str, int, float]]:
         """The FILES matching *pattern* on a REMOTE node, each as ``(path, size, mtime)``, NEWEST FIRST.
 
-        The remote half of :meth:`Node.list_files` (L2): the same RPC the rest of this proxy uses,
+        The remote half of :meth:`Node.list_files`: the same RPC the rest of this proxy uses,
         answered by the agent's own :meth:`NodeImpl.list_files`. The reply is normalised to a list of
         ``(path, size, mtime)`` triples, so a caller sees the same shape whether the node is local or
         remote. NOT cached: a download list must reflect a just-rotated log, so the route re-enumerates
@@ -492,6 +490,20 @@ class NodeProxy(Node):
             "params": {
                 "server": server.name,
                 "instance": instance.name
+            }
+        }, node=self.name, timeout=timeout)
+
+    @override
+    async def bind_server(self, instance_name: str, name: str, channels: dict | None = None) -> None:
+        timeout = 60 if not self.slow_system else 120
+        await self.bus.send_to_node_sync({
+            "command": "rpc",
+            "object": "Node",
+            "method": "bind_server",
+            "params": {
+                "instance_name": instance_name,
+                "name": name,
+                "channels": channels
             }
         }, node=self.name, timeout=timeout)
 

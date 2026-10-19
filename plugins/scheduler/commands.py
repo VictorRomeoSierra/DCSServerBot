@@ -23,9 +23,7 @@ from zoneinfo import ZoneInfo
 from .listener import SchedulerListener
 from .views import ServerConfigView
 
-# ruamel YAML support
-from ruamel.yaml import YAML
-yaml = YAML()
+from core.utils.yaml_helper import new_yaml
 
 _ = get_translation(__name__.split('.')[1])
 
@@ -49,7 +47,7 @@ class Scheduler(Plugin[SchedulerListener]):
             os.makedirs(os.path.join(self.node.config_dir, 'plugins'), exist_ok=True)
             with open(os.path.join(self.node.config_dir, 'plugins', 'scheduler.yaml'), mode='w',
                       encoding='utf-8') as outfile:
-                yaml.dump(config, outfile)
+                new_yaml().dump(config, outfile)
         return config
 
     async def migrate(self, new_version: str, conn: psycopg.AsyncConnection | None = None) -> None:
@@ -106,7 +104,7 @@ class Scheduler(Plugin[SchedulerListener]):
             return
 
         config = os.path.join(self.node.config_dir, 'plugins', f'{self.plugin_name}.yaml')
-        data = yaml.load(Path(config).read_text(encoding='utf-8'))
+        data = new_yaml().load(Path(config).read_text(encoding='utf-8'))
         if self.node.name in data.keys():
             for name, node in data.items():
                 if name == DEFAULT_TAG:
@@ -118,7 +116,7 @@ class Scheduler(Plugin[SchedulerListener]):
             for instance in data.values():
                 change_instance(instance)
         with Path(config).open(mode='w', encoding='utf-8') as outfile:
-            yaml.dump(data, outfile)
+            new_yaml().dump(data, outfile)
         self.locals = self.read_locals()
 
     async def _handle_load(self, server: Server, config: dict) -> Status:
@@ -497,9 +495,11 @@ class Scheduler(Plugin[SchedulerListener]):
             )
             if rc is False:
                 self.log.error(f"Mission {new_mission} not loaded on server {server.name}")
+                server.restart_pending = False
                 return
             elif rc is None:
                 self.log.debug(f"Mission {new_mission} already loaded on server {server.name}")
+                server.restart_pending = False
                 return
 
     async def run_action(self, server: Server, rconf: dict):
@@ -527,6 +527,7 @@ class Scheduler(Plugin[SchedulerListener]):
         except TimeoutError:
             self.log.warning(f"{self.__cog_name__}: Timeout getting mission list from server {server.name}, "
                              f"skipping {method} action")
+            server.restart_pending = False
             return
 
         # select the new mission id
@@ -546,6 +547,7 @@ class Scheduler(Plugin[SchedulerListener]):
                 if not new_mission:
                     self.log.error(f"{self.__cog_name__}: "
                                    f"Mission {rconf['mission_file']} cannot be loaded on server {server.name}!")
+                    server.restart_pending = False
                     return
         else:
             new_mission = int(await server.getStartIndex())
@@ -554,9 +556,10 @@ class Scheduler(Plugin[SchedulerListener]):
                 if new_mission > len(mission_list):
                     new_mission = 1
 
-                # set the new start index if the server is shut down
-                if server.status == Status.SHUTDOWN:
-                    await server.setStartIndex(new_mission)
+        # a server that is not running starts on listStartIndex, so point it to the selected mission
+        # (check_state sets LOADING before it runs the startup action)
+        if server.status in [Status.SHUTDOWN, Status.LOADING]:
+            await server.setStartIndex(new_mission)
 
         # do we change the running mission?
         if server.status in [Status.RUNNING, Status.PAUSED] and server.current_mission:
@@ -578,6 +581,7 @@ class Scheduler(Plugin[SchedulerListener]):
                 user=rconf.get('user'),
                 mission=new_mission
             )
+            server.restart_pending = False
             return
 
         # change password if configured
@@ -1387,7 +1391,12 @@ class Scheduler(Plugin[SchedulerListener]):
                 await interaction.followup.send(_('Aborted.'))
                 return
 
-        view = ServerConfigView(self.bot, server)
+        view = ServerConfigView(
+            self.bot, server,
+            admin=((not interaction.client.node.locals.get('restrict_owner', False) and
+                    interaction.user.id == interaction.client.owner_id) or
+                   utils.check_roles(interaction.client.roles['Admin'], interaction.user))
+        )
         embed = view.render()
         msg = await interaction.followup.send(embed=embed, view=view, ephemeral=ephemeral)
         try:

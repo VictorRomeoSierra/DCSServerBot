@@ -4,14 +4,14 @@ A page is not hand-written per file: it is GENERATED from the pykwalify schema t
 validates that file against (see :mod:`services.webservice.configgen`). This page is the generator's
 first real consumer — the install's ``main.yaml``, its DEFAULT configuration — and it is here to
 prove the machinery end to end: a schema becomes a form, the form's save goes through the ONE write
-primitive (``core.utils.configwrite``, card S0's ``patch_config_file``), and the honest banner says a
+primitive (``core.utils.configwrite``'s ``patch_config_file``), and the honest banner says a
 restart applies it.
 
 WHAT IS WHERE
 -------------
 * the GET renders the generated form (left) and the file RE-SERIALISED as YAML (right, READ-ONLY in
-  this card — it is a dump of the parse, not the raw bytes, and for a no-op save nothing is written);
-  expert mode is a later card and is deliberately NOT built here;
+  this version — it is a dump of the parse, not the raw bytes, and for a no-op save nothing is
+  written); expert mode is deliberately NOT built here;
 * the POST reads the submitted fields back through the SAME generator tree, mutates the round-trip
   document in place (:func:`configgen.apply_form`), and hands it to ``patch_config_file`` — it never
   opens, parses or writes a file itself, so there is no second write path;
@@ -39,7 +39,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from core.utils import configwrite
 
-from .. import catalog, configgen, i18n, permissions, plugin_registry, readmodels, scopes, session
+from .. import (catalog, configgen, i18n, permissions, plugin_registry, readmodels, scopes, session,
+                validation)
 from ..registry import NavItem
 from . import actions as actions_page
 from . import dashboard as dashboard_page
@@ -713,8 +714,9 @@ def _page_context(request: Request, entry: GlobalFile, current_url: str) -> dict
     # files, so a file reported clean here is one a save will accept.
     if document is not None and entry.schema_files:
         try:
-            configwrite.validate_against_schema(configwrite.read_config_text(path),
-                                                list(entry.schema_files), path=path)
+            # the notice's check, MEMOISED: an unchanged file is not re-validated per render (see
+            # services/webservice/validation.py — a save still validates freshly)
+            validation.validate_cached(path, list(entry.schema_files))
         except configwrite.ConfigValidationError as ex:
             schema_error = _clean_detail(ex.errors) or str(ex)
         except configwrite.ConfigWriteError:
@@ -1022,8 +1024,9 @@ def scoped_context(request: Request, entry: GlobalFile, current_url: str,
             yaml_text = ""
     if document is not None and entry.schema_files:
         try:
-            configwrite.validate_against_schema(configwrite.read_config_text(path),
-                                                list(entry.schema_files), path=path)
+            # the notice's check, MEMOISED: an unchanged file is not re-validated per render (see
+            # services/webservice/validation.py — a save still validates freshly)
+            validation.validate_cached(path, list(entry.schema_files))
         except configwrite.ConfigValidationError as ex:
             schema_error = _clean_detail(ex.errors) or str(ex)
         except configwrite.ConfigWriteError:
@@ -1235,8 +1238,6 @@ def load_landing(request: Request) -> dict:
     its own is never dropped. A default plugin being switched OFF is shown the inline warning first
     (``?warn=<name>``) — the switch is a LINK, and only the confirm button posts the write.
     """
-    from urllib.parse import quote
-
     config = config_dir(request)
     main_path = config_path(request)
     csrf = session.get_csrf_token(request)

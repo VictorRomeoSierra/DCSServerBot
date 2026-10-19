@@ -10,61 +10,64 @@ This documentation is automatically generated from the RestAPI plugin definition
 - [Credits](#credits)
 - [Utilities](#utilities)
 - [Instance Control](#instance-control)
+- [Node Control](#node-control)
 - [Mission Control](#mission-control)
 - [Mission](#mission)
 - [Schema Models Reference](#schema-models-reference)
 
 ## Summary Overview
 
-| API                       | GET / POST | Parameters                                                                      | Description                                                                        |
-|---------------------------|------------|---------------------------------------------------------------------------------|------------------------------------------------------------------------------------|
-| /airbase                  | GET        | server_name: string, airbase_name: string                                       | Get information for a given airbase on a given server.                             |
-| /airbase/atis             | GET        | server_name: string, airbase_name: string                                       | Get ATIS information for an airbase on a given server.                             |
-| /airbase/capture          | POST       | server_name: string, airbase_name: string, coalition: int                       | Capture the airbase.                                                               |
-| /airbase/warehouse        | GET        | server_name: string, airbase_name: string                                       | Get warehouse information for an airbase on a given server.                        |
-| /airbase/warehouse/item   | POST       | server_name: string, airbase_name: string, item: string, value: int             | Set warehouse item quantity for an airbase on a given server.                      |
-| /airbases                 | GET        | server_name: string                                                             | Get a listing of all airbases on a given server.                                   |
-| /convertCoordinates       | GET        | server_name: string, coordinates: string                                        | Convert provided coordinate string into other formats.                             |
-| /credits                  | POST       | nick: string, [date: string                                                     | None], [campaign: string                                                           | None] | Get campaign credits for players |
-| /current_server           | GET        | nick: string, [date: string                                                     | None]                                                                              | Server name a player is flying on |
-| /events                   | GET        | ucid: string, start_time: datetime, end_time: datetime, [event: string          | None], [init_type: string                                                          | None], [offset: int | None], [limit: int | None] | Get mission events for players |
-| /getuser                  | POST       | [nick: string], [discord_id: string]                                            | Get users by name                                                                  |
-| /greenieboard             | POST       | [date: string                                                                   | None], [server_name: string                                                        | None] | Get a greenieboard |
-| /highscore                | GET        | [server_name: string], [period: string], [limit: int]                           | Get highscore statistics for players                                               |
-| /instance/mission/load    | POST       | server_name: string, mission_name: string                                       | Load a mission on a given server.                                                  |
-| /instance/mission/pause   | POST       | server_name: string                                                             | Pause the mission on a given server.                                               |
-| /instance/mission/restart | POST       | server_name: string                                                             | Restart the mission on a given server.                                             |
-| /instance/mission/unpause | POST       | server_name: string                                                             | Unpause the mission on a given server.                                             |
-| /instance/missions        | GET        | server_name: string                                                             | Return all missions for a given server.                                            |
-| /instance/restart         | POST       | server_name: string                                                             | Restart a server.                                                                  |
-| /instance/start           | POST       | server_name: string                                                             | Start a server.                                                                    |
-| /instance/stop            | POST       | server_name: string                                                             | Stop a server.                                                                     |
-| /leaderboard              | GET        | what: string, [order: string], [query: string                                   | None], [limit: int                                                                 | None], [offset: int | None], [server_name: string | None] | Get leaderbord information |
-| /linkme                   | POST       | discord_id: string, [force: bool]                                               | Link your Discord account to your DCS account                                      |
-| /mission/bullseyes        | GET        | server_name: string                                                             | Get the bullseye coordinates for blue and red coalitions in the current mission.   |
-| /mission/drawings         | GET        | server_name: string                                                             | Get mission drawing objects grouped by drawing layer.                              |
-| /mission/group            | GET        | server_name: string, coalition: string, group_name: string, [group_type: string | None]                                                                              | Get details for a single group in the current mission. |
-| /mission/group/waypoints  | GET        | server_name: string, group_name: string, group_type: string                     | Get the lat/lon waypoints for a named group in the current mission.                |
-| /mission/groups           | GET        | server_name: string, coalition: string, [group_type: string                     | None]                                                                              | Get all groups in the currently running mission for a coalition. |
-| /mission/unit             | GET        | server_name: string, unit_name: string                                          | Get mission unit data including current position, loadout, navaids, and waypoints. |
-| /mission/upload           | POST       | server_name: string, file: string, filename: string, load_after: bool           | Upload a .miz mission file to the server.                                          |
-| /modulestats              | POST       | nick: string, [date: string                                                     | None], [server_name: string                                                        | None] | Get module statistics |
-| /player_info              | POST       | nick: string, [date: string                                                     | None], [server_name: string                                                        | None] | Get player information |
-| /player_squadrons         | POST       | nick: string, [date: string                                                     | None]                                                                              | List of player squadrons |
-| /refuelings               | GET        | ucid: string, [module: string                                                   | None], [tanker: string                                                             | None], [start_time: datetime | None], [end_time: datetime | None] | Get refueling stats for players |
-| /server_attendance        | GET        | [server_name: string]                                                           | Get detailed server attendance statistics                                          |
-| /servers                  | GET        | [server_name: string                                                            | None]                                                                              | List all servers, the active mission (if any) and the active extensions |
-| /serverstats              | GET        | [server_name: string]                                                           | List the statistics of a whole group                                               |
-| /squadron_credits         | POST       | name: string, [campaign: string]                                                | Squadron campaign credits                                                          |
-| /squadron_members         | POST       | name: string                                                                    | List squadron members                                                              |
-| /squadrons                | GET        | [limit: int], [offset: int]                                                     | List all squadrons and their roles                                                 |
-| /stats                    | POST       | nick: string, [date: string                                                     | None], [server_name: string                                                        | None], [last_session: bool | None] | Get player statistics |
-| /topkdr                   | GET        | [limit: int], [offset: int], [server_name: string]                              | Get top KDR statistics for players                                                 |
-| /topkills                 | GET        | [limit: int], [offset: int], [server_name: string]                              | Get top kills statistics for players                                               |
-| /traps                    | POST       | nick: string, [date: string                                                     | None], [limit: int                                                                 | None], [offset: int | None], [server_name: string | None] | Get traps for players |
-| /traps/img                | GET        | trap_id: int                                                                    | Get trap image for a player                                                        |
-| /trueskill                | GET        | [limit: int], [offset: int], [server_name: string]                              | Get TrueSkill:tm: statistics for players                                           |
-| /weaponpk                 | POST       | nick: string, [date: string                                                     | None], [server_name: string                                                        | None] | Get PK statistics for all weapons of a specific players |
+| API | GET / POST | Parameters | Description |
+|-----|------------|------------|-------------|
+| /airbase | GET | server_name: string, airbase_name: string | Get information for a given airbase on a given server. |
+| /airbase/atis | GET | server_name: string, airbase_name: string | Get ATIS information for an airbase on a given server. |
+| /airbase/capture | POST | server_name: string, airbase_name: string, coalition: int | Capture the airbase. |
+| /airbase/warehouse | GET | server_name: string, airbase_name: string | Get warehouse information for an airbase on a given server. |
+| /airbase/warehouse/item | POST | server_name: string, airbase_name: string, item: string, value: int | Set warehouse item quantity for an airbase on a given server. |
+| /airbases | GET | server_name: string | Get a listing of all airbases on a given server. |
+| /convertCoordinates | GET | server_name: string, coordinates: string | Convert provided coordinate string into other formats. |
+| /credits | POST | nick: string, [date: string | None], [campaign: string | None] | Get campaign credits for players |
+| /current_server | GET | nick: string, [date: string | None] | Server name a player is flying on |
+| /events | GET | ucid: string, start_time: datetime, end_time: datetime, [event: string | None], [init_type: string | None], [offset: int | None], [limit: int | None] | Get mission events for players |
+| /getuser | POST | [nick: string], [discord_id: string] | Get users by name |
+| /greenieboard | POST | [date: string | None], [server_name: string | None] | Get a greenieboard |
+| /highscore | GET | [server_name: string], [period: string], [limit: int] | Get highscore statistics for players |
+| /instance/mission/load | POST | server_name: string, mission_name: string | Load a mission on a given server. |
+| /instance/mission/pause | POST | server_name: string | Pause the mission on a given server. |
+| /instance/mission/restart | POST | server_name: string, [run_extensions: bool], [use_orig: bool], [when_empty: bool] | Restart the mission on a given server. |
+| /instance/mission/unpause | POST | server_name: string | Unpause the mission on a given server. |
+| /instance/missions | GET | server_name: string | Return all missions for a given server. |
+| /instance/restart | POST | server_name: string | Restart a server. |
+| /instance/shutdown | POST | server_name: string, [force: bool], [maintenance: bool], [when_empty: bool] | Shut a server down (terminates the DCS process). |
+| /instance/start | POST | server_name: string | Start a server. |
+| /instance/stop | POST | server_name: string | Stop a server. |
+| /leaderboard | GET | what: string, [order: string], [query: string | None], [limit: int | None], [offset: int | None], [server_name: string | None] | Get leaderbord information |
+| /linkme | POST | discord_id: string, [force: bool] | Link your Discord account to your DCS account |
+| /mission/bullseyes | GET | server_name: string | Get the bullseye coordinates for blue and red coalitions in the current mission. |
+| /mission/drawings | GET | server_name: string | Get mission drawing objects grouped by drawing layer. |
+| /mission/group | GET | server_name: string, coalition: string, group_name: string, [group_type: string | None] | Get details for a single group in the current mission. |
+| /mission/group/waypoints | GET | server_name: string, group_name: string, group_type: string | Get the lat/lon waypoints for a named group in the current mission. |
+| /mission/groups | GET | server_name: string, coalition: string, [group_type: string | None] | Get all groups in the currently running mission for a coalition. |
+| /mission/unit | GET | server_name: string, unit_name: string | Get mission unit data including current position, loadout, navaids, and waypoints. |
+| /mission/upload | POST | server_name: string, file: string, filename: string, load_after: bool | Upload a .miz mission file to the server. |
+| /modulestats | POST | nick: string, [date: string | None], [server_name: string | None] | Get module statistics |
+| /node/restart | POST | [node_name: string | None] | Restart a node, or all nodes. The bot reloads its configuration. |
+| /player_info | POST | nick: string, [date: string | None], [server_name: string | None] | Get player information |
+| /player_squadrons | POST | nick: string, [date: string | None] | List of player squadrons |
+| /refuelings | GET | ucid: string, [module: string | None], [tanker: string | None], [start_time: datetime | None], [end_time: datetime | None] | Get refueling stats for players |
+| /server_attendance | GET | [server_name: string] | Get detailed server attendance statistics |
+| /servers | GET | [server_name: string | None] | List all servers, the active mission (if any) and the active extensions |
+| /serverstats | GET | [server_name: string] | List the statistics of a whole group |
+| /squadron_credits | POST | name: string, [campaign: string] | Squadron campaign credits |
+| /squadron_members | POST | name: string | List squadron members |
+| /squadrons | GET | [limit: int], [offset: int] | List all squadrons and their roles |
+| /stats | POST | nick: string, [date: string | None], [server_name: string | None], [last_session: bool | None] | Get player statistics |
+| /topkdr | GET | [limit: int], [offset: int], [server_name: string] | Get top KDR statistics for players |
+| /topkills | GET | [limit: int], [offset: int], [server_name: string] | Get top kills statistics for players |
+| /traps | POST | nick: string, [date: string | None], [limit: int | None], [offset: int | None], [server_name: string | None] | Get traps for players |
+| /traps/img | GET | trap_id: int | Get trap image for a player |
+| /trueskill | GET | [limit: int], [offset: int], [server_name: string] | Get TrueSkill:tm: statistics for players |
+| /weaponpk | POST | nick: string, [date: string | None], [server_name: string | None] | Get PK statistics for all weapons of a specific players |
 
 ---
 
@@ -1961,6 +1964,68 @@ This documentation is automatically generated from the RestAPI plugin definition
 
 ---
 
+### `POST` /instance/shutdown
+
+**Summary:** Shut down a server instance.
+
+**Description:** Shut a server down (terminates the DCS process), like `/server shutdown`. Unlike `/instance/stop`, which only stops the mission, the DCS process ends: DCS reads its mission list and the bot rewrites `serverSettings.lua` on the next start.
+
+With `when_empty=true` and players connected, nothing is shut down at once: the shutdown runs when the last player leaves (needs the Scheduler plugin, like "later" in `/server shutdown`) and the response status is `pending`.
+
+Errors: 404 if the server is unknown; 409 if it is already shut down, if it is in a transient state (`UNREGISTERED`, `LOADING`, `SHUTTING_DOWN`) without `force`, or if an action is already pending with `when_empty`; 504 on timeout.
+
+#### Parameters
+
+| Name | Type | In | Required | Default | Description |
+|------|------|----|----------|---------|-------------|
+| `server_name` | `string` | query | **Yes** | - | Server Name |
+| `force` | `boolean` | query | No | `false` | Kill the DCS process instead of a graceful shutdown (a shutdown deferred by `when_empty` is always graceful) |
+| `maintenance` | `boolean` | query | No | `true` | Set the maintenance flag, so the Scheduler does not start the server again |
+| `when_empty` | `boolean` | query | No | `false` | If players are connected, shut down once the server is empty |
+
+**Response:** `ServerShutdownResponse`
+
+#### Response Example
+
+```json
+{
+  "message": "Server 'DCS Server' shut down.",
+  "status": "success"
+}
+```
+
+---
+
+## Node Control
+
+### `POST` /node/restart
+
+**Summary:** Restart a node.
+
+**Description:** Restart a node, or all nodes, like `/node restart`. The bot reloads its configuration. The response is sent before the node that serves the RestAPI restarts, so the API is unavailable for a moment afterwards.
+
+Errors: 404 if the node is unknown; 409 if it is not active.
+
+#### Parameters
+
+| Name | Type | In | Required | Default | Description |
+|------|------|----|----------|---------|-------------|
+| `node_name` | `string` | query | No | all nodes | Node to restart |
+
+**Response:** `NodeRestartResponse`
+
+#### Response Example
+
+```json
+{
+  "message": "Node(s) node1 restarting.",
+  "nodes": ["node1"],
+  "status": "success"
+}
+```
+
+---
+
 ## Mission Control
 
 ### `GET` /instance/missions
@@ -2060,6 +2125,9 @@ This documentation is automatically generated from the RestAPI plugin definition
 | Name | Type | In | Required | Default | Description |
 |------|------|----|----------|---------|-------------|
 | `server_name` | `string` | query | **Yes** | - | Server Name |
+| `run_extensions` | `bool` | query | No | `False` | Run the extensions (MizEdit, RealWeather, ...) on the mission |
+| `use_orig` | `bool` | query | No | `True` | Start from the original mission (.orig) |
+| `when_empty` | `bool` | query | No | `False` | If players are connected, restart once the server is empty |
 
 **Response:** `MissionRestartResponse`
 
@@ -3537,6 +3605,24 @@ Below are the data structures and response models used across the API endpoints:
 }
 ```
 
+### `NodeRestartResponse`
+
+| Property | Type | Required | Description |
+|----------|------|----------|-------------|
+| `status` | `string` | **Yes** | Status of the operation |
+| `message` | `string` | **Yes** | Status message |
+| `nodes` | `array[string]` | **Yes** | Nodes that are restarting |
+
+#### Example
+
+```json
+{
+  "message": "Node(s) node1 restarting.",
+  "nodes": ["node1"],
+  "status": "success"
+}
+```
+
 ### `PlayerEntry`
 
 | Property | Type | Required | Description |
@@ -4018,6 +4104,22 @@ Below are the data structures and response models used across the API endpoints:
 ```json
 {
   "message": "Server 'DCS Server' restarted.",
+  "status": "success"
+}
+```
+
+### `ServerShutdownResponse`
+
+| Property | Type | Required | Description |
+|----------|------|----------|-------------|
+| `status` | `string` | **Yes** | Status of the operation (success, or pending with when_empty) |
+| `message` | `string` | **Yes** | Status message |
+
+#### Example
+
+```json
+{
+  "message": "Server 'DCS Server' shut down.",
   "status": "success"
 }
 ```

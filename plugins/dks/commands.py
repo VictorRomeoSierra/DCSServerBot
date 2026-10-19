@@ -21,13 +21,11 @@ from urllib.parse import quote
 from services.bot import DCSServerBot
 from services.webservice import WebService
 
-# ruamel YAML support
-from ruamel.yaml import YAML
-yaml = YAML()
+from core.utils.yaml_helper import new_yaml
 
 _ = get_translation(__name__.split('.')[1])
 DKS_URL = "https://www.digitalkneeboardsimulator.com/api/register/dcssb?otp={otp}&connection_string={callback_url}"
-DKS_JWKS_URL = "https://digitalkneeboardsimulator.com/api/pubkey"
+DKS_JWKS_URL = "https://www.digitalkneeboardsimulator.com/api/pubkey"
 
 
 class DKS(Plugin):
@@ -139,7 +137,7 @@ class DKS(Plugin):
 
             config = os.path.join(self.node.config_dir, 'plugins', 'restapi.yaml')
             if os.path.exists(config):
-                data = yaml.load(Path(config).read_text(encoding='utf-8'))
+                data = new_yaml().load(Path(config).read_text(encoding='utf-8'))
             else:
                 data = {}
             data.setdefault(DEFAULT_TAG, {}).setdefault('auth', {}).update({
@@ -151,7 +149,7 @@ class DKS(Plugin):
 
             tmp = Path(config).with_suffix('.yaml.tmp')
             with tmp.open('w', encoding='utf-8') as f:
-                yaml.dump(data, f)
+                new_yaml().dump(data, f)
             os.replace(tmp, config)
 
             if await self.bot.reload_plugin("RestAPI"):
@@ -176,13 +174,14 @@ class DKS(Plugin):
     @utils.app_has_role('Admin')
     async def register(self, interaction: discord.Interaction):
         restapi = cast(RestAPI, self.bot.cogs.get('RestAPI'))
-        if restapi.get_config().get('auth', {}).get('jwt') and not await utils.yn_question(
+        if restapi.get_config().get('auth', {}).get('jwt'):
+            if not await utils.yn_question(
                 interaction,
                 message=_("You have a JWT key configured for your RestAPI service already."),
                 question=_("Do you want to overwrite it?")
             ):
-            await interaction.followup.send(_("Aborted"), ephemeral=True)
-            return
+                await interaction.followup.send(_("Aborted"), ephemeral=True)
+                return
         else:
             await interaction.response.defer(ephemeral=True)
 

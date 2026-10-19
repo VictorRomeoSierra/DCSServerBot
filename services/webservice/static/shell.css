@@ -107,6 +107,7 @@
   --err-wash: rgba(248, 81, 73, .22);
   --tab-active: rgba(232, 163, 61, .10);        /* .cfg-tab.on */
   --elev: rgba(0, 0, 0, .6); --elev-sm: rgba(0, 0, 0, .55);  /* .dlg / .menu drop shadows */
+  --scrim: rgba(0, 0, 0, .62);                  /* .shot-back — the one overlay that dims the page */
   --login-line: #a9711f; --login-text: #1a1204; --login-hover: #c98f34; --login-lead: #3a3320;
   --login-ring: rgba(232, 163, 61, .12);        /* .login-grid .card.lead inset ring */
   --sw-off: #26313f; --sw-on: #2c4a30; --sw-on-line: #3d6b44;  /* .st-sw tile track */
@@ -222,7 +223,7 @@ option:checked, option:hover { background: var(--accent); color: var(--ground); 
 .signout button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 /* ---------------------------------------------------------------- top bar
- * `.shell-bar` is the shell's original name for this element and is kept (C1's asset test asserts
+ * `.shell-bar` is the shell's original name for this element and is kept (an asset test asserts
  * it); `.top` is the ported name. One element, one declaration — the second selector is an alias,
  * not a second rule. */
 .main { display: flex; flex-direction: column; min-width: 0; min-height: 0;
@@ -500,22 +501,6 @@ td.acts button { padding: 4px 10px; font: inherit; font-size: 11.5px; cursor: po
 td.acts button:hover { color: var(--text); border-color: var(--accent); }
 td.acts button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
-/* The MESSAGE control — the first write with a FIELD. It is the same one-form-per-row shape as
- * the pause buttons, but a text input inside a form has to stop being `inline` (above) or the field
- * and its label collapse onto one baseline: the form becomes an inline FLEX row, and the width is
- * capped so a long message cannot push the table's other columns out of the viewport. Namespaced to
- * `form.msg` so the pilot's plain buttons keep the rules above. */
-td.acts form.msg { display: inline-flex; align-items: center; gap: 6px; }
-td.acts form.msg label { font-size: 10.5px; color: var(--text-3); text-transform: uppercase;
-  letter-spacing: .06em; }
-td.acts form.msg input[type="text"] { width: 16rem; max-width: 40vw; padding: 4px 8px; font: inherit;
-  font-size: 12px; color: var(--text); background: var(--ground-2);
-  border: 1px solid var(--line-2); border-radius: var(--radius-s); }
-td.acts form.msg select { padding: 4px 6px; font: inherit; font-size: 12px; color: var(--text);
-  background: var(--panel-2); border: 1px solid var(--line-2); border-radius: var(--radius-s); }
-td.acts form.msg input[type="text"]:focus-visible, td.acts form.msg select:focus-visible {
-  outline: 2px solid var(--accent); outline-offset: 2px; }
-
 /* ---------------------------------------------------------------- the row ACTION STRIP */
 /* The server row's quick controls as an ICON STRIP — the mockup's `td.acts` cell. One glyph per
  * control, a native `title` and an `aria-label` on each (never an icon alone), and the row's rarer
@@ -637,6 +622,15 @@ td.acts .act-strip.busy { background: var(--panel-2); border-radius: var(--radiu
 
 /* ---------------------------------------------------------------- the confirm dialog */
 .dlg-back { display: grid; place-items: start center; padding: 20px 0 0; }
+/* THE SCREENSHOT MODAL: the same card, opened OVER the page the glyph was pressed on (the confirm
+ * dialog is a page of its own, this one is not), so the wrapper is fixed to the viewport and the page
+ * stays behind it. The card may be wider than a confirm dialog: a screenshot is read, not skimmed. */
+.shot-back { position: fixed; inset: 0; z-index: 40; padding: 18px; overflow: auto;
+  display: grid; place-items: center; background: var(--scrim); }
+.shot-back .dlg { width: min(760px, 100%); }
+.shot-back .dlg > .bd { padding: 10px; }
+.shot-back .dlg > .bd img { display: block; width: 100%; height: auto; border-radius: var(--radius-s);
+  border: 1px solid var(--line); background: var(--ground-2); }
 .dlg { width: min(520px, 100%); background: var(--panel); border: 1px solid var(--line-2);
   border-radius: var(--radius); box-shadow: 0 24px 60px var(--elev); overflow: hidden; }
 .dlg > .hd { display: flex; align-items: center; gap: 10px; padding: 12px 14px;
@@ -653,7 +647,7 @@ td.acts .act-strip.busy { background: var(--panel-2); border-radius: var(--radiu
   border-radius: 0 var(--radius-s) var(--radius-s) 0; }
 .dlg-warn svg { width: 15px; height: 15px; flex: 0 0 auto; margin-top: 1px; }
 .dlg-warn b { color: var(--danger-strong); }
-.dlg > .ft { display: flex; align-items: center; gap: 10px; padding: 12px 14px;
+.dlg > .ft { display: block; padding: 12px 14px;
   border-top: 1px solid var(--line); background: var(--ground-2); }
 .dlg > .ft .spacer { flex: 1; }
 .dlg .btn { padding: 8px 14px; font: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer;
@@ -664,18 +658,30 @@ td.acts .act-strip.busy { background: var(--panel-2); border-radius: var(--radiu
 .dlg .btn.danger { color: var(--danger-btn-text); border-color: var(--danger-btn-line);
   background: linear-gradient(180deg, var(--danger-btn-top), var(--danger)); }
 .dlg .target { font-family: var(--font-mono); color: var(--text-2); }
-/* THE DIALOG'S FIELDS. Kick and ban need a REASON (the ban a duration too), so the dialog's
- * own form carries them — beside the warning that explains the consequence, and directly above the
- * destructive button, which is the last thing read before acting. The form is a COLUMN inside the
- * shipped footer row, so the Cancel/spacer/danger layout is untouched and a dialog with no fields
- * (the three server ones) renders exactly as it did. */
+/* THE DIALOG'S FIELDS. Kick and ban need a REASON (the ban a duration too) and a message is typed
+ * into a box, so the dialog's own form carries them — beside the warning that explains the
+ * consequence, and directly above the two ways out. The form is a COLUMN inside the footer: its
+ * fields first, and the CANCEL/primary row LAST (`.dlg-buttons`), so a field of several lines cannot
+ * leave the primary button beside it while the cancel link floats in the middle of the row. */
 .dlg > .ft > form.dlg-act { display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }
+/* THE TWO WAYS OUT. One row, full width of the dialog: Cancel left, primary right, on the bottom
+ * line whichever fields the dialog has above them. */
+.dlg-buttons { align-self: stretch; display: flex; align-items: center; gap: 10px; }
 .dlg-field { display: flex; flex-direction: column; gap: 3px; margin: 0; min-width: min(300px, 60vw); }
+/* A FIELD'S WIDTH IS ITS DECLARATION'S, not a template guess: a reason is read back, so it takes the
+ * dialog's full width; a day count is two or three characters, so it shrinks to the box they need
+ * instead of offering three hundred pixels for "14". */
+.dlg-field.wide { align-self: stretch; }
+.dlg-field.narrow { align-self: flex-end; min-width: 0; width: 8.5rem; }
 .dlg-field label { font-size: 10.5px; color: var(--text-3); text-transform: uppercase;
   letter-spacing: .04em; }
-.dlg-field input { padding: 7px 9px; font: inherit; font-size: 12.5px; color: var(--text);
+.dlg-field input, .dlg-field textarea { padding: 7px 9px; font: inherit; font-size: 12.5px; color: var(--text);
   background: var(--ground-2); border: 1px solid var(--line-2); border-radius: var(--radius-s); }
-.dlg-field input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.dlg-field input:focus-visible, .dlg-field textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+/* A TEXTAREA IS A TEXT FIELD THAT HOLDS SEVERAL LINES: it wears the box above, keeps its own resize
+ * handle (vertical only — a dialog is a column and cannot afford a horizontal one) and starts tall
+ * enough that a message of a few lines is visible without scrolling inside it. */
+.dlg-field textarea { min-height: 92px; resize: vertical; }
 /* A SELECT IS A FIELD TOO — the Missions tab's ADD dialog chooses the mission file with one, so it
  * wears the same box the text fields do. */
 .dlg-field select { padding: 7px 9px; font: inherit; font-size: 12.5px; color: var(--text);
@@ -834,7 +840,7 @@ td.acts .act-strip.busy { background: var(--panel-2); border-radius: var(--radiu
   .cfg-form .st-w { justify-content: flex-start; }
 }
 
-/* ================================================================ the Missions tab (M9)
+/* ================================================================ the Missions tab
  * THREE SMALL RULES IN THE SHELL'S OWN IDIOM, and no new colour: the card-header SELECTION BAR
  * (`.sel-bar`), the START row's MARKER treatment (`.row-active`, re-using the amber the `.nav a.on`
  * gradient and the `.tabs .tab.on` inset edge are drawn from), and the dialog's READ-ONLY selection
@@ -937,6 +943,16 @@ a.srv-name:hover { text-decoration: underline; color: var(--accent); }
 .search input[type="search"]:focus-visible, .search button:focus-visible,
 .logpos a:focus-visible, .tabs .tab:focus-visible, .sort:focus-visible, .pdot:focus-visible {
   outline: 2px solid var(--accent); outline-offset: 2px; }
+/* THE PAGE-LEVEL CONTROL — the Servers page's "Add server" (one POST form in the page head, its
+ * answer IS the dialog page). `.btn` is styled only inside `.dlg`, so this chip is stated here for a
+ * control that lives outside one, mirroring the log card's footer control. */
+.page-actions { display: flex; gap: 10px; padding: 12px 0 0; }
+.page-actions button { padding: 7px 12px; font: inherit; font-size: 12.5px; font-weight: 600;
+  cursor: pointer; color: var(--text); background: var(--panel-2);
+  border: 1px solid var(--line-2); border-radius: var(--radius-s); }
+.page-actions button:hover { border-color: var(--accent); }
+.page-actions button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
 .search button { padding: 7px 12px; font: inherit; font-size: 12.5px; cursor: pointer;
   color: var(--text); background: var(--panel-2); border: 1px solid var(--line-2);
   border-radius: var(--radius-s); }
@@ -959,7 +975,7 @@ a.srv-name:hover { text-decoration: underline; color: var(--accent); }
 .logpos { display: inline-flex; gap: 4px; }
 .col-log > .log-card { margin: 0; }
 
-/* THE LOG CARD'S DOWNLOAD PICKER (L3) — the server Log / Events tab's one `<select>` plus its one
+/* THE LOG CARD'S DOWNLOAD PICKER — the server Log / Events tab's one `<select>` plus its one
  * Download control, in place of the old per-file link list. The chip mirrors the footer control
  * above; the select already wears the `.cfg-widget` control styling (it lives in a `.cfg-widget`). */
 .log-picker button { padding: 7px 12px; font: inherit; font-size: 12.5px; font-weight: 600;
@@ -1035,12 +1051,24 @@ a.srv-name:hover { text-decoration: underline; color: var(--accent); }
 .cfg-field:first-child { border-top: 0; }
 .cfg-label { display: flex; flex-wrap: wrap; gap: .35rem; align-items: baseline; }
 .cfg-key { color: var(--text); font-size: .8rem; }
+/* The schema's own sentence, on the row itself — no hover needed to read what a field is for. */
+.cfg-desc { color: var(--text-3); font-size: .75rem; max-width: 62ch; }
 .cfg-kind { color: var(--text-3); font-size: .72rem; }
 .cfg-badge { border: 1px solid var(--line-2); border-radius: 999px; padding: 0 .4rem;
   font-size: .68rem; color: var(--text-3); background: var(--panel-2); }
 .cfg-badge.warn { border-color: var(--warn-line); color: var(--warn-text); background: var(--warn-bg); }
 .cfg-badge.inc { border-color: var(--inc-line); color: var(--inc-text); background: var(--inc-bg); }
 .cfg-badge.cycle { border-color: var(--cycle-line); color: var(--cycle-text); background: var(--cycle-bg); }
+/* THE SCHEMA'S OWN DESCRIPTION (``desc:``) as a hover/focus tooltip. The marker is inert chrome —
+ * a help cursor and a keyboard focus ring, never a click target — and the sentence it reveals is the
+ * schema author's text, looked up in the reader's language by the ``schema_text`` global. Mirrors the
+ * tiles' tooltip: ``title`` for the mouse, and a visually-hidden copy the ``aria-describedby`` on the
+ * marker reaches, so the sentence is readable WITHOUT a mouse either. */
+.cfg-info { color: var(--text-3); font-size: .78rem; line-height: 1; cursor: help; }
+.cfg-info:hover { color: var(--accent); }
+.cfg-info:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+.cfg-sr { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden;
+  clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap; border: 0; }
 .cfg-hint { grid-column: 1 / -1; color: var(--text-3); font-size: .76rem; margin: .1rem 0 .3rem; }
 .cfg-input { width: 100%; background: var(--ground-2); border: 1px solid var(--line-2);
   color: var(--text); border-radius: var(--radius-s); padding: .3rem .5rem; font: inherit;
@@ -1058,6 +1086,10 @@ a.srv-name:hover { text-decoration: underline; color: var(--accent); }
 .cfg-input.mono, .cfg-key.mono, .cfg-subkey.mono, pre.yaml.mono, .cfg-file.mono {
   font-family: var(--font-mono); }
 .cfg-row, .cfg-rowbox { display: flex; gap: .4rem; align-items: flex-end; margin-bottom: .35rem; }
+/* A hybrid `*_or_list` field: the scalar the file carries, with the button that turns it into a list,
+   on ONE line — the button belongs to the value it converts, so the pair reads as one control. */
+.cfg-orpair { display: flex; gap: .4rem; align-items: center; }
+.cfg-orpair .cfg-input, .cfg-orpair textarea, .cfg-orpair select { flex: 1 1 auto; }
 .cfg-rowbox { flex-wrap: wrap; border: 1px solid var(--line); border-radius: var(--radius-s);
   padding: .4rem; background: var(--ground-2); }
 .cfg-sub { display: flex; flex-direction: column; gap: .15rem; min-width: 8rem; flex: 1 1 8rem; }
@@ -1422,6 +1454,7 @@ html[data-theme="light"] {
   --block-wash: rgba(154, 90, 5, .12); --err-wash: rgba(192, 38, 38, .18);
   --tab-active: rgba(154, 90, 5, .10);
   --elev: rgba(24, 32, 43, .18); --elev-sm: rgba(24, 32, 43, .16);
+  --scrim: rgba(24, 32, 43, .45);
   --login-line: #a9711f; --login-text: #ffffff; --login-hover: #8a5a10; --login-lead: #e3d7b4;
   --login-ring: rgba(154, 90, 5, .14);
   --sw-off: #d4dbe5; --sw-on: #bfe3c6; --sw-on-line: #7bbf8a;
