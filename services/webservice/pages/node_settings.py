@@ -44,6 +44,7 @@ import logging
 import secrets
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, Request
@@ -51,17 +52,19 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from core.utils import configwrite
 
-from .. import (catalog, configgen, i18n, permissions, plugin_registry, readmodels, scopes, session,
-                validation)
+from .. import (catalog, config_apply, config_hints, configgen, i18n, mount, permissions,
+                plugin_registry, readmodels, scopes, session, validation)
 from . import actions as actions_page
 from . import dashboard as dashboard_page
 from . import nodes as nodes_page
+from . import presets as presets_page
 from . import settings as settings_page
 
 __all__ = [
     "NODE_SETTINGS_PATH", "NODE_SETTINGS_CAPABILITY", "NODE_SETTINGS_ROLES",
     "NODE_SETTINGS_TITLE", "NODE_SETTINGS_LEAD", "NODES_YAML_NAME", "NODES_SCHEMA_PATH",
-    "NODE_PAGE_PATH", "NODE_PAGE_VALIDATE_PATH", "NODE_PAGE_TEMPLATE",
+    "NODE_PAGE_PATH", "NODE_PAGE_VALIDATE_PATH", "NODE_PAGE_HINTS_PATH", "NODE_PAGE_TEMPLATE",
+    "NODE_EXTENSION_PATH", "NODE_EXTENSION_VALIDATE_PATH", "NODE_EXTENSION_HINTS_PATH",
     "NODE_PAGE_SECTION_SETTINGS", "NODE_PAGE_SECTION_EXTENSIONS", "NODE_PAGE_EXTENSION_KIND",
     "NODE_PAGE_SCOPE_NODE", "NODE_PAGE_SCOPE_INSTANCE",
     "NODE_PAGE_SCOPE_FIELD", "NODE_PAGE_SCOPE_DEFAULT", "NODE_PAGE_SCOPE_INSTANCE_PREFIX",
@@ -121,8 +124,11 @@ def capabilities() -> dict[str, str]:
     return {NODE_SETTINGS_PATH: NODE_SETTINGS_CAPABILITY,
             NODE_PAGE_PATH: NODE_SETTINGS_CAPABILITY,
             NODE_PAGE_VALIDATE_PATH: NODE_SETTINGS_CAPABILITY,
+            # a hint is a READ of the schema, so it carries the PAGE's capability — never a write
+            NODE_PAGE_HINTS_PATH: NODE_SETTINGS_CAPABILITY,
             NODE_EXTENSION_PATH: NODE_SETTINGS_CAPABILITY,
-            NODE_EXTENSION_VALIDATE_PATH: NODE_SETTINGS_CAPABILITY}
+            NODE_EXTENSION_VALIDATE_PATH: NODE_SETTINGS_CAPABILITY,
+            NODE_EXTENSION_HINTS_PATH: NODE_SETTINGS_CAPABILITY}
 
 
 def nav_items():
@@ -254,12 +260,16 @@ def visible_nodes(request: Request) -> list[str]:
     return [readmodels.text(name) for name in entries]
 
 
-def _notice(request: Request, message: str, *, ok: bool) -> None:
-    """Store the one-shot notice of a save — the console's own wording, translated at render."""
+def _notice(request: Request, message: str, *, ok: bool, apply: dict | None = None) -> None:
+    """Store the one-shot notice of a save — the console's own wording, translated at render.
+
+    ``apply`` is the "Apply now" control's contract for the file just written (``config_apply``), or
+    ``None`` for a save that changed nothing and has nothing to apply.
+    """
     request.session[actions_page.NOTICE_KEY] = {
         "message": message, "ok": ok, "audit": "", "audit_warning": False,
         "action": NODE_SETTINGS_TITLE, "revert": "", "revert_omitted": "",
-        "refusal": True, "applies": "",
+        "refusal": True, "applies": "", "apply": apply, "pending": False,
     }
 
 
@@ -280,6 +290,10 @@ NODE_PAGE_PATH = "/nodes/{node}"
 #: The Expert Mode validator route for the node page. Same contract as the Settings area's validator:
 #: a POST carrying the posted slice, answered with a structured JSON verdict and writing nothing.
 NODE_PAGE_VALIDATE_PATH = "/actions/nodes/{node}/validate"
+#: THE COMPLETION HINTS for the node page's Expert Mode editor: a read of ``nodes_schema.yaml`` as
+#: JSON (:mod:`services.webservice.config_hints`), rooted at the DOCUMENT root — the editor's slice is
+#: ``{<node>: block}``, so its root key is the node name the schema's ``regex;(.+)`` block names.
+NODE_PAGE_HINTS_PATH = "/actions/nodes/{node}/hints"
 NODE_PAGE_TEMPLATE = "node_page.html"
 
 #: the two section headings on a tab (the settings form, then the extensions).
@@ -538,7 +552,7 @@ def node_page_url(node_name: str) -> str:
     """The URL of *node_name*'s node page — the name as ONE percent-encoded path segment."""
     from urllib.parse import quote
 
-    return f"/nodes/{quote(readmodels.text(node_name), safe='')}"
+    return mount.url(f"/nodes/{quote(readmodels.text(node_name), safe='')}")
 
 
 # --------------------------------------------------------- the extension CONFIGURATION destination
@@ -550,6 +564,10 @@ def node_page_url(node_name: str) -> str:
 # and the fields are the SAME ``f.<node>.extensions.<Name>…`` names the node page always used.
 NODE_EXTENSION_PATH = "/nodes/{node}/extensions/{name}"
 NODE_EXTENSION_VALIDATE_PATH = "/actions/nodes/{node}/extensions/{name}/validate"
+#: THE COMPLETION HINTS for an extension page's Expert Mode editor: the same ``nodes_schema.yaml``
+#: tree, rooted at the DOCUMENT root — that editor's slice is ``{<node>: block}`` as well (the block
+#: the page's save merges back is a top-level key of ``nodes.yaml``).
+NODE_EXTENSION_HINTS_PATH = "/actions/nodes/{node}/extensions/{name}/hints"
 NODE_EXTENSION_TEMPLATE = "settings_scope.html"
 
 
@@ -557,15 +575,37 @@ def node_extension_url(node_name: str, ext_name: str) -> str:
     """The URL of ONE extension's configuration for *node_name* — each name one path segment."""
     from urllib.parse import quote
 
-    return (f"/nodes/{quote(readmodels.text(node_name), safe='')}"
-            f"/extensions/{quote(readmodels.text(ext_name), safe='')}")
+    return mount.url(f"/nodes/{quote(readmodels.text(node_name), safe='')}"
+                    f"/extensions/{quote(readmodels.text(ext_name), safe='')}")
 
 
 def _node_extension_validate_url(node_name: str, ext_name: str) -> str:
     from urllib.parse import quote
 
-    return (f"/actions/nodes/{quote(readmodels.text(node_name), safe='')}"
-            f"/extensions/{quote(readmodels.text(ext_name), safe='')}/validate")
+    return mount.url(f"/actions/nodes/{quote(readmodels.text(node_name), safe='')}"
+                    f"/extensions/{quote(readmodels.text(ext_name), safe='')}/validate")
+
+
+def _node_extension_hints_url(node_name: str, ext_name: str) -> str:
+    """The URL of ONE extension's completion hints — each name one percent-encoded segment."""
+    from urllib.parse import quote
+
+    return mount.url(NODE_EXTENSION_HINTS_PATH.format(
+        node=quote(readmodels.text(node_name), safe=""),
+        name=quote(readmodels.text(ext_name), safe="")))
+
+
+def nodes_hints(request: Request) -> JSONResponse:
+    """``nodes.yaml``'s schema tree as hints JSON, rooted at the document's own keys.
+
+    The instrument is the ONE payload builder (:mod:`services.webservice.config_hints`); the container
+    is the EMPTY one — the file's root — because both node surfaces hand the editor a top-level-key
+    slice (``{<node>: block}``), whose root key is the node name the schema's ``regex;(.+)`` names.
+    A reader gets no file content here, only the schema: never a write, never a cached body.
+    """
+    return JSONResponse(config_hints.payload(configgen.schema_files_for(NODES_SCHEMA_PATH),
+                                             request=request),
+                        headers={"Cache-Control": "no-store"})
 
 
 def _extension_catalog() -> tuple[dict[str, str], dict[str, str]]:
@@ -660,7 +700,15 @@ def _node_page_validate_url(node_name: str) -> str:
     """The URL of *node_name*'s Expert Mode validator — one percent-encoded path segment."""
     from urllib.parse import quote
 
-    return f"/actions/nodes/{quote(readmodels.text(node_name), safe='')}/validate"
+    return mount.url(f"/actions/nodes/{quote(readmodels.text(node_name), safe='')}/validate")
+
+
+def _node_page_hints_url(node_name: str) -> str:
+    """The URL of *node_name*'s completion hints — one percent-encoded path segment."""
+    from urllib.parse import quote
+
+    return mount.url(NODE_PAGE_HINTS_PATH.format(
+        node=quote(readmodels.text(node_name), safe="")))
 
 
 def _rebase_instance(field: configgen.Field, node_name: str, instance: str) -> configgen.Field:
@@ -1293,6 +1341,7 @@ def node_page_context(request: Request, node_name: str, tab_index: int = 0) -> d
         "revision": configwrite.config_revision(path),
         "save_path": f"{node_page_url(node_name)}?tab={tab_index}",
         "validate_path": _node_page_validate_url(node_name),
+        "hints_path": _node_page_hints_url(node_name),
         "scope_carrier": NODE_PAGE_SCOPE_FIELD,
         "scope_value": scope_value,
     }
@@ -1573,9 +1622,15 @@ async def save_node(request: Request, doc_key: str, redirect_to: str) -> Redirec
     if result.changed:
         message = (settings_page.SAVED_NOW if result.applies == configwrite.APPLIES_NOW
                    else settings_page.SAVED_RESTART)
+        # the change belongs to THIS node's block: the offer names it, so the door restarts that node
+        # and never a node a request could name.
+        apply = config_apply.offer(request, path=path, config_dir=settings_page.config_dir(request),
+                                   kind=settings_page.KIND_NODES, name=NODES_YAML_NAME,
+                                   node=doc_key or "", back=redirect_to)
     else:
         message = settings_page.SAVED_NO_CHANGE
-    _notice(request, message, ok=True)
+        apply = None
+    _notice(request, message, ok=True, apply=apply)
     return RedirectResponse(redirect_to, status_code=303)
 
 
@@ -1589,6 +1644,92 @@ async def save_node(request: Request, doc_key: str, redirect_to: str) -> Redirec
 def _extension_context_node_key(document, node_name: str) -> str | None:
     """The key in *document* that names *node_name* — the SAME reading the node page uses."""
     return _document_node_key(document, node_name)
+
+
+# ------------------------------------------------ the preset-FILE choice: one field, not free text
+# THE ONE FIELD THE EDITOR DOES NOT RENDER AS FREE TEXT. ``MizEdit.presets`` names the preset file(s)
+# an instance applies at startup (``extensions/mizedit/schemas/mizedit_schema.yaml``, ``str_or_list``);
+# a mistyped path is silent, because the extension only logs a missing file. The control offers one
+# CHECKBOX per file the console can KNOW — the files ``discover_preset_files`` finds under the console's
+# config directory plus every label another node/instance already names — and ONE free-text row for a
+# path that list does not carry.
+#
+# WHY THE FREE ROW IS NOT DECORATION: the console runs inside the master's process, so it can list the
+# MASTER's config directory and nothing else. A file that exists only on a remote node has no row here;
+# the free row is the only way to name it, and the field's help says so on a node that is not the master.
+#
+# THE VALUE SHAPES ARE THE SCHEMA'S OWN. One choice is a STRING, several are a LIST, none removes the
+# key — which is what makes the extension fall back to ``presets.yaml`` in the instance's own config
+# directory. Nothing new is invented, and a value the document already carries is a row of its own, so
+# an untouched save cannot drop a hand-written path.
+
+#: the extension the control belongs to, and the one key it replaces.
+PRESETS_EXTENSION = "MizEdit"
+PRESETS_KEY = "presets"
+#: the companions the control posts — never document paths (the save collapses them into the value).
+#: ``PRESETS_FORM_FIELD`` is the marker that says the control was ON the page: without it a post carries
+#: no opinion about this field (an empty selection is invisible otherwise — a browser posts no checkbox).
+PRESETS_CHOICE_FIELD = "__presets"
+PRESETS_FREE_FIELD = "__presets_free"
+PRESETS_FORM_FIELD = "__presets_present"
+
+
+def _presets_field(active: dict) -> configgen.Field | None:
+    """The ``presets`` field of the ACTIVE tab, or ``None`` when this tab does not carry one."""
+    base = tuple(active.get("base") or ())
+    wanted = base + (PRESETS_KEY,)
+    for field in active.get("fields") or []:
+        if tuple(field.path) == wanted:
+            return field
+    return None
+
+
+def _values_named(current: Any) -> list[str]:
+    """The strings a ``presets`` value names — the SHAPES the schema allows and no others."""
+    if isinstance(current, str):
+        return [current]
+    if isinstance(current, (list, tuple)):
+        return [str(item) for item in current if item is not None]
+    return []
+
+
+def _master_node_names(request: Request) -> set[str]:
+    """The nodes the cluster view reports as MASTER (empty when no node reports itself)."""
+    entries = getattr(dashboard_page.request_source(request), "nodes", None)
+    if not isinstance(entries, dict):
+        return set()
+    return {readmodels.text(name) for name, node in entries.items()
+            if readmodels.safe(lambda: bool(getattr(node, "master", False)), False)}
+
+
+def presets_choice_context(request: Request, nodes_document: Any, current: Any,
+                           field: configgen.Field, node_name: str) -> dict:
+    """The rows the preset-file control renders, and whether this node's own disk is readable here."""
+    config = settings_page.config_dir(request)
+    rows: list[dict] = []
+    seen: set[str] = set()
+
+    def offer(label: str, who: str = "") -> None:
+        if label and label not in seen:
+            seen.add(label)
+            rows.append({"label": label, "checked": False, "who": who})
+
+    # the extension's own DEFAULT file first, then what the console's config directory holds, then
+    # every label another node/instance already names (its files may only exist on that machine)
+    offer(f"{presets_page.CONFIG_LABEL}/{presets_page.MIZEDIT_DEFAULT_FILE}")
+    for path in presets_page.discover_preset_files(config):
+        offer(presets_page.display_path(config, path))
+    for label, who in presets_page.mizedit_preset_files(nodes_document, config):
+        offer(label, who)
+    # a value the list does NOT offer keeps its own row, checked: an untouched save must not drop it
+    for value in _values_named(current):
+        offer(value)
+    named = set(_values_named(current))
+    for row in rows:
+        row["checked"] = row["label"] in named
+    masters = _master_node_names(request)
+    return {"path": field.name, "rows": rows,
+            "remote": bool(masters) and readmodels.text(node_name) not in masters}
 
 
 def extension_page_context(request: Request, node_name: str, ext_name: str, tab_index: int = 0) -> dict:
@@ -1642,6 +1783,20 @@ def extension_page_context(request: Request, node_name: str, ext_name: str, tab_
     slice_keys = scopes.scope_keys(visible) if visible else []
     # THE SHOW/HIDE MODEL for this tab's body + the removal acknowledgement (see ``save_extension``).
     vis = settings_page.visibility_context(view.root, view.root, document)
+    # THE PRESET-FILE CHOICE. ``MizEdit.presets`` is rendered as a control instead of free text, and it
+    # is shown even when the block does not carry it — an operator who has set nothing yet is exactly
+    # who needs to see the files. It stays in the REMOVABLE set: that is what mints the save's removal
+    # acknowledgement, which a "no row checked" removal must carry like any other.
+    presets_control = None
+    presets_here = (_presets_field(active) if ext_name.lower() == PRESETS_EXTENSION.lower() else None)
+    if presets_here is not None:
+        presets_id = configgen.view_id(presets_here)
+        vis["hidden"] = frozenset(item for item in vis["hidden"] if item != presets_id)
+        vis["picks"] = {name: [option for option in options if option["id"] != presets_id]
+                        for name, options in vis["picks"].items()}
+        vis["picks"] = {name: options for name, options in vis["picks"].items() if options}
+        presets_control = presets_choice_context(request, document, view.values.get(presets_here.name),
+                                                 presets_here, key or node_name)
     remove_ack = ""
     if vis["removable"] and document is not None:
         remove_ack = settings_page.mint_remove_ack(request, str(path),
@@ -1682,6 +1837,7 @@ def extension_page_context(request: Request, node_name: str, ext_name: str, tab_
         "sections": view.sections,
         "hidden": vis["hidden"],
         "picks": vis["picks"],
+        "presets_control": presets_control,
         "removable": vis["removable"],
         "remove_ack": remove_ack,
         "remove_ack_field": vis["remove_ack_field"],
@@ -1734,6 +1890,95 @@ def _foreign_extension_field(form, doc_key: str) -> str | None:
     return None
 
 
+def _document_carries(document, tokens: tuple) -> bool:
+    """Whether *document* carries the key at *tokens*."""
+    current = document
+    for token in tokens:
+        if not isinstance(current, dict) or token not in current:
+            return False
+        current = current[token]
+    return True
+
+
+class _CollapsedForm:
+    """A posted form with one field's choice rows collapsed into the schema's OWN value shape.
+
+    ``configgen.apply_form`` and the save's removal reading take the form through ``multi_items`` (and
+    ``get`` for the companions), so a sequence of ``(name, value)`` pairs is all this has to carry.
+    """
+
+    def __init__(self, form, items):
+        self._form = form
+        self._items = list(items)
+
+    def multi_items(self):
+        return list(self._items)
+
+    def get(self, key, default=None):
+        values = [value for name, value in self._items if name == key]
+        return values[-1] if values else default
+
+    def __iter__(self):
+        return iter([name for name, _value in self._items])
+
+
+def _collapse_presets_choice(form, document):
+    """Rebuild *form* with the preset-file control's rows as the ``presets`` value it means.
+
+    The control posts one ``f.<path>.__presets`` per CHECKED file (in page order) and the free-text row
+    as ``f.<path>.__presets_free``. Those are not document paths, so they are replaced here by the shapes
+    the schema declares: ONE file is a STRING, several are a LIST in that order, NONE removes the key
+    (the removal the save then requires its acknowledgement for). A typed path is kept VERBATIM — it is
+    operator data, and a normalising step here would silently rename a file.
+    """
+    multi = getattr(form, "multi_items", None)
+    if not callable(multi):
+        return form
+    choice_suffix = "." + PRESETS_CHOICE_FIELD
+    free_suffix = "." + PRESETS_FREE_FIELD
+    form_suffix = "." + PRESETS_FORM_FIELD
+    chosen: dict[str, list[str]] = {}
+    typed: dict[str, str] = {}
+    rendered: set[str] = set()
+    kept: list[tuple] = []
+    for name, value in list(multi()):
+        text = name if isinstance(name, str) else ""
+        if not text.startswith("f."):
+            kept.append((name, value))
+        elif text.endswith(choice_suffix):
+            chosen.setdefault(text[2:-len(choice_suffix)], []).append(str(value or ""))
+        elif text.endswith(free_suffix):
+            typed[text[2:-len(free_suffix)]] = str(value or "")
+        elif text.endswith(form_suffix):
+            rendered.add(text[2:-len(form_suffix)])
+        else:
+            kept.append((name, value))
+    if not rendered:
+        return form
+    paths = list(chosen) + [path for path in typed if path not in chosen]
+    paths += [path for path in rendered if path not in paths]
+    stale = {"f." + path for path in paths}
+    stale |= {"f." + path + "." + configgen.FORM_COMPANION for path in paths}
+    derived: list[tuple] = []
+    for path in paths:
+        values = [value for value in chosen.get(path, []) if value.strip()]
+        extra = typed.get(path, "")
+        if extra.strip() and extra not in values:
+            values.append(extra)
+        name = "f." + path
+        if not values:
+            if _document_carries(document, tuple(path.split("."))):
+                derived.append(("f." + configgen.REMOVED_COMPANION,
+                                configgen.encode_path(tuple(path.split(".")))))
+        elif len(values) == 1:
+            derived.append((name, values[0]))
+            derived.append((name + "." + configgen.FORM_COMPANION, "scalar"))
+        else:
+            derived.extend((name, value) for value in values)
+            derived.append((name + "." + configgen.FORM_COMPANION, "list"))
+    return _CollapsedForm(form, [pair for pair in kept if pair[0] not in stale] + derived)
+
+
 async def save_extension(request: Request, node_name: str, ext_name: str,
                          redirect_to: str) -> RedirectResponse:
     """The ONE save body for an extension's configuration on ONE node — the SAME write primitive.
@@ -1777,6 +2022,10 @@ async def save_extension(request: Request, node_name: str, ext_name: str,
             result = configwrite.patch_config_file(path, merge_mutate, schemas=schema_files,
                                                    expect_revision=revision)
         else:
+            # THE PRESET-FILE CONTROL posts its rows as companions, not document paths: collapse them
+            # into the field's own value shape BEFORE anything reads the form — the removal reading
+            # included, since "no file selected" IS a removal.
+            form = _collapse_presets_choice(form, existing)
             if _foreign_extension_field(form, doc_key) is not None:
                 _notice(request, SAVE_REFUSED_FOREIGN_SCOPE, ok=False)
                 return RedirectResponse(redirect_to, status_code=303)
@@ -1816,9 +2065,13 @@ async def save_extension(request: Request, node_name: str, ext_name: str,
     if result.changed:
         message = (settings_page.SAVED_NOW if result.applies == configwrite.APPLIES_NOW
                    else settings_page.SAVED_RESTART)
+        apply = config_apply.offer(request, path=path, config_dir=settings_page.config_dir(request),
+                                   kind=settings_page.KIND_NODES, name=NODES_YAML_NAME,
+                                   node=doc_key or "", back=redirect_to)
     else:
         message = settings_page.SAVED_NO_CHANGE
-    _notice(request, message, ok=True)
+        apply = None
+    _notice(request, message, ok=True, apply=apply)
     return RedirectResponse(redirect_to, status_code=303)
 
 
@@ -1925,6 +2178,20 @@ def add_routes(router: APIRouter) -> APIRouter:
         return JSONResponse(settings_page.validate_slice(request, payload, path, schema_files,
                                                          [doc_key]))
 
+    @router.get(NODE_PAGE_HINTS_PATH)
+    async def node_page_hints(request: Request, node: str):
+        """The node page's completion hints — the schema tree, never the file and never a write.
+
+        The page's OWN read gate answers here: the capability is declared on the route, and a node
+        outside the caller's view is the console's 404 — the same pair the page itself applies, since
+        the hints describe only the schema and a visible node's editor is what fetches them.
+        """
+        requested = readmodels.text(node)
+        if _viewed_node(dashboard_page.request_source(request), requested) is None:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=404)
+        return nodes_hints(request)
+
     # ------------------------------------------------------ the extension CONFIG page (the cogwheel)
     def _canonical_extension(ext_name: str) -> str | None:
         """The schema key *ext_name* names, case-insensitively — or ``None`` (the console's 404)."""
@@ -1951,6 +2218,7 @@ def add_routes(router: APIRouter) -> APIRouter:
             "notice": actions_page.pop_notice(request),
             "save_path": f"{base_url}?tab={tab}",
             "validate_path": _node_extension_validate_url(node_name, ext_name),
+            "hints_path": _node_extension_hints_url(node_name, ext_name),
             "revision_field": settings_page.SETTINGS_REVISION_FIELD,
             "expert_field": settings_page.SETTINGS_EXPERT_FIELD,
             "yaml_field": settings_page.SETTINGS_YAML_FIELD,
@@ -2009,5 +2277,18 @@ def add_routes(router: APIRouter) -> APIRouter:
         payload = "" if text is None else str(text)
         return JSONResponse(settings_page.validate_slice(request, payload, path, schema_files,
                                                          [doc_key]))
+
+    @router.get(NODE_EXTENSION_HINTS_PATH)
+    async def node_extension_hints(request: Request, node: str, name: str):
+        """ONE extension page's completion hints — the schema tree, resolved exactly as its page is.
+
+        A node outside the caller's view is the console's 404 and an extension the catalog does not
+        declare is the same answer, so the URL a page carries cannot be replayed at another target.
+        """
+        _extension_node(request, node)
+        if _canonical_extension(name) is None:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=404)
+        return nodes_hints(request)
 
     return router

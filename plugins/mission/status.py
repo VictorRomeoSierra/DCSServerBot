@@ -27,9 +27,9 @@ STATUS_IMG = {
 
 class Init(report.EmbedElement):
     async def render(self, server: Server):
-        num_players = len(server.get_active_players()) + 1
+        num_players = len(server.get_active_players())
         self.embed.set_author(
-            name=f"{server.name} [{num_players}/{server.settings.get('maxPlayers', 16)}]",
+            name=f"{server.name} [{num_players}/{utils.player_slots(server.settings.get('maxPlayers', 16))}]",
             icon_url=STATUS_IMG[server.status])
         if server.status in [Status.PAUSED, Status.RUNNING] and server.current_mission:
             self.embed.description = f"Mission: \"{server.current_mission.display_name}\""
@@ -188,7 +188,9 @@ class ExtensionsInfo(report.EmbedElement):
         footer = self.embed.footer.text or ''
         for ext in extensions:
             self.add_field(name=ext['name'], value=ext['value'])
-        footer += "".join([f" | {ext['name']} v{ext['version']}" for ext in extensions if ext.get('version')])
+        footer += "".join([
+            f" | {ext['name']} v{ext['version']}" for ext in extensions if ext.get('version', 'n/a') != 'n/a'
+        ])
         self.embed.set_footer(text=footer)
         # add a ruler at the bottom
         await report.Ruler(self.env).render()
@@ -257,7 +259,7 @@ class All(report.EmbedElement):
                 await asyncio.sleep(1)
             if server.status == Status.SHUTDOWN:
                 continue
-            name = f"{server.name} [{len(server.players) + 1}/{server.settings.get('maxPlayers', 16)}]"
+            name = f"{server.name} [{len(server.players)}/{utils.player_slots(server.settings.get('maxPlayers', 16))}]"
             value = f"IP/Port:  {server.node.public_ip}:{server.settings.get('port', 10308)}\n"
             if server.current_mission:
                 value += f"Mission:  {server.current_mission.name}\n"

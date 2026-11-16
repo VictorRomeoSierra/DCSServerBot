@@ -14,7 +14,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable
 
-from core.action_results import ActionResult
+from core.action_results import (ACTION_FAILED, ACTION_UNAVAILABLE, TARGET_BUSY, ActionResult)
 
 if TYPE_CHECKING:
     from core import NodeImpl, Server
@@ -37,27 +37,66 @@ log = logging.getLogger(__name__)
 # a REST call and an MCP tool all reach the same function through it. Plugins simply decorate their
 # action functions — no hard-coded imports needed.
 
+#: The two action kinds. A READ changes nothing it is asked about; a WRITE changes something that
+#: outlives the call. The kind states WHAT the action does — domain metadata, never an HTTP shape.
+ACTION_KIND_READ = "read"
+ACTION_KIND_WRITE = "write"
+ACTION_KINDS = (ACTION_KIND_READ, ACTION_KIND_WRITE)
+
 _ACTIONS: dict[str, Callable] = {}
 
+#: ``qualname`` → kind, written by the same decorator as :data:`_ACTIONS` and read through
+#: :func:`kind_of`. A SEPARATE mapping so :func:`action_registry` keeps returning
+#: ``dict[str, Callable]``: no consumer of the registry changes.
+_ACTION_KINDS: dict[str, str] = {}
 
-def action(fn: Callable) -> Callable:
+
+def action(fn: Callable | None = None, *, kind: str = ACTION_KIND_WRITE) -> Callable:
     """Decorator: register a function as an ACTION this installation can offer.
 
-    Usage in any plugin's actions.py::
+    Two spellings, ONE registry::
 
         from core.actions import action
 
-        @action
+        @action                                      # a WRITE — the default
         async def start_server(ctx: Any, server_name: str) -> ServerControlResult:
+            ...
+
+        @action(kind="read")                         # a READ
+        async def list_missions(ctx: Any, server_name: str) -> MissionListResult:
             ...
 
     The declaration is transport-neutral: the MCP service, the admin web console and the Discord
     commands all read the same registry this fills, so adding a plugin's action needs no edit on any
     of them. Discovery scans loaded plugins' actions.py modules and auto-registers every decorated
     function.
+
+    An action registered WITHOUT ``kind`` reports :data:`ACTION_KIND_WRITE` — the fail-safe
+    direction, because a write presented as a read would take the paths a read takes, while a read
+    presented as a write only demands more than it needs. Any other ``kind`` value raises
+    ``ValueError`` at import time, so a typo cannot register a third state.
     """
-    _ACTIONS[fn.__qualname__] = fn
-    return fn
+    if kind not in ACTION_KINDS:
+        raise ValueError(f"@action: kind must be one of {ACTION_KINDS}, got {kind!r}")
+
+    def register(target: Callable) -> Callable:
+        _ACTIONS[target.__qualname__] = target
+        _ACTION_KINDS[target.__qualname__] = kind
+        return target
+
+    return register if fn is None else register(fn)
+
+
+def kind_of(qualname: str) -> str:
+    """The kind *qualname* declares: :data:`ACTION_KIND_READ` or :data:`ACTION_KIND_WRITE`.
+
+    Answers for EVERY registered action, and answers :data:`ACTION_KIND_WRITE` for a name that is
+    not registered — an action absent from this process declares nothing, and the fail-safe
+    direction is the one a caller must assume.
+    """
+    if qualname not in _ACTIONS:
+        return ACTION_KIND_WRITE
+    return _ACTION_KINDS.get(qualname, ACTION_KIND_WRITE)
 
 
 def action_registry() -> dict[str, Callable]:
@@ -390,12 +429,14 @@ async def call_action(qualname: str, ctx: ActionContext, /, *, audit_result: boo
         return ActionResult(
             success=False,
             message=f"Action '{qualname}' is not available in this installation.",
+            code=ACTION_UNAVAILABLE,
         )
     target, key = _normalise_target(params)
     if key is not None and key in _in_flight:
         return ActionResult(
             success=False,
             message=f"Another action on {target} is still running. Wait and retry.",
+            code=TARGET_BUSY,
         )
     if key is not None:
         _in_flight.add(key)
@@ -403,7 +444,8 @@ async def call_action(qualname: str, ctx: ActionContext, /, *, audit_result: boo
         result = await fn(ctx, **params)
     except Exception as ex:
         log.exception("Action '%s' failed", qualname)
-        return ActionResult(success=False, message=f"Action '{qualname}' failed: {ex}")
+        return ActionResult(success=False, message=f"Action '{qualname}' failed: {ex}",
+                            code=ACTION_FAILED)
     finally:
         if key is not None:
             _in_flight.discard(key)
@@ -441,12 +483,14 @@ async def read_action(qualname: str, ctx: ActionContext, /, **params) -> ActionR
         return ActionResult(
             success=False,
             message=f"Action '{qualname}' is not available in this installation.",
+            code=ACTION_UNAVAILABLE,
         )
     try:
         result = await fn(ctx, **params)
     except Exception as ex:
         log.exception("Action '%s' failed", qualname)
-        return ActionResult(success=False, message=f"Action '{qualname}' failed: {ex}")
+        return ActionResult(success=False, message=f"Action '{qualname}' failed: {ex}",
+                            code=ACTION_FAILED)
     if not isinstance(result, ActionResult):
         result = ActionResult(success=bool(result), message=str(result))
     return result
@@ -468,17 +512,17 @@ def _records_an_audit(result: ActionResult) -> bool:
 # (``services/bot/dcsserverbot.py:473-546``, ``sql/tables.sql:31-40``). The logbook plugin CONSUMES
 # it and stores none of it, so logbook-absent changes nothing here — do not build a logbook adapter.
 #
-# The actor: the ``audit`` row holds ``discord_id`` and ``ucid`` and nothing else, so a web caller
-# is named by the declared ``[web:backend/subject]`` PREFIX in the event text (greppable:
-# ``WHERE event LIKE '[web:%'``) — NEVER by passing a display name (it would land in ``ucid`` and
-# corrupt player data) and never as a ucid.
+# The actor: the ``audit`` row holds an ``actor`` column beside ``discord_id`` and ``ucid``, and the
+# declared ``[web:backend/subject]`` token is also written at the head of the event text (the write
+# surface's tests pin it, and it is what the audit channel shows) — NEVER a display name (it would
+# land in ``ucid`` and corrupt player data) and never as a ucid.
 
 #: what ``ActionResult.data["audit"]`` carries, on the one outcome that matters to the page
 AUDIT_RECORDED = "recorded"
 AUDIT_NOT_RECORDED = "not-recorded"
 
-#: the module of the HEADLESS bot: its ``audit()`` is a no-op that returns normally, so "the entry
-#: was recorded" cannot be confirmed by the call returning.
+#: the module of the HEADLESS bot. The console's apply door names it to tell an operator that this
+#: install runs without Discord (its own sentence, not a fault) instead of "no reload available".
 HEADLESS_BOT_MODULE = "services.bot.dummy.bot"
 
 #: The most characters of an action's OUTCOME the AUDIT event will ever carry. The event text is
@@ -508,12 +552,13 @@ def bound_text(value: Any, limit: int = AUDIT_EVENT_MAX_CHARS) -> str:
 
 
 def _audit_token(value) -> str:
-    """A value safe to sit inside the ``[web:backend/subject]`` prefix: ONE line, no brackets.
+    """A value safe to sit inside the ``[web:backend/subject]`` actor token: ONE line, no brackets.
 
-    The prefix is the greppable actor token (``WHERE event LIKE '[web:%'``), so anything in it that
-    can close the token early or break the line it is written on defeats the whole point — a subject
-    carrying ``]`` could forge a second ``[web:…]`` prefix and a newline could mangle the event it
-    prefixes (review M-2). The subjects are operator/Discord-controlled today, so this is hygiene
+    The token is stored in the entry's ``actor`` column and leads the event text, so anything in it
+    that can close the token early or break the line it is written on defeats the whole point — a
+    subject carrying ``]`` could forge a second ``[web:…]`` token and a newline could mangle the
+    event it prefixes (review M-2). The subjects are
+    operator/Discord-controlled today, so this is hygiene
     rather than exploitability; the value is NEUTRALISED here rather than refused, because a mangled
     actor is visible in the trail while a refused identity is an outage.
 
@@ -526,12 +571,14 @@ def _audit_token(value) -> str:
     return cleaned.strip()
 
 
-def _can_confirm_audit(bot) -> bool:
-    """Whether *bot* can POSITIVELY record an entry — a bot that is present and is not headless."""
-    if bot is None:
-        return False
-    module = getattr(type(bot), "__module__", "") or ""
-    return not module.startswith(HEADLESS_BOT_MODULE)
+def can_record_audit(bot) -> bool:
+    """Whether *bot* can POSITIVELY record an entry: it must expose an audit sink.
+
+    A headless bot raises no error on the write path — it appends the row to the cluster's audit
+    table and skips only the channel announcement — so it qualifies exactly like a Discord bot.
+    What does not is a process with no bot at all (an agent node, a service without a bot).
+    """
+    return bot is not None and callable(getattr(bot, "audit", None))
 
 
 def _resolve_bot(ctx) -> Any:
@@ -561,21 +608,21 @@ async def audit_action(ctx: ActionContext, result: ActionResult, *, server: Any 
 
     The event text is BOUNDED (:data:`AUDIT_EVENT_MAX_CHARS`) before it reaches the bot, because the
     refusal it carries can quote a caller-supplied name (``Server '<name>' not found.``) and a
-    crafted name must not grow the audit table without limit. The actor prefix leads
-    the text, so clipping the tail never loses who made the attempt.
+    crafted name must not grow the audit table without limit. The actor does NOT lead the text: it
+    travels beside it into the entry's own ``actor`` column, which clipping cannot lose.
     """
-    event = bound_text(f"{ctx.audit_actor} {message or result.message or ''}".strip())
+    event = bound_text((message or result.message or '').strip())
     target = bot if bot is not None else _resolve_bot(ctx)
     if not isinstance(getattr(result, "data", None), dict):
         result.data = {}
-    if not _can_confirm_audit(target):
+    if not can_record_audit(target):
         log.error("Audit entry NOT recorded (actor %s, server %s): %s - no bot that can record it "
                   "is available in this process.", ctx.audit_actor or "unknown",
                   getattr(server, "name", None) or "-", event)
         result.data["audit"] = AUDIT_NOT_RECORDED
         return result
     try:
-        await target.audit(event, server=server)
+        await target.audit(event, server=server, actor=ctx.audit_actor or None)
     except Exception:
         log.exception("Audit entry NOT recorded (actor %s, server %s): %s - the audit write "
                       "raised.", ctx.audit_actor or "unknown",
@@ -644,13 +691,20 @@ class ActionContext:
         return ctx
 
     @classmethod
-    def from_service(cls, service) -> ActionContext:
-        """Create context from a Service (e.g. MCPService)."""
+    def from_service(cls, service, *, actor: str | None = None) -> ActionContext:
+        """Create context from a Service (e.g. MCPService).
+
+        ``actor`` is the audit token of the caller this context is built for; ``None`` keeps the
+        transport's own label ``"MCP"``, so a caller that names no actor audits exactly as before.
+        The token's variable part is neutralised through :func:`_audit_token` where the token is
+        BUILT (``from_web`` does the same for its subject): the brackets of a declared token are
+        structural, so sanitising the assembled string would destroy it.
+        """
         from services.servicebus import ServiceBus
         from core.services.registry import ServiceRegistry
 
         ctx = cls(node=service.node, bus=ServiceRegistry.get(ServiceBus))
-        ctx._audit_user = "MCP"  # or pass explicitly per-call
+        ctx._audit_user = actor if actor is not None else "MCP"
         ctx._transport = TRANSPORT_SERVICE
         return ctx
 
@@ -750,8 +804,8 @@ class ActionContext:
         """The actor token the audit records: the declared web prefix, else the transport's label.
 
         ``[web:local/specialk]`` (or ``[web:discord/<id>]``, ``[web:breakglass/<user>]``) for a web
-        caller — greppable and needing no schema change — and the display-name label for Discord,
-        MCP and the REST surface, exactly as before.
+        caller — greppable, and stored in the entry's own ``actor`` column — and the display-name
+        label for Discord, MCP and the REST surface, exactly as before.
         """
         if self._audit_backend:
             return f"[web:{self._audit_backend}/{self._audit_subject}]"

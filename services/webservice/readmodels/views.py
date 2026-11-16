@@ -41,11 +41,11 @@ from urllib.parse import urlencode
 
 __all__ = [
     "MAX_QUERY_LENGTH", "MAX_SORT_LENGTH", "SORT_PARAM", "DIRECTION_PARAM", "SORT_DIRECTIONS",
-    "DEFAULT_SORT", "DEFAULT_DIRECTION",
+    "DEFAULT_SORT", "DEFAULT_DIRECTION", "PAGE_PARAM", "PLAYER_DIRECTORY_PAGE_SIZE",
     "LOG_POSITIONS", "TEXT", "NUM", "Column", "ColumnView", "TableView", "PlayerSearch",
     "ViewParams", "ViewState", "TABLE_COLUMNS", "TABLE_LABELS", "PAGE_COLUMNS", "PAGE_LABELS",
     "ALL_COLUMN_KEYS", "columns_for",
-    "column_keys", "normalise_sort", "normalise_direction", "normalise_query",
+    "column_keys", "normalise_sort", "normalise_direction", "normalise_query", "normalise_page",
     "normalise_position", "opposite_direction", "natural_direction",
     "sort_rows", "search_players", "column_link", "table_view", "view_state", "view_params",
 ]
@@ -75,6 +75,14 @@ MAX_SORT_LENGTH = 32
 #: here moves every reader with it instead of silently desyncing the ones that typed the literal.
 SORT_PARAM = "sort"
 DIRECTION_PARAM = "dir"
+
+#: The PAGE parameter of a paged table (``?page=``) — the directory's own, validated here so the
+#: page and the read that answers it cannot disagree about what a page number is.
+PAGE_PARAM = "page"
+
+#: How many rows a paged table shows at once. The directory's own number: 50 rows fill the card
+#: without turning one page into a scroll hunt, and the read's ``LIMIT`` uses the same value.
+PLAYER_DIRECTORY_PAGE_SIZE = 50
 
 #: the two directions, and the one in force when the URL says nothing
 SORT_DIRECTIONS: tuple[str, ...] = ("asc", "desc")
@@ -142,10 +150,36 @@ PAGE_COLUMNS: dict[str, tuple[Column, ...]] = {
     "bans": (Column("name", _("Player")), Column("ucid", _("UCID")), Column("reason", _("Reason")),
              Column("banned_at", _("Banned")), Column("banned_until", _("Expires")),
              Column("scope", _("Scope"))),
+    # THE MODS TABLE: one row per installed package of ONE target, a database read like the bans
+    # list — so it is a page-only table too and never a dashboard tab. ``status`` is the bookkeeping
+    # state the row carries (installed); whether a NEWER package sits in the folder is a node read
+    # and therefore not a column, because a sort key with no source is a control that lies.
+    #: the package column is keyed ``name`` like every other table's first column: the sort layer's
+    #: default key and its name tie-break are spelled once, and a table whose first column is called
+    #: something else would be the one exception to both.
+    "mods": (Column("name", _("Package")), Column("version", _("Version")),
+             Column("installed", _("Installed")), Column("status", _("Status"))),
+    # THE PLAYER DIRECTORY: one row per PLAYER (a Discord link groups its UCIDs), a Postgres read
+    # with its own ``LIMIT``/``OFFSET`` and its own empty-state-able page. It is deliberately NOT the
+    # dashboard's ``players`` table: that one is the live roster, rebuilt from the in-memory source on
+    # every live tick, and it must not grow a database column. ``playtime`` compares as a number of
+    # SECONDS so ``9 h`` sorts before ``10 h``; ``state`` compares the ban/watch/VIP tokens.
+    "player_directory": (Column("online", _("Status")), Column("name", _("Player")),
+                         Column("ucid", _("UCID")),
+                         Column("discord", _("Discord"), NUM),
+                         Column("last_seen", _("Last seen")), Column("playtime", _("Playtime"), NUM),
+                         Column("state", _("State"))),
+    # THE AUDIT TRAIL: one row per recorded operation, a Postgres read with its own ``LIMIT`` and its
+    # own paged view. ``server`` is the row's ``server_name`` (a column key has no ``_name`` suffix
+    # here, because the URL is read by an operator); ``time`` sorts lexicographically as the UTC stamp
+    # it renders, which is the same order the column holds.
+    "audit": (Column("time", _("When")), Column("node", _("Node")), Column("actor", _("Actor")),
+              Column("server", _("Server")), Column("event", _("Event"))),
 }
 
 #: The card heading of a PAGE-ONLY table (the dashboard's own labels are :data:`TABLE_LABELS`).
-PAGE_LABELS: dict[str, str] = {"bans": _("Bans")}
+PAGE_LABELS: dict[str, str] = {"bans": _("Bans"), "mods": _("Mods"),
+                               "player_directory": _("Players"), "audit": _("Audit")}
 
 
 def columns_for(table: str) -> tuple[Column, ...]:
@@ -183,10 +217,21 @@ def _clean(value, limit: int) -> str:
     return cleaned.strip()[:limit]
 
 
+def default_sort(table: str) -> str:
+    """The column *table* sorts by when the URL states none.
+
+    :data:`DEFAULT_SORT` when the table has it, else the table's FIRST column — a page-only table
+    whose leading column is not ``name`` (the audit trail leads with ``time``) must not resolve to a
+    key it does not have.
+    """
+    keys = column_keys(table)
+    return DEFAULT_SORT if DEFAULT_SORT in keys else (keys[0] if keys else DEFAULT_SORT)
+
+
 def normalise_sort(table: str, value) -> str:
-    """A column key of *table*, or :data:`DEFAULT_SORT`. Nothing else is ever passed on."""
+    """A column key of *table*, or its default. Nothing else is ever passed on."""
     key = _clean(value, MAX_SORT_LENGTH)
-    return key if key in column_keys(table) else DEFAULT_SORT
+    return key if key in column_keys(table) else default_sort(table)
 
 
 def normalise_direction(value) -> str:
@@ -198,6 +243,27 @@ def normalise_direction(value) -> str:
 def normalise_query(value) -> str:
     """The search text as it may be echoed and matched: trimmed, control-free, capped."""
     return _clean(value, MAX_QUERY_LENGTH)
+
+
+def normalise_page(value, pages: int | None = None) -> int:
+    """The 1-based page number *value* names, or 1 when it names none of this table's pages.
+
+    The CLOSED RANGE is ``1..pages``: a non-numeric, blank, negative or zero value is page 1, and so
+    is a value past the last page — a page number is not an error the page can show, it is a view
+    nobody can serve, so the reader is handed the first page instead of an empty table. ``pages=None``
+    is the before-the-read case (the caller does not know yet how many pages exist): the answer is
+    then any value ``>= 1``, and the read's own fallback handles a page past the end.
+    """
+    key = _clean(value, MAX_SORT_LENGTH)
+    try:
+        page = int(key)
+    except (TypeError, ValueError):
+        return 1
+    if page < 1:
+        return 1
+    if pages is not None and page > max(int(pages), 1):
+        return 1
+    return page
 
 
 def normalise_position(value) -> str | None:
@@ -365,6 +431,45 @@ def _cell(table: str, key: str, row):
             return row.banned_until
         if key == "scope":
             return row.scope
+    elif table == "mods":
+        if key in ("name", "package"):
+            return row.package
+        if key == "version":
+            return row.version
+        if key == "installed":
+            return row.installed
+        if key == "status":
+            return row.state
+    elif table == "player_directory":
+        if key == "online":
+            # the live marker as a sortable word: ``online`` sorts after ``offline`` ascending, so
+            # the players in a slot are first when the column is read descending.
+            return "online" if row.online else "offline"
+        if key == "name":
+            return row.name
+        if key == "ucid":
+            return row.ucid
+        if key == "discord":
+            # the number the LINK is, never the member's name: a name changes, an id does not, and an
+            # unlinked player's ``-1`` is the one value that sorts them together.
+            return row.discord_id
+        if key == "last_seen":
+            return row.last_seen_at
+        if key == "playtime":
+            return row.playtime_seconds
+        if key == "state":
+            return row.state
+    elif table == "audit":
+        if key == "time":
+            return row.time
+        if key == "node":
+            return row.node
+        if key == "actor":
+            return row.actor
+        if key == "server":
+            return row.server
+        if key == "event":
+            return row.event
     raise KeyError(f"no cell for {table}.{key}")
 
 
@@ -384,18 +489,20 @@ def sort_rows(table: str, rows: Sequence, sort: str = DEFAULT_SORT,
               direction: str = DEFAULT_DIRECTION) -> list:
     """*rows* ordered by the validated column and direction. Never raises on input, never mutates.
 
-    THE SECONDARY KEY IS THE NAME, ASCENDING IN BOTH DIRECTIONS. The list is first ordered by name
-    (the stable, complete tie-breaker — every table has a name) and then by the requested column,
-    using a STABLE sort. Sorting by the primary in reverse therefore cannot shuffle the ties: equal
-    keys always come out in name order, whichever way the primary runs, and the result never
+    THE SECONDARY KEY IS THE TABLE'S TIE-BREAKER, ASCENDING IN BOTH DIRECTIONS. The list is first
+    ordered by that key (a stable, complete tie-breaker — ``name`` for every table that has one, else
+    the table's default column, as the audit trail has) and then by the requested column, using a
+    STABLE sort. Sorting by the primary in reverse therefore cannot shuffle the ties: equal
+    keys always come out in tie-break order, whichever way the primary runs, and the result never
     depends on the order the read model happened to hand the rows over in.
     """
     key = normalise_sort(table, sort)
     direction = normalise_direction(direction)
     kind = _column(table, key).kind
+    tiebreak = "name" if "name" in column_keys(table) else default_sort(table)
 
     def name_key(row):
-        return _text(_cell(table, "name", row)).casefold()
+        return _text(_cell(table, tiebreak, row)).casefold()
 
     def primary_key(row):
         value = _cell(table, key, row)

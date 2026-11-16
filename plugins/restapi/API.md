@@ -4,6 +4,7 @@ This documentation is automatically generated from the RestAPI plugin definition
 
 ## Table of Contents
 
+- [Machine API v1](#machine-api-v1)
 - [Airbase](#airbase)
 - [Info](#info)
 - [Statistics](#statistics)
@@ -68,6 +69,178 @@ This documentation is automatically generated from the RestAPI plugin definition
 | /traps/img | GET | trap_id: int | Get trap image for a player |
 | /trueskill | GET | [limit: int], [offset: int], [server_name: string] | Get TrueSkill:tm: statistics for players |
 | /weaponpk | POST | nick: string, [date: string | None], [server_name: string | None] | Get PK statistics for all weapons of a specific players |
+
+---
+
+## Machine API v1
+
+`/api/v1` is the machine surface: one HTTP route per **endpoint row**, where a row binds an action to
+one method and one path. The prefix is fixed at `/api/v1` (`plugins/restapi/api_v1.py:82`); the legacy
+`prefix:` setting does not move it (see [Config keys](#config-keys)).
+
+A row declares no parameters. The parameter list is derived from the action's own signature: `{name}`
+segments of the path are path parameters, every other parameter of a `GET` is a query parameter, and
+every other parameter of a `POST` is a JSON body field.
+
+### The routes
+
+| Method | Path | Action | Risk |
+|---|---|---|---|
+| GET | `/api/v1/servers` | `list_servers` | read |
+| GET | `/api/v1/servers/{server_name}` | `get_server_status` | read |
+| GET | `/api/v1/servers/{server_name}/mission` | `get_mission_info` | read |
+| GET | `/api/v1/servers/{server_name}/missions` | `get_mission_list` | read |
+| GET | `/api/v1/servers/{server_name}/mission/weather` | `read_mission_weather` | read |
+| POST | `/api/v1/servers/{server_name}/start` | `start_server` | lifecycle |
+| POST | `/api/v1/servers/{server_name}/stop` | `stop_server` | lifecycle |
+| POST | `/api/v1/servers/{server_name}/restart` | `restart_server` | lifecycle |
+| POST | `/api/v1/servers/{server_name}/mission/pause` | `pause_mission` | lifecycle |
+| POST | `/api/v1/servers/{server_name}/mission/unpause` | `unpause_mission` | lifecycle |
+| POST | `/api/v1/servers/{server_name}/mission/restart` | `restart_mission` | lifecycle |
+| POST | `/api/v1/servers/{server_name}/mission/rotate` | `rotate_mission` | lifecycle |
+| POST | `/api/v1/servers/{server_name}/mission/load` | `load_mission` | lifecycle |
+
+Thirteen rows, declared in `plugins/mission/api.py`. Only the `read` and `lifecycle` classes are
+mounted: a row of a higher class (`moderation`, `config`, `node`, `secret`) is logged at ERROR and
+served nowhere on v1, even when a plugin declares it.
+
+A `read` row runs through `read_action` (no in-flight guard, no audit); every other row runs through
+`call_action` (guard, typed refusals, the missing-audit warning). The seam is chosen by the action's
+`kind`, so a row mislabelled `read` over a write action still gets the guarded path.
+
+### Who may call a route
+
+The guard decides in this order, per request (`plugins/restapi/api_v1.py:189`):
+
+1. **The requirement is `max(class floor, configured policy)`.** The network scope of the peer is
+   `local` (loopback), `trusted` (an address in `security.trusted`) or `remote` (anything else,
+   including a request with no peer). The configured requirement is
+   `endpoints.<key>.security[<network>]`, else `security.default[<network>]`, else `jwt`. A configured
+   policy can RAISE a class floor; it can never lower one.
+2. **`disabled` wins.** A requirement of `disabled` — in the row's own block or for that network —
+   answers `404` before any credential is read.
+3. **`none` runs without examining a credential**, even a valid one that is presented. That is the
+   read convenience the legacy surface also offers.
+4. **Otherwise the credential decides:** no verifiable credential is `401`; a verified credential
+   below the effective floor is `403`.
+
+### Floors
+
+| class | floor on every network | on v1 | as an MCP tool |
+|---|---|---|---|
+| read | `none` | yes | `read` keys |
+| lifecycle | `api_key` | yes | `control` keys |
+| moderation | `api_key` | not mounted | `control` keys (no row today) |
+| config | `api_key` | not mounted | `control` keys (no row today) |
+| node | `jwt` | not mounted | never |
+| secret | `jwt` | not mounted | never |
+
+### v1 and the legacy surface
+
+Both surfaces authenticate through the same verifier (`services/webservice/api_auth.py`) and read the
+same `auth`, `security` and `endpoints` blocks, and they are not interchangeable. The difference that
+matters is the floor: the legacy surface answers a **keyless write on loopback** whenever
+`security.default.local` is `none`, so anything that can reach `127.0.0.1` can `POST /instance/stop`;
+v1 computes `max(class floor, policy)`, so a `lifecycle` write needs an API key on loopback too. v1
+also answers `401` for a missing credential where legacy answers its historical
+`403 "Invalid authentication"`, and it answers `404` for an unknown server before dispatch.
+
+### The wire contract
+
+Every action outcome is JSON with this envelope:
+
+```json
+{"status": "ok" | "error", "message": "<one sentence>", "code": "<machine code>", ...data}
+```
+
+* `status` and `message` are always present. The keys of the result's `data` are flattened into the
+  same object, beside them.
+* `code` is present **only** when the action seam itself refused or failed; on a `200` an ordinary
+  answer is exactly `{"status", "message", **data}` — no `code` key. Client code switches on `code`,
+  never on `message`.
+
+| Status | When | Body |
+|---|---|---|
+| `200` | the action answered successfully | the envelope, no `code` |
+| `400` | the action answered a domain refusal (`success` false, no code) | the envelope, no `code` |
+| `404` | the `server_name` does not resolve, decided **before** dispatch | `{"status": "error", "message": "<resolver sentence>"}` — no `code` |
+| `409` | another action on the same target is in flight | envelope with `"code": "target_busy"`, plus the header `Retry-After: 2` |
+| `500` | the action raised | the envelope with `code: "action_failed"`; the traceback is logged, never returned |
+| `501` | the row's action is not registered in this process | the envelope with `code: "action_unavailable"` |
+| `401` / `403` | no credential / a credential below the floor | `{"detail": "…"}` — **not** the envelope |
+
+The last row is the one exception to the envelope: the refusal is raised by the authentication
+dependency before any action runs, so there is no result to render, and FastAPI serialises an
+`HTTPException` as `{"detail": "…"}`. A client must therefore accept two body shapes: `detail` on
+`401`/`403`, the envelope on every other status. The `401` also carries `WWW-Authenticate: Bearer`.
+
+### Config keys
+
+In `config/plugins/restapi.yaml`:
+
+```yaml
+DEFAULT:
+  api_v1:
+    enabled: true            # false mounts no /api/v1 route at all
+  endpoints:
+    v1/servers:              # one row. The key is 'v1/' + the row path without its leading slash.
+      enabled: true          # false leaves the route unregistered
+      security:
+        local: none
+        trusted: api_key
+        remote: jwt
+    v1/servers/{server_name}/start:
+      security:
+        remote: jwt
+```
+
+* `api_v1.enabled` — `true` by default. `false` mounts nothing under `/api/v1`; the legacy routes are
+  unaffected.
+* `endpoints.v1/<relative path>` — the config block of one row, spelled `v1/servers`,
+  `v1/servers/{server_name}`, `v1/servers/{server_name}/start`. `enabled` and `security` mean what
+  they mean on the legacy surface; a block that states neither inherits `security.default`.
+* One key never governs both surfaces: the legacy key for `/servers` is `servers`, the v1 key is
+  `v1/servers`. A legacy key that spells a v1 row's path is reported with a WARNING at mount time,
+  because it now governs the legacy route alone (`plugins/restapi/api_v1.py:365`).
+
+### MCP
+
+The MCP surface serves the same rows as MCP tools, mounted at `/mcp` on the web application
+(`services/mcpservice/server.py:367`). It is a mount and not a route: the application's capability
+gate is a route dependency, so the mount carries its own gate, `services/mcpservice/server.py:263`,
+which verifies `Authorization: Bearer <key>` and answers `401 {"detail": "Not authenticated"}` before
+any MCP session exists.
+
+* **One tool list per key level.** A tool is a row: its name is the row's action, its description the
+  row's summary, its parameters the action's signature. `read` keys are offered the `read` rows;
+  `control` keys are offered `read`, `lifecycle`, `moderation` and `config` rows; `node` and `secret`
+  rows are offered to no level. A row may also opt out entirely with `mcp=False`.
+* **The configured keys** live in `services/mcpservice.yaml`:
+  `enabled`, and `keys` as a list of `{label, level, key}` or `{label, level, jwt: {key, jwks_url}}`.
+  The `label` is 1–64 characters of letters, digits, `.`, `_`, `-` and must be unique. One level with
+  keys but no visible tool is not served.
+* **`transport.allowed_hosts` is mandatory.** The MCP SDK enables DNS-rebinding protection by
+  default, and with an empty allow-list every request is answered `421 Invalid Host header`. An empty
+  or missing `allowed_hosts` is therefore a startup error (`McpConfigError`), logged by the service
+  registry as `Service MCP NOT started: <reason>`; the rest of the process keeps running.
+  `transport.allowed_origins` is optional.
+* **`mcp==2.3.0`** is a declared runtime requirement (`requirements.txt`); the service is built on
+  `MCPServer` and its `streamable_http_app`.
+
+### Audit actors
+
+Every audited call records the caller in the entry's `actor` column, beside the event text.
+
+| Surface | Actor |
+|---|---|
+| admin console | `[web:<backend>/<subject>]` — `local`, `discord` or `breakglass`, and the signed-in subject |
+| `/api/v1` | `[api:key/<label>]` for an API key; `[api:jwt/<subject>]` for a JWT |
+| `/mcp` | `[mcp:key/<label>]` for a static key; `[mcp:jwt/<subject>]` for a JWT |
+| legacy REST | `"API"` |
+| Discord | the member's display name |
+
+The legacy REST's plain `"API"` is historical: it names the transport, not the caller. It is not the
+pattern for a new surface — both machine surfaces above carry the verified key's own token.
 
 ---
 
@@ -1353,12 +1526,45 @@ This documentation is automatically generated from the RestAPI plugin definition
     "comment": "Good pass",
     "grade": "OK",
     "id": 1,
+    "landingdist": -86,
     "night": false,
     "place": "CVN-73",
     "points": 100,
+    "tgroove": 15.7,
     "time": "2025-08-07T12:00:00",
     "trapcase": 3,
+    "trapdata": {
+      "Alt": [
+        185.0,
+        165.0,
+        145.0,
+        125.0,
+        105.0
+      ],
+      "AoA": [
+        8.1,
+        8.0,
+        8.2,
+        8.3,
+        8.1
+      ],
+      "X": [
+        1200.0,
+        1100.0,
+        1000.0,
+        900.0,
+        800.0
+      ],
+      "Z": [
+        -12.5,
+        -10.8,
+        -8.3,
+        -5.2,
+        -2.1
+      ]
+    },
     "unit_type": "F/A-18C",
+    "wind": 25,
     "wire": 3
   }
 ]
@@ -1968,20 +2174,16 @@ This documentation is automatically generated from the RestAPI plugin definition
 
 **Summary:** Shut down a server instance.
 
-**Description:** Shut a server down (terminates the DCS process), like `/server shutdown`. Unlike `/instance/stop`, which only stops the mission, the DCS process ends: DCS reads its mission list and the bot rewrites `serverSettings.lua` on the next start.
-
-With `when_empty=true` and players connected, nothing is shut down at once: the shutdown runs when the last player leaves (needs the Scheduler plugin, like "later" in `/server shutdown`) and the response status is `pending`.
-
-Errors: 404 if the server is unknown; 409 if it is already shut down, if it is in a transient state (`UNREGISTERED`, `LOADING`, `SHUTTING_DOWN`) without `force`, or if an action is already pending with `when_empty`; 504 on timeout.
+**Description:** Shut a server down (terminates the DCS process).
 
 #### Parameters
 
 | Name | Type | In | Required | Default | Description |
 |------|------|----|----------|---------|-------------|
 | `server_name` | `string` | query | **Yes** | - | Server Name |
-| `force` | `boolean` | query | No | `false` | Kill the DCS process instead of a graceful shutdown (a shutdown deferred by `when_empty` is always graceful) |
-| `maintenance` | `boolean` | query | No | `true` | Set the maintenance flag, so the Scheduler does not start the server again |
-| `when_empty` | `boolean` | query | No | `false` | If players are connected, shut down once the server is empty |
+| `force` | `bool` | query | No | `False` | Kill the DCS process instead of a graceful shutdown (a shutdown deferred by when_empty is always graceful) |
+| `maintenance` | `bool` | query | No | `True` | Set the maintenance flag, so the Scheduler does not start the server again |
+| `when_empty` | `bool` | query | No | `False` | If players are connected, shut down once the server is empty |
 
 **Response:** `ServerShutdownResponse`
 
@@ -2002,15 +2204,13 @@ Errors: 404 if the server is unknown; 409 if it is already shut down, if it is i
 
 **Summary:** Restart a node.
 
-**Description:** Restart a node, or all nodes, like `/node restart`. The bot reloads its configuration. The response is sent before the node that serves the RestAPI restarts, so the API is unavailable for a moment afterwards.
-
-Errors: 404 if the node is unknown; 409 if it is not active.
+**Description:** Restart a node, or all nodes. The bot reloads its configuration.
 
 #### Parameters
 
 | Name | Type | In | Required | Default | Description |
 |------|------|----|----------|---------|-------------|
-| `node_name` | `string` | query | No | all nodes | Node to restart |
+| `node_name` | `string | None` | query | No | - | Node to restart (default: all nodes) |
 
 **Response:** `NodeRestartResponse`
 
@@ -2019,7 +2219,9 @@ Errors: 404 if the node is unknown; 409 if it is not active.
 ```json
 {
   "message": "Node(s) node1 restarting.",
-  "nodes": ["node1"],
+  "nodes": [
+    "node1"
+  ],
   "status": "success"
 }
 ```
@@ -3611,14 +3813,16 @@ Below are the data structures and response models used across the API endpoints:
 |----------|------|----------|-------------|
 | `status` | `string` | **Yes** | Status of the operation |
 | `message` | `string` | **Yes** | Status message |
-| `nodes` | `array[string]` | **Yes** | Nodes that are restarting |
+| `nodes` | `list[string]` | **Yes** | Nodes that are restarting |
 
 #### Example
 
 ```json
 {
   "message": "Node(s) node1 restarting.",
-  "nodes": ["node1"],
+  "nodes": [
+    "node1"
+  ],
   "status": "success"
 }
 ```
@@ -4337,10 +4541,14 @@ Below are the data structures and response models used across the API endpoints:
 | `comment` | `string` | **Yes** | Landing comment |
 | `place` | `string` | **Yes** | Landing location |
 | `trapcase` | `int` | **Yes** | Trap case number |
-| `wire` | `int | None` | **Yes** | Arresting wire number |
+| `wire` | `int | None` | No | Arresting wire number |
 | `night` | `bool` | **Yes** | Whether landing was at night |
 | `points` | `int` | **Yes** | Points awarded for the trap |
 | `time` | `datetime` | **Yes** | Time of the trap |
+| `trapdata` | `object | None` | No | Detailled trap data |
+| `tgroove` | `float | None` | No | Time in the Goove |
+| `landingdist` | `int | None` | No | Landing distance |
+| `wind` | `int | None` | No | Wind |
 
 #### Example
 
@@ -4349,12 +4557,45 @@ Below are the data structures and response models used across the API endpoints:
   "comment": "Good pass",
   "grade": "OK",
   "id": 1,
+  "landingdist": -86,
   "night": false,
   "place": "CVN-73",
   "points": 100,
+  "tgroove": 15.7,
   "time": "2025-08-07T12:00:00",
   "trapcase": 3,
+  "trapdata": {
+    "Alt": [
+      185.0,
+      165.0,
+      145.0,
+      125.0,
+      105.0
+    ],
+    "AoA": [
+      8.1,
+      8.0,
+      8.2,
+      8.3,
+      8.1
+    ],
+    "X": [
+      1200.0,
+      1100.0,
+      1000.0,
+      900.0,
+      800.0
+    ],
+    "Z": [
+      -12.5,
+      -10.8,
+      -8.3,
+      -5.2,
+      -2.1
+    ]
+  },
   "unit_type": "F/A-18C",
+  "wind": 25,
   "wire": 3
 }
 ```

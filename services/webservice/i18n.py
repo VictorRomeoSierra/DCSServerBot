@@ -9,11 +9,10 @@ bot's own tree, ``locale/<lang>/LC_MESSAGES/``, under the **``webui`` domain** �
 translator already knows from the bot's plugins, but a domain of its own, because Discord and the
 frontend share almost nothing.
 
-ENGLISH IS THE MSGID, AND THAT IS THE POINT. ``en`` is the source language: wrapping a string is a
-no-op until a translation exists, so the tree stays green and nothing changes visually while the
-migration proceeds slice by slice. ``locale/en/LC_MESSAGES/webui.po`` is the identity catalog (its
-msgstrs are their msgids) — it exists so English is a first-class choice in the language control and
-so a new translator has a template to copy, not because anything needs translating.
+ENGLISH IS THE MSGID, AND THAT IS THE POINT. ``en`` is the source language and every English string
+IS its msgid, so it needs no catalog and ships none: a lookup falls back to the msgid itself, which
+is why wrapping a string is a no-op until a translation exists. English stays a first-class choice in
+the language control — :func:`selectable_languages` always offers it, first.
 
 A RUNTIME WITH NO NEW DEPENDENCY. The console uses the standard library's :mod:`gettext` and Jinja's
 i18n extension. Babel is a **build/developer** tool only (like the ``msgfmt`` step the bot's own
@@ -25,6 +24,12 @@ THE LANGUAGE OF A REQUEST, highest precedence first:
 2. the browser's ``Accept-Language`` header;
 3. the ``language:`` key in ``main.yaml`` — today's install-wide setting, and the default when
    nothing else applies.
+
+PUBLIC SITE PAGES USE A SHORTER PRECEDENCE. A page served by :mod:`services.webservice.site_pages`
+resolves through :func:`resolve_site_language`: the stored ``dcssb_lang`` cookie first, then the
+site's declared ``site.lang``. ``Accept-Language`` and ``main.yaml`` are NOT consulted there — a
+site that declares German stays German for a visitor who has chosen nothing. The cookie is the SAME
+``dcssb_lang``, so one stored choice covers both surfaces and the two cannot drift apart.
 
 THE STORE, AND WHY IT CANNOT NAME AN UNKNOWN LANGUAGE. The stored choice is a **dedicated cookie**,
 not the authenticated session — for two reasons. It has to work **before login** (the login page is
@@ -38,13 +43,16 @@ is not an error and is never echoed: it simply yields ``None`` and the next sour
 is consulted. A visitor therefore cannot make the console look for ``../../etc/passwd`` or a
 language that does not exist.
 
-THE CONTROL SHOWS FLAGS, NOT NAMES. With more languages coming, a row of names is too long, so each
-option is a small SVG flag (a neutral globe for English, the source language) with the language's own
-endonym kept as its ``title``/``aria-label`` — the name is not drawn, but hovering and a screen reader
-still say which language it is. Flag EMOJI are deliberately NOT used (Windows renders them as the two
-regional-indicator letters, so the control would look broken on the maintainer's own machine); the
-assets are vendored SVG files (see ``static/flags/``). Only languages with a compiled ``webui``
-catalog are offered, and the control stays plain links, so it works with JavaScript off.
+THE CONTROL NAMES THE CURRENT LANGUAGE, THEN LISTS THE REST. The top bar carries ONE pill — the
+language in force, drawn as its flag plus its own endonym — and the pill opens a menu with one row
+per selectable language (flag + endonym, the current row ticked). A flat row of every flag no longer
+fits as languages are added, and a flag alone never says which language it is; the menu can afford
+both. Each row is still a plain GET link to :data:`LANGUAGE_PATH`, and the menu is a native
+``popover`` opened from its button, so the control works with JavaScript off. The current language's
+flag is a neutral globe for English (the source language), never a national flag. Flag EMOJI are
+deliberately NOT used (Windows renders them as the two regional-indicator letters, so the control
+would look broken on the maintainer's own machine); the assets are vendored SVG files (see
+``static/flags/``). Only languages with a compiled ``webui`` catalog are offered.
 
 NO LEAK BETWEEN REQUESTS. The console runs **inside the bot's own process**, so a global
 ``install_gettext_translations``/``set_language`` would bleed the console's language into the bot's
@@ -74,9 +82,11 @@ __all__ = [
     "MESSAGES_PATH", "JS_MESSAGES",
     "LANGUAGE_NAMES", "LANGUAGE_FLAGS", "FLAG_ASSET_PREFIX", "FLAG_NEUTRAL_ASSET", "flag_asset",
     "catalog_languages", "selectable_languages", "display_name",
-    "normalise_language", "default_language", "resolve_language", "translations_for",
+    "normalise_language", "default_language", "resolve_language", "resolve_site_language",
+    "translations_for",
     "SCHEMA_DOMAIN", "schema_text_for", "schema_text",
-    "environment_for_language", "environment_for", "language_control", "render", "render_fragment",
+    "environment_for_language", "environment_for", "language_control", "site_language_control",
+    "render", "render_fragment",
     "translator_for", "translate",
     "messages_for", "messages_for_language", "messages_script", "messages_script_for",
     "messages_capability",
@@ -115,7 +125,10 @@ MESSAGES_PATH = "/i18n/messages.js"
 #: somebody who does not read the current language. A catalog with no entry here still appears in
 #: the control, labelled by its code — a new catalog is never hidden for want of a name.
 LANGUAGE_NAMES: dict[str, str] = {"en": "English", "de": "Deutsch", "es": "Español", "ru": "Русский",
-                                 "cn": "中文"}
+                                 "cn": "中文", "tr": "Türkçe", "fr": "Français",
+                                 "it": "Italiano",
+                                 "pt": "Português (Brasil)",
+                                 "pl": "Polski"}
 
 #: the static area the flag SVGs are served from (the shell's own asset path, served by the same
 #: gated frontend every other asset uses; spelled here rather than imported from ``shell`` because
@@ -131,7 +144,8 @@ FLAG_NEUTRAL_ASSET = "globe.svg"
 #: public-domain / MIT artwork only; see ``static/flags/SOURCE.txt`` beside the files. Windows does
 #: not render flag EMOJI (it falls back to the two regional-indicator letters), which is exactly why
 #: these are real SVG files and not emoji. A code absent here gets the neutral globe.
-LANGUAGE_FLAGS: dict[str, str] = {"de": "de.svg", "es": "es.svg", "ru": "ru.svg", "cn": "cn.svg"}
+LANGUAGE_FLAGS: dict[str, str] = {"de": "de.svg", "es": "es.svg", "ru": "ru.svg", "cn": "cn.svg",
+                                  "tr": "tr.svg", "fr": "fr.svg", "it": "it.svg", "pt": "pt.svg", "pl": "pl.svg"}
 
 
 def flag_asset(code: str) -> str:
@@ -328,6 +342,32 @@ def _header_of(request, name: str) -> str | None:
     return headers.get(name) if headers is not None else None
 
 
+def resolve_site_language(request, site_lang) -> str:
+    """The language a PUBLIC SITE page renders in: the stored choice, else the site's own.
+
+    PRECEDENCE, in this order and no other:
+
+    1. the visitor's stored choice — the shared ``dcssb_lang`` cookie, validated by
+       :func:`normalise_language`; an absent or unknown value is skipped;
+    2. ``site.lang`` — the language the site block declares (validated against the shipped
+       catalogs when the site is loaded).
+
+    ``Accept-Language`` is DELIBERATELY NOT consulted, and neither is ``main.yaml``: a site that
+    declares German stays German for a visitor who has chosen nothing. That is why this function
+    exists instead of :func:`resolve_language`, whose header and install-wide steps are wrong for a
+    site.
+
+    The cookie is the CONSOLE'S OWN (``dcssb_lang``, path ``/``), so one stored choice covers both
+    surfaces: a visitor who picks French on the public site sees the Command Center in French too,
+    and vice versa — one preference, one control, no second cookie to get out of step.
+    """
+    stored = normalise_language(_cookie_of(request))
+    if stored:
+        return stored
+    return normalise_language(site_lang) or BASE_LANGUAGE
+
+
+
 # ------------------------------------------------------------------- the per-language translator
 
 def translations_for(language: str) -> gettext.NullTranslations:
@@ -511,13 +551,50 @@ def language_control(request: Request) -> dict:
     trusted from the client.
     """
     current = resolve_language(request)
+    options = [{"code": code, "name": display_name(code), "flag": flag_asset(code),
+                "active": code == current}
+               for code in selectable_languages()]
     return {
         "current": current,
+        "current_name": display_name(current),
+        "current_flag": flag_asset(current),
         "action": LANGUAGE_PATH,
         "next": _return_path(request),
-        "languages": [{"code": code, "name": display_name(code), "flag": flag_asset(code),
-                       "active": code == current}
-                      for code in selectable_languages()],
+        "languages": options,
+    }
+
+
+def site_language_control(request, resolved, language: str) -> dict:
+    """The PUBLIC SITE's language control — the same shape :func:`language_control` returns.
+
+    ``_language.html`` renders this unchanged, so the partial needs no site-specific branch.
+
+    ``language`` is the language IN FORCE for this render (what
+    :func:`resolve_site_language` answered), not :func:`resolve_language`'s answer: the tick and
+    the pill must name the language the page is actually written in, and the console's resolver
+    would consult ``Accept-Language`` and ``main.yaml`` and tick the wrong row.
+
+    ``action`` is the SITE's own switch path and ``next`` the current path inside THIS site
+    (both built through :mod:`services.webservice.site_pages`), so the switch returns to a page of
+    the site the control was rendered on rather than to a console path. ``next`` is validated
+    (:func:`site_pages.safe_return`), never trusted from the client.
+    """
+    # imported LAZILY: ``site_pages`` imports this module at top level, so a module-level import
+    # here would be a cycle. Both modules are loaded by the time a request runs.
+    from . import site_pages
+
+    url = getattr(request, "url", None)
+    path = (getattr(url, "path", None) or "/") if url is not None else "/"
+    options = [{"code": code, "name": display_name(code), "flag": flag_asset(code),
+                "active": code == language}
+               for code in selectable_languages()]
+    return {
+        "current": language,
+        "current_name": display_name(language),
+        "current_flag": flag_asset(language),
+        "action": site_pages.site_url(resolved, LANGUAGE_PATH),
+        "next": site_pages.safe_return(request, resolved, path),
+        "languages": options,
     }
 
 
@@ -594,6 +671,13 @@ JS_MESSAGES: dict[str, str] = {
     "yaml.checking": _("Checking…"),
     "yaml.ok": _("Valid."),
     "yaml.editing": _("editing"),
+    # the completion popup over the schema's tree (static/settings-yaml.js): the two marks a row can
+    # carry and the word that names the row inserting a block's example. They reuse the catalogs'
+    # EXISTING "required" and "set" msgids — those words are already translated everywhere — so only
+    # "example" is a new msgid in the nine catalogs.
+    "yaml.hint.required": _("required"),
+    "yaml.hint.set": _("set"),
+    "yaml.hint.example": _("example"),
 }
 
 #: the ONE substitution helper the served script installs. It LOOKS A KEY UP and replaces ``{name}``

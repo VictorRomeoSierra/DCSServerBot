@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import atexit
 import importlib
 import inspect
 import json
@@ -9,10 +8,12 @@ import luadata
 import os
 import pkgutil
 import psutil
+import queue
 import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import traceback
 
@@ -45,7 +46,9 @@ from typing import TYPE_CHECKING, Any, Iterable
 from typing_extensions import override
 from watchdog.events import (FileSystemEventHandler, DirCreatedEvent, FileCreatedEvent, DirDeletedEvent,
                              FileDeletedEvent, DirMovedEvent, FileMovedEvent)
-from watchdog.observers import Observer, ObserverType
+from watchdog.observers import Observer
+from watchdog.observers.api import BaseObserver
+from watchdog.observers.polling import PollingObserver
 
 from core.utils.yaml_helper import new_yaml
 
@@ -103,17 +106,40 @@ class RenameError(Exception):
 
 
 class MissionFileSystemEventHandler(FileSystemEventHandler):
+    """Feeds new and deleted ``.miz``/``.sav`` files into the server's mission list.
+
+    The watchdog callbacks do nothing but turn an event into a path and hand it to the worker: the
+    stability wait can take minutes on a slow share, and blocking the observer's emitter thread for
+    it would delay every other event by the same amount.
+
+    A path is in ``_queued`` from the moment it is accepted until the worker is done with it, so a
+    burst of duplicate notifications for one file adds it once.
+    """
+
     DEBOUNCE_WINDOW = 2.0           # seconds
     TEMP_SUFFIXES = ('.tmp', '.part', '.swp', '~')
     IGNORE_PREFIX = '.'             # hidden files
+    STABLE_SAMPLE = 0.5             # seconds between two size samples
 
-    def __init__(self, server, loop):
+    def __init__(self, server, loop, stable_timeout: float = 60.0):
         super().__init__()
         self.server = server
         self.log = server.log
         self.loop = loop
+        self.stable_timeout = stable_timeout
         self.deleted: dict[str, int] = {}
         self._seen: dict[str, float] = {}
+        self._queued: set[str] = set()
+        self._lock = threading.Lock()
+        self._stopped = threading.Event()
+        self._queue: queue.Queue[str | None] = queue.Queue()
+        self._worker = threading.Thread(target=self._work, name=f'autoscan-{server.name}', daemon=True)
+        self._worker.start()
+
+    def stop(self):
+        self._stopped.set()
+        self._queue.put(None)
+        self._worker.join(timeout=5)
 
     def _is_debounced(self, path):
         now = time.monotonic()
@@ -131,46 +157,38 @@ class MissionFileSystemEventHandler(FileSystemEventHandler):
             return False
         return path.endswith('.miz') or path.endswith('.sav')
 
-    def _wait_for_stable_file(self, path, timeout=5.0):
-        start = time.monotonic()
-        while time.monotonic() - start < timeout:
-            try:
-                size1 = os.path.getsize(path)
-            except FileNotFoundError:
-                return False
-            time.sleep(0.5)
-            try:
-                size2 = os.path.getsize(path)
-            except FileNotFoundError:
-                return False
-            if size1 == size2:
-                return True
-        return False
+    # ----------------------------------------------------------------------
+    # Watchdog callbacks: a path in, nothing else
+    # ----------------------------------------------------------------------
+    def on_created(self, event: DirCreatedEvent | FileCreatedEvent) -> None:
+        if not event.is_directory:
+            self._handle_created(event.src_path)
+
+    def on_deleted(self, event: DirDeletedEvent | FileDeletedEvent) -> None:
+        if not event.is_directory:
+            self._handle_deleted(event.src_path)
+
+    def on_moved(self, event: DirMovedEvent | FileMovedEvent) -> None:
+        # a rename leaves the old name behind and arrives under the new one
+        if not event.is_directory:
+            self._handle_deleted(event.src_path)
+            self._handle_created(event.dest_path)
 
     # ----------------------------------------------------------------------
     # Core handlers
     # ----------------------------------------------------------------------
-    def on_created(self, event: DirCreatedEvent | FileCreatedEvent) -> None:
-        path = os.path.normpath(event.src_path)
+    def _handle_created(self, path: str | bytes) -> None:
+        path = os.fsdecode(os.path.normpath(path))
         if not self._is_valid_mission_file(path):
             return
-        if self._is_debounced(path):
-            return
+        with self._lock:
+            if path in self._queued or self._is_debounced(path):
+                return
+            self._queued.add(path)
+        self._queue.put(path)
 
-        if not self._wait_for_stable_file(path):
-            self.log.warning(f"File {path} never stabilized – skipping.")
-            return
-
-        if path in self.deleted:
-            idx = self.deleted.pop(path)
-            asyncio.run_coroutine_threadsafe(self.server.addMission(path, idx=idx), self.loop)
-        else:
-            asyncio.run_coroutine_threadsafe(self.server.addMission(path), self.loop)
-
-        self.log.info(f"=> New mission {os.path.basename(path)[:-4]} added to server {self.server.name}.")
-
-    def on_deleted(self, event: DirDeletedEvent | FileDeletedEvent) -> None:
-        path = os.path.normpath(event.src_path)
+    def _handle_deleted(self, path: str | bytes) -> None:
+        path = os.fsdecode(os.path.normpath(path))
         if not self._is_valid_mission_file(path):
             return
         missions = self.server.settings['missionList']
@@ -178,25 +196,80 @@ class MissionFileSystemEventHandler(FileSystemEventHandler):
             secondary = os.path.join(os.path.dirname(path), '.dcssb', os.path.basename(path))
             if secondary in missions:
                 path = secondary
-        if path in missions:
+        with self._lock:
+            if path not in missions:
+                self.log.debug(f"Mission file {path} got deleted from disk.")
+                return
             idx = missions.index(path) + 1
-            asyncio.run_coroutine_threadsafe(self.server.deleteMission(idx), self.loop)
             self.deleted[path] = idx
-            self.log.info(f"=> Mission {os.path.basename(path)[:-4]} deleted from server {self.server.name}.")
-        else:
-            self.log.debug(f"Mission file {path} got deleted from disk.")
+        asyncio.run_coroutine_threadsafe(self.server.deleteMission(idx), self.loop)
+        self.log.info(f"=> Mission {os.path.basename(path)[:-4]} deleted from server {self.server.name}.")
 
-    def on_moved(self, event: DirMovedEvent | FileMovedEvent) -> None:
-        self.on_deleted(event)
-        self.on_created(event)
+    # ----------------------------------------------------------------------
+    # Worker: one file at a time, off the emitter thread
+    # ----------------------------------------------------------------------
+    def _work(self):
+        while True:
+            path = self._queue.get()
+            try:
+                if path is None or self._stopped.is_set():
+                    return
+                self._add_pending(path)
+            except Exception as ex:
+                # the worker outlives one bad file: a raise here would stop autoscan for good
+                self.log.exception(ex)
+            finally:
+                if path is not None:
+                    with self._lock:
+                        self._queued.discard(path)
+                    self._queue.task_done()
+
+    def _add_pending(self, path: str) -> None:
+        if not self._wait_for_stable_file(path):
+            if not self._stopped.is_set():
+                self.log.warning(f"File {path} never stabilized – skipping.")
+            return
+        with self._lock:
+            idx = self.deleted.pop(path, None)
+        if idx is not None:
+            asyncio.run_coroutine_threadsafe(self.server.addMission(path, idx=idx), self.loop)
+        else:
+            asyncio.run_coroutine_threadsafe(self.server.addMission(path), self.loop)
+        self.log.info(f"=> New mission {os.path.basename(path)[:-4]} added to server {self.server.name}.")
+
+    def _wait_for_stable_file(self, path: str) -> bool:
+        """True once *path* stops growing, False once it vanished or kept growing past the budget."""
+        start = time.monotonic()
+        try:
+            size = os.path.getsize(path)
+        except FileNotFoundError:
+            return False
+        while time.monotonic() - start < self.stable_timeout:
+            time.sleep(self.STABLE_SAMPLE)
+            if self._stopped.is_set():
+                return False
+            try:
+                new_size = os.path.getsize(path)
+            except FileNotFoundError:
+                return False
+            if new_size == size:
+                return True
+            size = new_size
+        return False
+
+
+def create_observer(polling: bool, poll_interval: float) -> BaseObserver:
+    """A polling observer where the OS cannot report changes reliably, the native one otherwise."""
+    return PollingObserver(timeout=poll_interval) if polling else Observer()
 
 
 @dataclass
 @DataObjectFactory.register()
 class ServerImpl(Server):
     bot: DCSServerBot | None = field(compare=False, init=False, repr=False, default=None)
-    event_handler: MissionFileSystemEventHandler = field(compare=False, repr=False, default=None)
-    observer: ObserverType = field(compare=False, repr=False, default=None)
+    event_handler: MissionFileSystemEventHandler | None = field(compare=False, repr=False, default=None)
+    observer: BaseObserver | None = field(compare=False, repr=False, default=None)
+    observer_mode: str | None = field(compare=False, repr=False, default=None)
     process: psutil.Process | None = field(default=None, repr=False, compare=False)
 
     @override
@@ -217,7 +290,10 @@ class ServerImpl(Server):
             row = cursor.fetchone()
             if row:
                 self._maintenance = row[0]
-        atexit.register(self.stop_observer)
+        # A threading exit hook, not atexit: threading._shutdown() joins the observer's non-daemon
+        # threads BEFORE it runs the atexit handlers, so an atexit stopper is reached only after
+        # the join that is waiting for it — the process then never exits.
+        threading._register_atexit(self.stop_observer)  # type: ignore[attr-defined]
 
     @override
     async def reload(self):
@@ -268,11 +344,19 @@ class ServerImpl(Server):
         self._prepare()
 
     def start_observer(self):
-        if not self.observer:
-            self.event_handler = MissionFileSystemEventHandler(self, asyncio.get_event_loop())
-            self.observer = Observer()
-            self.enable_autoscan()
-            self.observer.start()
+        mode, detail = self._resolve_observer_mode()
+        if self.observer:
+            if self.observer_mode == mode:
+                return
+            # the configured mode changed under a running observer (a reload): rebuild it
+            self.stop_observer()
+        self.event_handler = MissionFileSystemEventHandler(
+            self, asyncio.get_event_loop(), stable_timeout=self._seconds('autoscan_stable_timeout', 60.0))
+        self.observer = create_observer(mode == 'polling', self._seconds('autoscan_poll_interval', 3.0))
+        self.observer_mode = mode
+        self.enable_autoscan()
+        self.observer.start()
+        self.log.info(f'  => {self.name}: autoscan observer = {mode} ({detail}).')
 
     def stop_observer(self):
         if self.observer:
@@ -280,14 +364,39 @@ class ServerImpl(Server):
             self.observer.stop()
             self.observer.join(timeout=10)
             self.observer = None
+            self.observer_mode = None
+            if self.event_handler:
+                self.event_handler.stop()
+                self.event_handler = None
+
+    def _resolve_observer_mode(self) -> tuple[str, str]:
+        """The observer mode to run, plus the clause the startup log line states it with."""
+        mode = str(self.locals.get('autoscan_observer', 'auto')).strip().lower()
+        if mode not in ('auto', 'notify', 'polling'):
+            self.log.warning(f'  => {self.name}: unknown autoscan_observer "{mode}", falling back to auto.')
+            mode = 'auto'
+        if mode != 'auto':
+            return mode, 'configured'
+        missions_dir = self.instance.missions_dir if self.instance else ''
+        if not missions_dir:
+            return 'notify', 'no missions directory configured'
+        remote, resolved = utils.is_remote_path(missions_dir)
+        return ('polling' if remote else 'notify'), f'missions dir {resolved} is {"remote" if remote else "local"}'
+
+    def _seconds(self, key: str, default: float) -> float:
+        try:
+            return float(self.locals.get(key, default))
+        except (TypeError, ValueError):
+            self.log.warning(f'  => {self.name}: {key} is not a number, using {default:g}s.')
+            return default
 
     def enable_autoscan(self):
-        if not self.observer.emitters:
+        if self.observer and self.event_handler and not self.observer.emitters:
             self.observer.schedule(self.event_handler, self.instance.missions_dir, recursive=True)
             self.log.info(f'  => {self.name}: Auto-scanning for new miz files in Missions-folder enabled.')
 
     def disable_autoscan(self):
-        if self.observer.emitters:
+        if self.observer and self.observer.emitters:
             self.observer.unschedule_all()
             self.log.info(f'  => {self.name}: Auto-scanning for new miz files in Missions-folder disabled.')
 
@@ -495,7 +604,14 @@ class ServerImpl(Server):
             self.start_observer()
 
     def _get_current_mission_file(self) -> str | None:
-        if not self.current_mission or not self.current_mission.filename:
+        # The mission DCS last reported is only usable while the file is still there: it can be
+        # replaced, renamed or deleted while the server is down, and a crash or a forced shutdown
+        # keeps ``current_mission`` alive. Handing a dead path to a caller fails on its first copy.
+        filename = self.current_mission.filename if self.current_mission else None
+        if filename and not os.path.exists(filename):
+            self.log.warning(f"Current mission {filename} could not be found!")
+            filename = None
+        if not filename:
             settings = self.settings
             try:
                 start_index = int(settings.get('listStartIndex', 1))
@@ -503,8 +619,6 @@ class ServerImpl(Server):
                 start_index = settings['listStartIndex'] = 1
             if settings['missionList'] and start_index <= len(settings['missionList']):
                 filename = settings['missionList'][start_index - 1]
-            else:
-                filename = None
             if not filename or not os.path.exists(filename):
                 for idx, filename in enumerate(settings['missionList']):
                     if os.path.exists(filename):
@@ -514,8 +628,6 @@ class ServerImpl(Server):
                         self.log.warning(f"Non-existent mission {filename} in your missionList!")
                 else:
                     filename = None
-        else:
-            filename = self.current_mission.filename
         return os.path.normpath(filename) if filename else None
 
     @override
@@ -1024,7 +1136,19 @@ class ServerImpl(Server):
             )
 
     @override
-    async def startup(self, modify_mission: bool | None = True, use_orig: bool | None = True) -> None:
+    async def start(self, *, preset: dict | list | str | None = None) -> bool:
+        # A process start changes no mission, so a start that states no preset leaves the record alone.
+        # A launch-driven start (the scheduler's stop-then-start shape) states the weather it already
+        # applied, so the page names it — and states an empty set when it applied none, which clears.
+        if preset is not None:
+            await _record_launched_preset(self, preset, bool(preset))
+        return await super().start()
+
+    @override
+    async def startup(self, modify_mission: bool | None = True, use_orig: bool | None = True, *,
+                      preset: dict | list | str | None = None,
+                      preset_name: str | list[str] | None = None,
+                      announce: bool = False) -> None:
         # A duplicate start request is one where OUR OWN DCS PROCESS IS ALREADY ALIVE, never one where the
         # status merely reads as up: the scheduler's state loop marks a server LOADING and THEN schedules the
         # launch that starts it, so a bare ``status == LOADING`` test makes the scheduler skip its own launch
@@ -1049,7 +1173,14 @@ class ServerImpl(Server):
         await self.init_extensions()
         await self.prepare_extensions()
         if modify_mission:
-            await self.apply_mission_changes(use_orig=use_orig)
+            await self.apply_mission_changes(use_orig=use_orig, preset=preset,
+                                             preset_name=preset_name, announce=announce)
+        else:
+            # The extensions do not run here, so this start applies no preset itself. The record
+            # follows the value the caller states: a launch that already applied the weather passes its
+            # preset names, and a start that states none clears the record — the page would otherwise
+            # name a preset this start never applied.
+            await _record_launched_preset(self, preset, bool(preset), preset_name=preset_name)
         await asyncio.to_thread(self.do_startup)
 
         from services.firewall import FirewallService
@@ -1170,67 +1301,107 @@ class ServerImpl(Server):
 
     @override
     @performance_log()
-    async def apply_mission_changes(self, filename: str | None = None, *, use_orig: bool | None = True) -> str | None:
-        try:
-            # disable autoscan
-            if self.locals.get('autoscan', False):
-                self.disable_autoscan()
-            if not filename:
-                filename = await self.get_current_mission_file()
-                if not filename:
-                    self.log.warning("No mission found. Is your mission list empty?")
-                    return None
+    async def apply_mission_changes(self, filename: str | None = None, *, use_orig: bool | None = True,
+                                    preset: dict | list | str | None = None,
+                                    preset_name: str | list[str] | None = None,
+                                    announce: bool = False) -> str | None:
+        # The rewrite runs in the nested ``_rewrite`` and reports whether the per-load preset was
+        # REALLY applied — a name the instance does not carry is ignored by the extension and rewrites
+        # nothing. The record and the announcement follow THAT answer, never the request: a launch
+        # nobody picked a preset for, or one that picked a name the instance does not carry, records
+        # none and announces nothing.
+        applied = False
 
-            # select the mission file to use before creating a temp copy
-            selected_filename = filename
-            dirty = False
-            for ext in self.extensions.values():
-                if type(ext).get_mission_file != Extension.get_mission_file:
-                    new_selected_filename = await ext.get_mission_file(selected_filename)
-                    if new_selected_filename != selected_filename:
-                        self.log.info(f'  => {ext.name} selected {os.path.basename(new_selected_filename)}.')
-                        selected_filename = new_selected_filename
-                        dirty = True
-
-            source_filename = utils.get_orig_file(selected_filename) if use_orig else selected_filename
-            temp_dir = tempfile.mkdtemp(prefix='dcssb-mission-')
-            tmp_filename = os.path.join(temp_dir, os.path.basename(selected_filename))
-            new_filename = tmp_filename
-
+        async def _rewrite() -> str | None:
+            nonlocal applied
+            mission = filename
             try:
-                shutil.copy2(source_filename, tmp_filename)
+                # disable autoscan
+                if self.locals.get('autoscan', False):
+                    self.disable_autoscan()
+                if not mission:
+                    mission = await self.get_current_mission_file()
+                    if not mission:
+                        self.log.warning("No mission found. Is your mission list empty?")
+                        return None
 
-                # process all mission modifications on the temporary copy
-                dirty |= use_orig
+                # select the mission file to use before creating a temp copy
+                selected_filename = mission
+                dirty = False
                 for ext in self.extensions.values():
-                    if type(ext).modify_mission != Extension.modify_mission:
-                        new_filename, _dirty = await ext.modify_mission(new_filename)
-                        if _dirty:
-                            self.log.info(f'  => {ext.name} applied on {os.path.basename(new_filename)}.')
-                        dirty |= _dirty
+                    if type(ext).get_mission_file != Extension.get_mission_file:
+                        new_selected_filename = await ext.get_mission_file(selected_filename)
+                        if new_selected_filename != selected_filename:
+                            self.log.info(f'  => {ext.name} selected {os.path.basename(new_selected_filename)}.')
+                            selected_filename = new_selected_filename
+                            dirty = True
 
-                if not dirty:
-                    return filename
+                source_filename = utils.get_orig_file(selected_filename) if use_orig else selected_filename
+                # A source that is gone cannot be rewritten: name it and carry on with the mission as
+                # configured. Startup prunes a mission file that no longer exists from the list, so
+                # failing the whole launch here would only hide a mission that CAN start.
+                if not source_filename or not os.path.exists(source_filename):
+                    self.log.warning(f"Mission file {selected_filename} not found - mission rewrite skipped.")
+                    return mission
+                temp_dir = tempfile.mkdtemp(prefix='dcssb-mission-')
+                tmp_filename = os.path.join(temp_dir, os.path.basename(selected_filename))
+                new_filename = tmp_filename
 
-                writable_filename = utils.create_writable_mission(selected_filename)
-                shutil.copy2(new_filename, writable_filename)
-                return writable_filename
+                try:
+                    shutil.copy2(source_filename, tmp_filename)
 
-            except Exception as ex:
-                self.log.exception(ex)
-                if use_orig:
+                    # process all mission modifications on the temporary copy
+                    dirty |= use_orig
+                    for ext in self.extensions.values():
+                        if type(ext).modify_mission != Extension.modify_mission:
+                            # a None preset is passed as no keyword at all, so an extension still on the
+                            # standalone ``modify_mission(self, filename)`` signature stays callable
+                            if preset is None:
+                                new_filename, _dirty = await ext.modify_mission(new_filename)
+                            else:
+                                new_filename, _dirty = await ext.modify_mission(new_filename, preset=preset)
+                            if _dirty:
+                                self.log.info(f'  => {ext.name} applied on {os.path.basename(new_filename)}.')
+                            dirty |= _dirty
+                            # the per-load preset is REALLY applied only when the extension that
+                            # CONSUMES it reports a change; a name it does not carry leaves the mission
+                            # untouched, so nothing is recorded and nothing is announced. The consumer is
+                            # named by its class, not imported: this module must not pull the extension
+                            # in to answer the question.
+                            if preset is not None and _dirty and type(ext).__name__ == "MizEdit":
+                                applied = True
+
+                    if not dirty:
+                        return mission
+
                     writable_filename = utils.create_writable_mission(selected_filename)
-                    orig_filename = utils.get_orig_file(selected_filename)
-                    shutil.copy2(orig_filename, writable_filename)
+                    shutil.copy2(new_filename, writable_filename)
                     return writable_filename
-                return filename
 
+                except Exception as ex:
+                    self.log.exception(ex)
+                    if use_orig:
+                        # never re-copy a source that may be the very thing that failed: check it
+                        # first and fall back to the unmodified mission instead of raising again
+                        orig_filename = utils.get_orig_file(selected_filename)
+                        if orig_filename and os.path.exists(orig_filename):
+                            writable_filename = utils.create_writable_mission(selected_filename)
+                            shutil.copy2(orig_filename, writable_filename)
+                            return writable_filename
+                    return mission
+
+                finally:
+                    utils.safe_rmtree(temp_dir)
             finally:
-                utils.safe_rmtree(temp_dir)
-        finally:
-            # enable autoscan
-            if self.locals.get('autoscan', False):
-                self.enable_autoscan()
+                # enable autoscan
+                if self.locals.get('autoscan', False):
+                    self.enable_autoscan()
+
+        result = await _rewrite()
+        await _record_launched_preset(self, preset, applied, preset_name=preset_name)
+        if applied and announce:
+            await _announce_launched_preset(self, preset)
+        return result
 
     async def keep_alive(self):
         if self.status in [Status.RUNNING, Status.PAUSED, Status.STOPPED]:
@@ -1326,10 +1497,17 @@ class ServerImpl(Server):
         return ret
 
     @override
-    async def restart(self, modify_mission: bool | None = True, use_orig: bool | None = True) -> None:
+    async def restart(self, modify_mission: bool | None = True, use_orig: bool | None = True, *,
+                      preset: dict | list | str | None = None,
+                      preset_name: str | list[str] | None = None,
+                      announce: bool = False) -> None:
         current_mission = self._get_current_mission_file()
         if current_mission:
-            await self.loadMission(current_mission, modify_mission=modify_mission, use_orig=use_orig)
+            # ``preset`` / ``preset_name`` / ``announce`` are forwarded so a restart with a weather
+            # pick applies it — and records its name — by the SAME path a load does: a restart whose
+            # caller states none keeps today's behaviour.
+            await self.loadMission(current_mission, modify_mission=modify_mission, use_orig=use_orig,
+                                   preset=preset, preset_name=preset_name, announce=announce)
         else:
             await self.stop()
             await self.start()
@@ -1344,8 +1522,10 @@ class ServerImpl(Server):
             mission_id = 1
         if self.status in [Status.STOPPED, Status.PAUSED, Status.RUNNING]:
             await self.send_to_dcs({"command": "setStartIndex", "id": mission_id})
-        else:
-            self.settings['listStartIndex'] = mission_id
+        # The pointer is written in BOTH branches: the DCS command moves ``net.missionlist`` in the
+        # running process, but the bot's own cache — what ``getStartIndex`` and the mission list read
+        # — would otherwise keep the old index until a restart.
+        self.settings['listStartIndex'] = mission_id
 
     @override
     async def setPassword(self, password: str | None):
@@ -1393,6 +1573,7 @@ class ServerImpl(Server):
             mission = os.path.join(os.path.dirname(path), '.dcssb', os.path.basename(path))
 
         missions = await self.getMissionList()
+        was_empty = not missions
         # we have this mission in the list already
         if path in missions or mission in missions:
             # if the replacement mission is in the list only, update it with the new mission
@@ -1421,12 +1602,24 @@ class ServerImpl(Server):
             self.settings['missionList'] = missions
             if autostart:
                 self.settings['listStartIndex'] = missions.index(path) + 1
+        if was_empty and not autostart:
+            # the FIRST mission in an empty rotation is the only one that can start, so it takes the
+            # pointer whether or not the box was ticked. Any later mission must be ticked to become the
+            # start one: adding never moves the pointer on its own.
+            try:
+                self.settings['listStartIndex'] = self.settings['missionList'].index(path) + 1
+            except ValueError:
+                self.settings['listStartIndex'] = 1
         return self.settings['missionList']
 
     @override
     async def deleteMission(self, mission_id: int) -> list[str]:
         if self.status in [Status.PAUSED, Status.RUNNING] and self.mission_id == mission_id:
             raise AttributeError("Can't delete the running mission!")
+        try:
+            start = int(self.settings['listStartIndex'] or 1)
+        except (KeyError, TypeError, ValueError):
+            start = 1
         if self.status in [Status.STOPPED, Status.PAUSED, Status.RUNNING]:
             data = await self.send_to_dcs_sync({"command": "deleteMission", "id": mission_id})
             self.settings['missionList'] = [os.path.normpath(x) for x in data['missionList']]
@@ -1434,6 +1627,23 @@ class ServerImpl(Server):
             missions = self.settings['missionList']
             missions.pop(mission_id - 1)
             self.settings['missionList'] = missions
+        # THE POINTER MUST KEEP NAMING A MISSION. Every entry after the removed slot shifts down by one,
+        # so a start index BEYOND that slot still names its own mission once decremented; the removed
+        # slot itself is taken by the mission that followed it; a list that shrank under the pointer is
+        # clamped to its new length, and an empty list has no start mission at all (0).
+        count = len(self.settings['missionList'])
+        if not count:
+            new_start = 0
+        else:
+            new_start = start - 1 if mission_id < start else start
+            new_start = max(1, min(new_start, count))
+        if new_start != start:
+            if new_start and self.status in [Status.STOPPED, Status.PAUSED, Status.RUNNING]:
+                # the process owns the index in those states: move it there too, so its own copy of
+                # the list does not put the old slot back
+                await self.setStartIndex(new_start)
+            else:
+                self.settings['listStartIndex'] = new_start
         return self.settings['missionList']
 
     @override
@@ -1518,7 +1728,10 @@ class ServerImpl(Server):
 
     @override
     async def loadMission(self, mission: int | str, modify_mission: bool | None = True,
-                          use_orig: bool | None = True, no_reload: bool | None = False) -> bool | None:
+                          use_orig: bool | None = True, no_reload: bool | None = False, *,
+                          preset: dict | list | str | None = None,
+                          preset_name: str | list[str] | None = None,
+                          announce: bool = False) -> bool | None:
 
         mission_list = await self.getMissionList()
         start_index = int(self.settings.get('listStartIndex', 1))
@@ -1538,13 +1751,21 @@ class ServerImpl(Server):
             return None
 
         if modify_mission:
-            filename = await self.apply_mission_changes(mission, use_orig=use_orig)
-        elif use_orig:
-            filename = utils.create_writable_mission(mission)
-            orig_mission = utils.get_orig_file(mission)
-            shutil.copy2(orig_mission, filename)
+            filename = await self.apply_mission_changes(mission, use_orig=use_orig, preset=preset,
+                                                        preset_name=preset_name,
+                                                        announce=announce)
         else:
-            filename = mission
+            # The extensions do not run here, so this load applies no preset itself. The record follows
+            # the value the caller states: a launch that already applied the weather passes its preset
+            # names (or the document AND the name it came from), and a load that states none clears the
+            # record.
+            await _record_launched_preset(self, preset, bool(preset), preset_name)
+            if use_orig:
+                filename = utils.create_writable_mission(mission)
+                orig_mission = utils.get_orig_file(mission)
+                shutil.copy2(orig_mission, filename)
+            else:
+                filename = mission
 
         if mission == current_mission and filename != mission:
             mission_list = await self.replaceMission(current_index, filename)
@@ -1714,21 +1935,31 @@ class ServerImpl(Server):
     @override
     async def enable_extension(self, name: str, config: dict | None = None) -> bool:
         ext = self.extensions.get(name)
+        old_config = None
         if not ext:
             ext = self.load_extension(name, config)
             self.extensions[name] = ext
-        if ext and await ext.enable():
+        elif config:
+            # a loaded extension is enabled with the config it was given (e.g. a key from /extension enable)
+            old_config = ext.config
+            ext.config = ext.config | config.get('Node', {}) | config.get('Instance', {})
+        enabled = False
+        try:
+            enabled = bool(ext) and await ext.enable()
+        finally:
+            if not enabled and old_config is not None:
+                ext.config = old_config
+        if enabled:
             await self.config_extension(name, utils.deep_merge(config or {}, {"Instance": {"enabled": True}}))
-            return True
-        return False
+        return enabled
 
     @override
     async def disable_extension(self, name: str) -> bool:
         if name not in self.extensions:
             raise InstallException(f"Extension '{name}' not found")
         ext = self.extensions[name]
-        await self.config_extension(name, {"Instance": {"enabled": False}})
         if await ext.disable():
+            await self.config_extension(name, {"Instance": {"enabled": False}})
             self.extensions.pop(name, None)
             return True
         return False
@@ -1741,7 +1972,12 @@ class ServerImpl(Server):
     @override
     async def getAllMissionFiles(self) -> list[tuple[str, str]]:
         result = []
-        base_dir, all_missions = await self.node.list_directory(self.instance.missions_dir, pattern="*.miz",
+        # A PERSISTENT MISSION IS A ``.sav`` FILE: ``/mission persistence`` renames it and points
+        # ``missionList`` at it, so both kinds are missions here — the same pair every other listing
+        # in the bot asks for. Listing only ``*.miz`` left a configured ``.sav`` unresolved, which the
+        # tab read as ``missing`` and the download refused as "not found".
+        base_dir, all_missions = await self.node.list_directory(self.instance.missions_dir,
+                                                                pattern=["*.miz", "*.sav"],
                                                                 ignore=['.dcssb', 'Scripts', 'Saves'], traverse=True)
         for mission in all_missions:
             orig = utils.get_orig_file(mission, create_file=False)
@@ -1783,3 +2019,68 @@ class ServerImpl(Server):
     @override
     async def get_config(self) -> dict:
         return self.read_locals()
+
+
+async def _record_launched_preset(server, preset: dict | list | str | None, applied: bool,
+                                  preset_name: str | list[str] | None = None) -> None:
+    """Write what this load was launched with to the server's ``servers`` row.
+
+    The row is the ONE home of the fact: ``launched_preset`` is the preset NAME and
+    ``launched_preset_temporary`` marks a preset built on the spot (which has no name). A load that
+    applied nothing — no preset asked for, or a NAME the server does not carry — CLEARS both, so the
+    record always describes the mission that is running now and never the previous one. The fact
+    belongs to the NAMED server (``servers`` is keyed by ``server_name`` alone), NOT to the instance
+    slot, which can be rebound from one server to the next; the row itself is created by the node when
+    the server registers (``ServerImpl.__init__``). A server with no pool (a test double, an early boot)
+    records nothing rather than raising.
+
+    ``preset_name`` names a preset whose VALUE is a DOCUMENT — a preset read out of a preset file,
+    which carries the change itself and no name in it. When it is stated and the preset was really
+    applied, the record takes that name and is not temporary. A LIST states every name the launch
+    applied and is joined in the launch's own order, each name VERBATIM (a preset name is operator
+    data looked up exactly, so a name whose file spells `` Snow `` is recorded as `` Snow ``).
+    ``None`` (every other caller) derives the record from ``preset`` alone, exactly as before.
+    """
+    pool = getattr(server, "apool", None)
+    server_name = getattr(server, "name", None)
+    if pool is None or not server_name:
+        return
+    name: str | None = None
+    temporary = False
+    if applied:
+        if preset_name is not None:
+            if isinstance(preset_name, (list, tuple)):
+                name = ", ".join(str(entry) for entry in preset_name if entry is not None) or None
+            else:
+                name = preset_name
+        elif isinstance(preset, str):
+            name = preset
+        elif isinstance(preset, list):
+            names = [entry for entry in preset if isinstance(entry, str)]
+            name = ", ".join(names) if names else None
+            temporary = not names
+        else:
+            temporary = True
+    async with pool.connection() as conn:
+        await conn.execute("""
+            UPDATE servers SET launched_preset = %s, launched_preset_temporary = %s
+            WHERE server_name = %s
+        """, (name, temporary, server_name))
+
+
+async def _announce_launched_preset(server, preset: dict | list | str | None) -> None:
+    """Tell the players on the server that its weather was changed for this mission.
+
+    Only the NODE can honestly announce: only it knows a preset was really applied, so a launch that
+    asked for a name the instance does not carry never reaches here. The message is the node's own
+    English sentence — it is delivered to DCS, not to a localised console — and a failed announcement
+    is logged, never raised: the mission must load whether or not the popup could be delivered.
+    """
+    if isinstance(preset, str) and preset:
+        message = f"New weather is in effect for this mission (preset '{preset}')."
+    else:
+        message = "New weather is in effect for this mission."
+    try:
+        await server.sendPopupMessage(Coalition.ALL, message)
+    except Exception:
+        server.log.exception("Could not announce the weather change on server \"%s\".", server.name)

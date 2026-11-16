@@ -8,13 +8,15 @@ Why the registrar owns the include
 ------------------------------------------------------------------
 On the pinned FastAPI/Starlette (0.141.1 / 1.6.0) ``app.include_router(r)`` appends **one**
 ``_IncludedRouter`` wrapper object to ``app.routes``; the router's own ``APIRoute``s stay inside
-it. The removal idiom used elsewhere in the tree
-(``for route in r.routes: if route in app.routes: app.routes.remove(route)``,
-``plugins/restapi/commands.py``) therefore removes **nothing** on this version — the previous
-handler keeps answering after a "reload", including its own auth decisions, and nothing warns.
-An older FastAPI pair behaves the other way round. So the registrar snapshots ``app.routes``
-before its own include and diffs by identity afterwards, and unregistration removes exactly the
-objects it added. It does not depend on either version's incidental behaviour.
+it. Other FastAPI versions append one copied ``APIRoute`` per route instead — either way the
+objects are NOT the router's own routes, so an idiom that matches ``router.routes`` against
+``app.routes`` removes **nothing**: the previous handler keeps answering after a "reload",
+including its own auth decisions, and nothing warns. The removal is therefore
+:func:`include_router_counted` / :func:`exclude_router` — a snapshot of ``app.routes`` before the
+include, a diff by identity afterwards, and a removal by identity — and every component that
+installs a router on the app (the registrar, ``plugins/restapi``, any later contributor) uses that
+pair instead of its own guess at what the include appended. It does not depend on any version's
+incidental behaviour.
 
 Deny by default at registration time
 ------------------------------------
@@ -44,34 +46,91 @@ with it at all. The low-priority mechanism stays the guarantee for ANY future sh
 also why the gate resolves a capability by **route identity** (:meth:`Registrar.owns_route`) and
 never by path: two components' routes can share a path, and only ownership can tell them apart (see
 :func:`services.webservice.permissions.capability_gate`).
+
+The console's mount is a registration-time fact
+-----------------------------------------------
+A page declares its path from its own root (``/fleet``, ``/``, ``/actions/server/start``);
+:meth:`Registrar.register_pages` serves, claims and advertises the whole registration under one base
+prefix (see :mod:`services.webservice.mount`). ``""`` is the console-at-root mode. Nothing below
+this seam names a mount, and the installation's fixed surface (``/auth/*``, ``/language``,
+``/i18n/messages.js``, ``/theme``, ``/static``) is registered with an empty prefix so its addresses
+do not move with the console.
 """
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Iterable, TYPE_CHECKING
+from typing import Any, Callable, Iterable, Sequence, TYPE_CHECKING
 
 from fastapi import APIRouter, FastAPI
+from starlette.routing import compile_path
 
-from . import permissions
+from . import mount, permissions
 
 if TYPE_CHECKING:  # pragma: no cover
     from jinja2 import Environment
 
-__all__ = ["NavItem", "Registration", "RegistrationError", "Registrar",
-           "RESERVED_PATHS", "RESERVED_PREFIXES"]
+__all__ = ["NavItem", "NavGroup", "NAV_GROUPS", "NAV_GROUPS_BY_NAME", "Registration",
+           "RegistrationError", "Registrar", "RESERVED_PATHS", "RESERVED_PREFIXES", "SHELL_OWNERS",
+           "exclude_router", "include_router_counted"]
 
 log = logging.getLogger(__name__)
 
+
+# --------------------------------------------------------------------------- router installation
+
+def include_router_counted(app: FastAPI, router: APIRouter, *, prefix: str = "") -> list[Any]:
+    """``app.include_router(router, prefix=prefix)``, returning exactly the route object(s) THIS
+    include appended.
+
+    The include never appends the router's own routes: on the pinned pair it appends one
+    ``_IncludedRouter`` wrapper, on other versions one copied ``APIRoute`` per route. The returned
+    list is what :func:`exclude_router` must be given later — the router's own ``routes`` are not.
+
+    *prefix* is the include-time path prefix: every path the router declares is served under it,
+    which is how the console's whole page tree is mounted at one address without any page module
+    naming that address.
+    """
+    before = list(app.routes)
+    app.include_router(router, prefix=prefix)
+    return [route for route in app.routes if not any(route is other for other in before)]
+
+
+def exclude_router(app: FastAPI, added: Sequence[Any]) -> int:
+    """Remove exactly the objects *added* from the app's route table, by identity.
+
+    Returns how many were removed. Identity and not equality: ``_IncludedRouter`` is a dataclass, so
+    ``list.remove`` can delete another owner's wrapper that compares equal.
+    """
+    routes = app.router.routes
+    removed = 0
+    for route in added:
+        for index, existing in enumerate(routes):
+            if existing is route:
+                del routes[index]
+                removed += 1
+                break
+    return removed
+
+
 #: Paths the shell owns. A contributor registering one of these is refused: with the pinned
 #: FastAPI a second registration on the same path wins silently, so a collision must be loud at
-#: registration time (it cannot be detected later).
-RESERVED_PATHS: tuple[str, ...] = ("/", "/login", "/logout", "/static")
+#: registration time (it cannot be detected later). ``/console`` is the console's mount under a
+#: public site, reserved in BOTH modes so a site slug or a plugin can never squat the address the
+#: console moves to.
+RESERVED_PATHS: tuple[str, ...] = ("/", "/login", "/logout", "/console", "/static")
 
 #: Prefixes the shell owns (an ``/auth/*`` route belongs to the login flow, not to a plugin; the
 #: whole ``/static`` area is the shell's asset surface).
 RESERVED_PREFIXES: tuple[str, ...] = ("/auth/", "/static/")
+
+#: The owner names the shell registers under. They — and only they — may claim the reserved surface
+#: (``/auth/*``, ``/static``, the site root and the console's own mount). ``site`` is the public
+#: site's page tree (``services/webservice/site_pages.py``): it is shipped by the shell, it owns the
+#: site root beside the console's mount, and the slugs it is served under are validated against this
+#: module's reserved surface at startup.
+SHELL_OWNERS: tuple[str, ...] = ("shell", "installation", "site")
 
 
 class RegistrationError(RuntimeError):
@@ -79,13 +138,71 @@ class RegistrationError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class NavGroup:
+    """One heading of the sidebar: its name alone.
+
+    ``name`` is the ENGLISH msgid — the group names are chrome, so every catalog owns their words
+    (``base.html`` translates it at render). A heading draws nothing: it is a bare label printed on
+    the rail's gutter (``shell.css``, ``.nav .grp``), and the entries under it wear the sprite.
+    """
+    name: str
+
+
+#: THE GROUP ORDER — one constant, because the order and the set are a decision of the console's own
+#: chrome rather than of any page. A page names one of these on its own nav item; :class:`NavItem`
+#: refuses a name that is not here, so an unknown group cannot silently create a sixth heading, and
+#: ``pages/dashboard.nav_groups`` renders the headings in exactly this order (and drops the ones left
+#: with nothing visible under them).
+NAV_GROUPS: tuple[NavGroup, ...] = (
+    NavGroup(name="Operations"),
+    NavGroup(name="Media"),
+    NavGroup(name="Cluster"),
+    NavGroup(name="Data"),
+    NavGroup(name="Administration"),
+)
+
+#: group name -> its declaration, for the one lookup a refusal and a grouping need
+NAV_GROUPS_BY_NAME: dict[str, NavGroup] = {group.name: group for group in NAV_GROUPS}
+
+
+@dataclass(frozen=True)
 class NavItem:
     """One navigation entry. ``capability`` is the capability a viewer needs to be offered it —
     the nav is rendered from the same declaration the route is gated by, so a page can never
-    advertise a door that answers 403."""
+    advertise a door that answers 403.
+
+    ``group`` and ``glyph`` are declared HERE, by the page that owns the entry, and never looked up
+    in a table the shell keeps: one declaration per page cannot drift from the pages it describes.
+
+    * ``group`` must be one of :data:`NAV_GROUPS` — checked at construction, which is the first
+      moment a page names a group, so a wrong name fails at import instead of rendering a heading
+      nobody declared;
+    * ``glyph`` is a name in the nav sprite. An UNKNOWN name is not refused (a page added before its
+      drawing exists still renders — it draws nothing), but an EMPTY one is: an entry that can never
+      draw anything is a declaration mistake, not a missing drawing.
+
+    ``available`` is an optional test of whether the product behind the entry exists in THIS process
+    (its service/plugin is active), as opposed to ``capability``, which is a right. ``None`` means
+    always available, so every entry that does not declare it is unchanged. It is evaluated PER
+    REQUEST by the sidebar, never at registration: routes and capabilities are registered once at
+    boot, while the state a test reads is only reliable later.
+    """
     label: str
     url: str
     capability: str
+    group: str
+    glyph: str
+    available: Callable[[], bool] | None = None
+
+    def __post_init__(self) -> None:
+        if self.group not in NAV_GROUPS_BY_NAME:
+            raise ValueError(
+                f"nav item '{self.label}' ({self.url}) names the group '{self.group}', which the "
+                f"console does not have (declared: {', '.join(NAV_GROUPS_BY_NAME)})")
+        if not str(self.glyph or "").strip():
+            raise ValueError(
+                f"nav item '{self.label}' ({self.url}) declares no glyph; every entry names a "
+                f"drawing of the nav sprite")
 
 
 @dataclass
@@ -96,6 +213,8 @@ class Registration:
     nav: tuple[NavItem, ...] = ()
     capabilities: dict[str, str] = field(default_factory=dict)
     templates: Path | None = None
+    #: the base prefix this owner's routes were mounted under (``""`` when it keeps the root)
+    prefix: str = ""
     #: route objects appended to ``app.routes`` by this owner's include (the wrapper)
     included: list[Any] = field(default_factory=list)
     #: the owner's own ``APIRoute`` objects. The console registers them as LOW-PRIORITY routes
@@ -119,11 +238,135 @@ def _matches_prefix(prefix: str, path: str) -> bool:
     return path == prefix or path.startswith(prefix + "/")
 
 
-class Registrar:
-    """Bookkeeping for everything the admin web UI serves."""
+def _route_answers(route, path: str) -> bool:
+    """Whether *route* answers *path* — by its compiled pattern, or its literal path when it has none."""
+    matcher = getattr(route, "path_regex", None)
+    if matcher is not None:
+        return bool(matcher.match(path))
+    return getattr(route, "path", None) == path
 
-    def __init__(self, app: FastAPI):
+
+def _declares_slash(route) -> bool:
+    """Whether *route*'s OWN path ends with a slash — an address that lives at ``/x/``."""
+    return str(getattr(route, "path", "") or "").endswith("/")
+
+
+def _join(base: str, path: str) -> str:
+    """*path* under *base*: the root page is served at the mount itself, not at the mount plus a slash."""
+    if not base:
+        return path
+    if path == "/":
+        return base
+    return base + path
+
+
+def _set_route_path(route, path: str) -> None:
+    """Set one route's address and rebuild the compiled matcher it answers by."""
+    route.path = path
+    if hasattr(route, "path_format"):
+        route.path_format = path
+    if hasattr(route, "path_regex"):
+        route.path_regex, _format, route.param_convertors = compile_path(path)
+
+
+def _mount_route(route, base: str) -> None:
+    """Serve one route under *base*, in place.
+
+    The route keeps its place in its router and in the router's low-priority list; only the path it
+    matches moves. The compiled matcher is rebuilt from the new path, so the route answers at its
+    mounted address and nowhere else. The installation's fixed surface (``mount.is_fixed``) keeps
+    its address: the door and the display switches are not part of the console's page tree.
+    """
+    path = getattr(route, "path", None)
+    if not base or not isinstance(path, str) or not path.startswith("/") or mount.is_fixed(path):
+        return
+    _set_route_path(route, _join(base, path))
+
+
+def _unmount_route(route, base: str) -> None:
+    """Move one mounted route back to its base-relative address, in place.
+
+    The inverse of :func:`_mount_route`: a fixed path and a path outside *base* keep their address.
+    """
+    path = getattr(route, "path", None)
+    if not base or not isinstance(path, str) or not path.startswith("/") or mount.is_fixed(path):
+        return
+    if path == base:
+        _set_route_path(route, "/")
+    elif path.startswith(base + "/"):
+        _set_route_path(route, path[len(base):])
+
+
+def _unmounted_nav(item: NavItem, base: str) -> NavItem:
+    """*item* with *base* removed from its URL (the inverse of :func:`_mounted_nav`)."""
+    if not base or not str(item.url or "").startswith("/"):
+        return item
+    if item.url == base:
+        return replace(item, url="/")
+    if item.url.startswith(base + "/"):
+        return replace(item, url=item.url[len(base):])
+    return item
+
+
+def _mark_routes(router) -> None:
+    """Invalidate a router's cached effective route lists after its routes moved in place."""
+    mark = getattr(router, "_mark_routes_changed", None)
+    if callable(mark):
+        mark()
+
+
+def _staged_include(router: APIRouter, app: FastAPI) -> Any:
+    """Build the include wrapper for *router* WITHOUT touching the application's route table.
+
+    ``include_router`` appends its wrapper to the router it is called on. Calling it on a staging
+    router with the application's own include attributes produces the same wrapper — same prefix,
+    dependencies, response class and override provider — while the live table stays untouched. The
+    wrapper is what a swap installs, so a failed build leaves the previous table serving.
+    """
+    parent = app.router
+    # typed loosely: ``include_router_counted`` declares a FastAPI but only needs ``.routes`` and
+    # ``.include_router``, which an APIRouter also has
+    staging: Any = APIRouter(
+        prefix=parent.prefix,
+        tags=parent.tags,
+        dependencies=parent.dependencies,
+        default_response_class=parent.default_response_class,
+        responses=parent.responses,
+        callbacks=parent.callbacks,
+        deprecated=parent.deprecated,
+        include_in_schema=parent.include_in_schema,
+        generate_unique_id_function=parent.generate_unique_id_function,
+        strict_content_type=parent.strict_content_type,
+        dependency_overrides_provider=app,
+    )
+    added = include_router_counted(staging, router)
+    return added[0] if added else None
+
+
+def _mounted_nav(item: NavItem, base: str) -> NavItem:
+    """*item* with its URL moved under *base* (an empty base returns the item unchanged).
+
+    The site root is the console's own root once a prefix exists: ``/`` becomes ``<base>`` and not
+    ``<base>/``, so the entry names the mounted page exactly.
+    """
+    if not base or not str(item.url or "").startswith("/"):
+        return item
+    return replace(item, url=_join(base, item.url))
+
+
+class Registrar:
+    """Bookkeeping for everything the admin web UI serves.
+
+    *console_prefix* is the base prefix the console's own pages are mounted under (``""`` at the
+    site root, ``"/console"`` while a public site owns ``/``). It is passed at construction, from
+    the configuration, and applied in :meth:`register_pages` only — the single place a path, its
+    capability and its nav entry are claimed, so a page module keeps declaring its own path and
+    never names a mount.
+    """
+
+    def __init__(self, app: FastAPI, *, console_prefix: str = ""):
         self.app = app
+        self.console_prefix = console_prefix or ""
         self.environment: "Environment | None" = None
         self._registrations: dict[str, Registration] = {}
         # path (exact) or prefix (without the trailing '*') -> (owner, capability)
@@ -137,6 +380,8 @@ class Registrar:
         #: ask "is this route one of ours" — a path cannot answer that (two components' routes can
         #: share a path; see :func:`services.webservice.permissions.capability_gate`).
         self._owned_route_ids: set[int] = set()
+        #: route id -> the base prefix its owner was mounted under (diagnostics and lookups only)
+        self._route_bases: dict[int, str] = {}
 
     # ---------------------------------------------------------------------------------- assets
 
@@ -154,7 +399,8 @@ class Registrar:
             raise RegistrationError(f"asset path '{path}' must be a concrete path, not a prefix")
         # the asset path is claimed as a PREFIX: everything under it is served from this directory,
         # so an asset request (for which there is no route object) resolves through the prefix
-        self._claim(_normalise_prefix(path) + "*", capability, owner, reserved_ok=(owner == "shell"))
+        self._claim(_normalise_prefix(path) + "*", capability, owner,
+                    reserved_ok=(owner in SHELL_OWNERS))
         if self._asset_owner is not None and self._asset_owner != owner:
             raise RegistrationError(f"asset path '{path}' is already owned by "
                                     f"'{self._asset_owner}'; the shell is the only asset owner")
@@ -173,7 +419,8 @@ class Registrar:
 
     def register_pages(self, owner: str, router: APIRouter, nav: Iterable[NavItem] | None = None,
                        capabilities: dict[str, str] | None = None,
-                       templates: Path | str | None = None) -> Registration:
+                       templates: Path | str | None = None,
+                       prefix: str | None = None) -> Registration:
         """Register a contributor's pages (a router with its routes).
 
         ``capabilities`` maps each route path (full path, prefix included; a key ending in ``*``
@@ -181,14 +428,22 @@ class Registrar:
         capability declaration and against the paths other owners already hold — a collision or a
         missing capability raises :class:`RegistrationError` instead of producing a route that
         silently wins or ships public.
+
+        *prefix* is the base prefix the routes are served under; ``None`` means the console's own
+        (``self.console_prefix``) and ``""`` means the installation's fixed surface, which is never
+        moved. The prefix is applied HERE, to the whole registration at once: every route's path,
+        its capability declaration and every nav URL are moved under it, so a page declares
+        ``/fleet`` and is served, gated and advertised at ``<prefix>/fleet`` without knowing that a
+        prefix exists.
         """
+        base = (self.console_prefix if prefix is None else prefix) or ""
         owner = (owner or "").strip()
         if not owner:
             raise RegistrationError("a registration needs a non-empty owner name")
         if owner in self._registrations:
             raise RegistrationError(f"owner '{owner}' is already registered; unregister it first "
-                                    f"(registering twice would leave two sets of routes live)")
-        nav_items = tuple(nav or ())
+                                    f"(registering twice would leave two sets of live routes)")
+        nav_items = tuple(_mounted_nav(item, base) for item in (nav or ()))
         for item in nav_items:
             if permissions.roles_for_capability(item.capability) is None:
                 raise RegistrationError(
@@ -199,7 +454,8 @@ class Registrar:
             if permissions.roles_for_capability(capability) is None:
                 raise RegistrationError(
                     f"owner '{owner}' declares unknown capability '{capability}' for '{path}'")
-            self._claim(path, capability, owner, reserved_ok=(owner == "shell"))
+            claimed = path if mount.is_fixed(path) else _join(base, path)
+            self._claim(claimed, capability, owner, reserved_ok=(owner in SHELL_OWNERS))
 
         template_dir: Path | None = None
         if templates is not None:
@@ -208,8 +464,11 @@ class Registrar:
                 raise RegistrationError(
                     f"owner '{owner}' registered templates that do not exist: {template_dir}")
 
-        before = list(self.app.routes)
         routes = list(getattr(router, "routes", []) or [])
+        # the whole page tree moves under the registration's base, in place: the routes keep their
+        # identity (which the gate resolves capabilities by) and only the address they match changes
+        for route in routes:
+            _mount_route(route, base)
         # THE CONSOLE REGISTERS ITS OWN PAGES AS LOW-PRIORITY ROUTES. A route another component
         # registered on the SAME path therefore WINS it, so the console can never shadow a peer's
         # route — the old endpoints keep answering exactly as they did before the console existed.
@@ -237,16 +496,17 @@ class Registrar:
         else:
             setattr(router, "_low_priority_routes", list(low_priority) + routes)
             router.routes = []
-        self.app.include_router(router)
-        # exactly the object(s) OUR include appended — see the module docstring for why this is
-        # a snapshot/diff and not `for route in router.routes: app.routes.remove(route)`
-        included = [route for route in self.app.routes if not any(route is b for b in before)]
+        # exactly the object(s) OUR include appended: the include appends its OWN objects, never
+        # the router's routes, so only a snapshot/diff can name what to remove later
+        included = include_router_counted(self.app, router)
 
         registration = Registration(owner=owner, router=router, nav=nav_items,
                                     capabilities=declared, templates=template_dir,
-                                    included=included, routes=routes)
+                                    included=included, routes=routes, prefix=base)
         self._registrations[owner] = registration
         self._owned_route_ids.update(id(route) for route in routes)
+        for route in routes:
+            self._route_bases[id(route)] = base
         if template_dir is not None:
             self._template_dirs[owner] = template_dir
         log.info("Registrar: '%s' registered %d route(s), %d capability declaration(s)%s.",
@@ -260,18 +520,10 @@ class Registrar:
         registration = self._registrations.pop(owner, None)
         if registration is None:
             return False
-        removed = 0
-        for route in registration.included:
-            # remove BY IDENTITY: ``_IncludedRouter`` is a dataclass, so ``list.remove`` matches by
-            # EQUALITY and can delete a different owner's wrapper that compares equal. The point of
-            # the snapshot/diff in ``register_pages`` is identity, so the removal is identity too.
-            for index, existing in enumerate(self.app.router.routes):
-                if existing is route:
-                    del self.app.router.routes[index]
-                    removed += 1
-                    break
+        removed = exclude_router(self.app, registration.included)
         for route in registration.routes:
             self._owned_route_ids.discard(id(route))
+            self._route_bases.pop(id(route), None)
         for path in list(self._capabilities):
             if self._capabilities[path][0] == owner:
                 del self._capabilities[path]
@@ -283,6 +535,186 @@ class Registrar:
         log.info("Registrar: '%s' unregistered (%d route object(s) removed, %d route(s) no longer "
                  "answering).", owner, removed, len(registration.routes))
         return True
+
+    def _claimed_by(self, claimed: str):
+        """The ``(owner, capability)`` holding *claimed*, or ``None``."""
+        if _is_prefix(claimed):
+            return self._prefixes.get(_normalise_prefix(claimed))
+        return self._capabilities.get(claimed)
+
+    def _check_claim(self, claimed: str, owner: str, *, reserved_ok: bool) -> None:
+        """Refuse a claim that another owner already holds, or a reserved path, BEFORE mutating."""
+        existing = self._claimed_by(claimed)
+        if existing is not None and existing[0] != owner:
+            raise RegistrationError(f"'{claimed}' is already claimed by '{existing[0]}', not by "
+                                    f"'{owner}'")
+        if not reserved_ok and (claimed in RESERVED_PATHS
+                               or any(claimed.startswith(p) for p in RESERVED_PREFIXES)):
+            raise RegistrationError(f"'{claimed}' is reserved by the shell")
+
+    def _release_registration(self, registration: Registration) -> None:
+        """Drop ONE registration's own capability declarations; leave its asset prefixes alone."""
+        for path in registration.capabilities:
+            claimed = path if mount.is_fixed(path) else _join(registration.prefix, path)
+            if _is_prefix(claimed):
+                key = _normalise_prefix(claimed)
+                if self._prefixes.get(key, (None,))[0] == registration.owner:
+                    del self._prefixes[key]
+            elif self._capabilities.get(claimed, (None,))[0] == registration.owner:
+                del self._capabilities[claimed]
+
+    def replace_owner(self, owner: str, router: APIRouter | None,
+                      capabilities: dict[str, str] | None = None,
+                      nav: Iterable[NavItem] | None = None,
+                      prefix: str | None = None,
+                      templates: Path | str | None = None) -> Registration | None:
+        """Build a replacement registration for *owner* and swap it in with ONE assignment.
+
+        The new router's routes are mounted and its include wrapper is built BEFORE anything live is
+        touched; the application's route table is then replaced in a single assignment. A failure
+        while building leaves the previous registration serving. ``router=None`` removes the owner's
+        table without registering a new one (an empty site catalog).
+
+        The old registration's capability declarations are released and the new ones claimed in the
+        same step, so a path the new table does not serve cannot keep a stale declaration and a path
+        it does serve is declared before the table answers.
+        """
+        owner = (owner or "").strip()
+        if not owner:
+            raise RegistrationError("a registration needs a non-empty owner name")
+        base = (self.console_prefix if prefix is None else prefix) or ""
+        declared = dict(capabilities or {})
+        for path, capability in declared.items():
+            if permissions.roles_for_capability(capability) is None:
+                raise RegistrationError(
+                    f"owner '{owner}' declares unknown capability '{capability}' for '{path}'")
+            claimed = path if mount.is_fixed(path) else _join(base, path)
+            self._check_claim(claimed, owner, reserved_ok=(owner in SHELL_OWNERS))
+        nav_items = tuple(_mounted_nav(item, base) for item in (nav or ()))
+        for item in nav_items:
+            if permissions.roles_for_capability(item.capability) is None:
+                raise RegistrationError(
+                    f"owner '{owner}' declares nav item '{item.label}' with unknown capability "
+                    f"'{item.capability}'")
+        template_dir = Path(templates) if templates is not None else None
+        if template_dir is not None and not template_dir.is_dir():
+            raise RegistrationError(
+                f"owner '{owner}' registered templates that do not exist: {template_dir}")
+
+        routes: list[Any] = []
+        wrapper = None
+        if router is not None:
+            routes = list(getattr(router, "routes", []) or [])
+            for route in routes:
+                _mount_route(route, base)
+            low_priority = getattr(router, "_low_priority_routes", None)
+            if low_priority is None:
+                log.warning("Registrar: '%s' replacement registered %d page route(s) as NORMAL "
+                            "routes - this FastAPI does not expose low-priority routes.", owner,
+                            len(routes))
+            else:
+                setattr(router, "_low_priority_routes", list(low_priority) + routes)
+                router.routes = []
+            _mark_routes(router)
+            wrapper = _staged_include(router, self.app)
+
+        old = self._registrations.get(owner)
+        if old is None and router is None:
+            # nothing to remove and nothing to install: an apply that leaves this owner absent
+            return None
+        live = list(self.app.router.routes)
+        old_included = tuple(old.included) if old is not None else ()
+        table = [route for route in live
+                 if not any(route is included for included in old_included)]
+        if wrapper is not None:
+            table.append(wrapper)
+
+        if old is not None:
+            self._release_registration(old)
+            for route in old.routes:
+                self._owned_route_ids.discard(id(route))
+                self._route_bases.pop(id(route), None)
+            self._template_dirs.pop(owner, None)
+            if router is None:
+                # ``router=None`` retires the owner's table without replacing it: nothing of the
+                # owner stays reachable and a later registration starts from a clean slate.
+                del self._registrations[owner]
+                self.app.router.routes = table
+                self.clear_template_cache()
+                log.info("Registrar: '%s' removed (0 route(s) registered in its place).", owner)
+                return None
+        for path, capability in declared.items():
+            claimed = path if mount.is_fixed(path) else _join(base, path)
+            self._claim(claimed, capability, owner, reserved_ok=(owner in SHELL_OWNERS))
+
+        if router is None:  # unreachable: the two branches above retired the only such case
+            return None
+        registration = Registration(owner=owner, router=router, nav=nav_items,
+                                    capabilities=declared, templates=template_dir,
+                                    prefix=base,
+                                    included=[wrapper] if wrapper is not None else [],
+                                    routes=routes)
+        self._registrations[owner] = registration
+        self._owned_route_ids.update(id(route) for route in routes)
+        for route in routes:
+            self._route_bases[id(route)] = base
+        if template_dir is not None:
+            self._template_dirs[owner] = template_dir
+        # THE SWAP IS ONE ASSIGNMENT: a request already walking the old list finishes on it, and a
+        # request that starts afterwards sees the complete new table — never a half-built one.
+        self.app.router.routes = table
+        _mark_routes(self.app.router)
+        self.clear_template_cache()
+        log.info("Registrar: '%s' replaced (%d route(s), %d capability declaration(s)).",
+                 owner, len(routes), len(declared))
+        return registration
+
+    def move_console(self, new_prefix: str) -> str:
+        """Move every console registration from the current mount to *new_prefix*.
+
+        The console's page tree is registered at one base; when an enabled root site appears or
+        disappears that base changes. The routes are moved IN PLACE (their own path and compiled
+        matcher), the capability declarations are re-keyed under the new base and the nav URLs are
+        re-mounted. The site's own registration is never moved: its routes keep their site prefixes.
+        Fixed installation paths (``mount.is_fixed``) never move.
+
+        Every new claim is checked before the first mutation, so a refused claim leaves the table as
+        it was. Returns the new prefix.
+        """
+        old = self.console_prefix
+        new = new_prefix or ""
+        if new == old:
+            return old
+        moving: list[Registration] = []
+        for owner, registration in list(self._registrations.items()):
+            if owner in ("site", "installation") or registration.prefix != old:
+                continue
+            for path, capability in registration.capabilities.items():
+                claimed = path if mount.is_fixed(path) else _join(new, path)
+                self._check_claim(claimed, owner, reserved_ok=(owner in SHELL_OWNERS))
+            moving.append(registration)
+        for registration in moving:
+            # DECLARE BEFORE SERVING: the new paths are claimed before their routes are moved there,
+            # so a path that appears is never reachable undeclared. The old paths are released first,
+            # so the window is a DENY (nothing served) and never an unclaimed PUBLIC route.
+            self._release_registration(registration)
+            for path, capability in registration.capabilities.items():
+                claimed = path if mount.is_fixed(path) else _join(new, path)
+                self._claim(claimed, capability, registration.owner,
+                            reserved_ok=(registration.owner in SHELL_OWNERS))
+            for route in registration.routes:
+                _unmount_route(route, old)
+                _mount_route(route, new)
+            registration.nav = tuple(_mounted_nav(_unmounted_nav(item, old), new)
+                                     for item in registration.nav)
+            registration.prefix = new
+            for route in registration.routes:
+                self._route_bases[id(route)] = new
+            _mark_routes(registration.router)
+        self.console_prefix = new
+        log.info("Registrar: the console moved from '%s' to '%s' (%d registration(s)).",
+                 old or "/", new or "/", len(moving))
+        return new
 
     def clear_template_cache(self) -> None:
         """Drop Jinja's compiled-template cache.
@@ -317,6 +749,46 @@ class Registrar:
         table[key] = (owner, capability)
 
     # --------------------------------------------------------------------------------- lookup
+
+    def serves(self, path: str) -> bool:
+        """Whether a route this registrar registered matches *path* — pages AND dynamic paths.
+
+        Matched with each route's own compiled ``path_regex``, by the registration's stored route
+        objects (``self.routes``), which is the only enumeration that sees mounted page paths. A
+        static comparison against ``route.path`` would answer ``False`` for ``/player/<ucid>``.
+        """
+        text = str(path or "")
+        if not text.startswith("/"):
+            return False
+        for route in self.routes:
+            if _route_answers(route, text):
+                return True
+        return False
+
+    def slash_target(self, path: str) -> str | None:
+        """The unslashed address *path* should be redirected to, or ``None``.
+
+        ``None`` in three cases, each of them a rule rather than a defensive check:
+
+        * the path is not a trailing-slash form (the site root included — stripping its slash names
+          no path at all);
+        * the unslashed form is served by no route, so a redirect would invent an address;
+        * a route DECLARED at ``/x/`` — its own path ends with the slash — answers the slashed form,
+          so that form is an address of its own and is never redirected away from. A parameterised
+          route does not count: ``/fleet/{name:path}`` matches ``/fleet/`` with an empty name, which
+          is nobody's address, and ``/fleet`` is what a pasted link was aiming at.
+        """
+        text = str(path or "")
+        if len(text) < 2 or not text.endswith("/") or text == "//":
+            return None
+        unslashed = text[:-1]
+        if not unslashed.startswith("/") or not self.serves(unslashed):
+            return None
+        for route in self.routes:
+            if _declares_slash(route) and _route_answers(route, text) \
+                    and not _route_answers(route, unslashed):
+                return None
+        return unslashed
 
     def owns_route(self, route) -> bool:
         """Whether *route* is a route THIS registrar registered (a page or an asset).

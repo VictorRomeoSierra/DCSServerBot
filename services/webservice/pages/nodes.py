@@ -101,7 +101,7 @@ from urllib.parse import quote
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 
-from .. import i18n, permissions, readmodels
+from .. import i18n, mount, permissions, readmodels
 from ..readmodels import dcslog as dcs_log
 from . import dashboard as dashboard_page
 from . import lists as lists_page
@@ -128,7 +128,8 @@ NAV_LABEL = i18n._("Nodes")
 
 PAGE = lists_page.ListPage(table=NODES_TABLE, path=NODES_PATH, capability=NODES_CAPABILITY,
                            roles=NODES_ROLES, title=NODES_TITLE, lead=NODES_LEAD,
-                           nav_label=NAV_LABEL, scope_grants=True, writes=True)
+                           nav_label=NAV_LABEL, group="Cluster", glyph="hex",
+                           scope_grants=True, writes=True, live=True)
 
 #: THE NODE LOG DOWNLOAD's route — one literal TEMPLATE path (``{node}`` is one path segment, the
 #: node's own name). It is not the page path and not a page: it answers GET, it renders no chrome,
@@ -190,7 +191,7 @@ def log_download_path(node_name: str) -> str:
     decodes it again (``{node}`` is a path parameter), so the name the handler resolves is the name
     that was rendered.
     """
-    return f"/nodes/{quote(readmodels.text(node_name), safe='')}/log"
+    return mount.url(f"/nodes/{quote(readmodels.text(node_name), safe='')}/log")
 
 
 def log_download_control(node_name: str, roles, manager: bool = False) -> dict | None:
@@ -227,12 +228,12 @@ def log_view_path(node_name: str) -> str:
     another. Encoded exactly as :func:`log_download_path` encodes, and decoded again by the route's
     ``{node}`` parameter.
     """
-    return f"/nodes/{quote(readmodels.text(node_name), safe='')}/log/view"
+    return mount.url(f"/nodes/{quote(readmodels.text(node_name), safe='')}/log/view")
 
 
 def node_log_window_path(node_name: str) -> str:
     """The URL of *node_name*'s window endpoint — the follower's own request base (L-viewer)."""
-    return f"/nodes/{quote(readmodels.text(node_name), safe='')}/log/window"
+    return mount.url(f"/nodes/{quote(readmodels.text(node_name), safe='')}/log/window")
 
 
 def log_view_control(node_name: str, roles, manager: bool = False) -> dict | None:
@@ -257,11 +258,18 @@ def log_view_control(node_name: str, roles, manager: bool = False) -> dict | Non
 
 
 def capabilities() -> dict[str, str]:
-    """The capability declaration for the paths this module registers."""
+    """The capability declaration for the paths this module registers.
+
+    The two live paths carry the PAGE's own ``nodes.view``: "may open the page" and "may stream its
+    rows" are one declaration, so the stream cannot outlive a revocation of the page.
+    """
     PAGE.declare()
-    return {NODES_PATH: NODES_CAPABILITY, NODES_LOG_PATH: LOG_DOWNLOAD_CAPABILITY,
-            NODE_LOG_VIEW_PATH: LOG_DOWNLOAD_CAPABILITY,
-            NODE_LOG_WINDOW_PATH: LOG_DOWNLOAD_CAPABILITY}
+    declared = {NODES_PATH: NODES_CAPABILITY, NODES_LOG_PATH: LOG_DOWNLOAD_CAPABILITY,
+                NODE_LOG_VIEW_PATH: LOG_DOWNLOAD_CAPABILITY,
+                NODE_LOG_WINDOW_PATH: LOG_DOWNLOAD_CAPABILITY}
+    for path in lists_page.stream_paths(PAGE):
+        declared[path] = NODES_CAPABILITY
+    return declared
 
 
 def nav_items():

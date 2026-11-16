@@ -9,8 +9,8 @@ from core import Service, ServiceRegistry, NodeImpl, DEFAULT_TAG, Port, PortType
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.openapi.docs import get_swagger_ui_html, get_redoc_html
 from fastapi.openapi.utils import get_openapi
-from pathlib import Path
 from services.servicebus import ServiceBus
+from services.webservice.auth.discord_oauth import secure_client_secret
 from services.webservice.shell import create_app, frontend_enabled, install_shell
 from starlette.requests import Request
 from typing_extensions import override
@@ -18,16 +18,37 @@ from uvicorn import Config
 
 from core.utils.yaml_helper import new_yaml
 
+#: The listener and port the service uses when the config states neither, and the values a config
+#: auto-created for the REST API plugin is written with.
+DEFAULT_LISTEN = '0.0.0.0'
+DEFAULT_PORT = 9876
+
 
 @ServiceRegistry.register(master_only=True, depends_on=[ServiceBus])
 class WebService(Service):
 
+    def _secure_client_secret(self) -> bool:
+        """Move ``auth.discord.client_secret`` into the secret store; True when it was moved.
+
+        Returns whether the config changed, and the caller writes the file. ``frontend: false``
+        does not exempt it: that switch skips the LOGIN, not the secret sitting in plain text.
+        """
+        block = self.locals.get(DEFAULT_TAG) or {}
+        auth = block.get('auth') if isinstance(block, dict) else None
+        discord = auth.get('discord') if isinstance(auth, dict) else None
+        if not secure_client_secret(discord, config_dir=self.node.config_dir):
+            return False
+        self.log.info(f"  - {self.name}: Discord client secret found, removing it from yaml ...")
+        return True
+
     def __init__(self, node: NodeImpl):
         super().__init__(node)
+        if self._secure_client_secret():
+            self.save_config()
         cfg = self.get_config()
         if not cfg:
-            old_config = os.path.join(self.node.config_dir, 'plugins', 'restapi.yaml')
-            if os.path.exists(old_config):
+            legacy_config = os.path.join(self.node.config_dir, 'plugins', 'restapi.yaml')
+            if os.path.exists(legacy_config):
                 self.install()
                 self.locals = self.read_locals()
                 cfg = self.get_config()
@@ -37,14 +58,20 @@ class WebService(Service):
         self.ui = None
         #: the upgrade poll's task — created in ``start()``, cancelled in ``stop()``
         self.upgrade_task = None
+        #: the DCS update poll's task — created in ``start()``, cancelled in ``stop()``
+        self.dcs_task = None
+        #: the post-update checks the node's hook schedules, kept referenced until they finish
+        self.dcs_tasks: set[asyncio.Task] = set()
         #: the render warm-up's task — created in ``start()``, cancelled in ``stop()``
         self.warm_task = None
+        #: the ready-time scope audit's task — created in ``start()``, cancelled in ``stop()``
+        self.scope_task = None
         if cfg:
             self.app = self._create_app()
             self.config = Config(
                 app=self.app,
-                host=cfg.get('listen', '0.0.0.0'),
-                port=cfg.get('port', 9876),
+                host=cfg.get('listen', DEFAULT_LISTEN),
+                port=cfg.get('port', DEFAULT_PORT),
                 workers=1,
                 log_level=logging.WARNING,
                 log_config=None,
@@ -57,26 +84,19 @@ class WebService(Service):
             self.app = None
 
     def install(self):
-        old_config = os.path.join(self.node.config_dir, 'plugins', 'restapi.yaml')
-        new_config = os.path.join(self.node.config_dir, 'services', 'webservice.yaml')
-        if os.path.exists(old_config) and not os.path.exists(new_config):
-            old = new_yaml().load(Path(old_config).read_text(encoding='utf-8'))
-            new = old.copy()
-            if 'prefix' in old.get(DEFAULT_TAG, {}):
-                old[DEFAULT_TAG] = {
-                    'prefix': new[DEFAULT_TAG].pop('prefix')
-                }
-            else:
-                old = {}
+        """Create the service config a REST API installation needs, and nothing else.
 
-            if old:
-                with open(old_config, mode='w', encoding='utf-8') as old_out:
-                    new_yaml().dump(old, old_out)
-            else:
-                os.remove(old_config)
-            if new:
-                with open(new_config, mode='w', encoding='utf-8') as new_out:
-                    new_yaml().dump(new, new_out)
+        The file carries the two keys that start the HTTP server, at the values the service itself
+        falls back to. A REST API's own settings — ``auth``, ``security``, ``endpoints``,
+        ``prefix`` — are NOT part of this file: they belong to ``plugins/restapi.yaml``, which is
+        the file the plugin reads, and this schema refuses them.
+        """
+        new_config = os.path.join(self.node.config_dir, 'services', 'webservice.yaml')
+        if os.path.exists(new_config):
+            return
+        os.makedirs(os.path.dirname(new_config), exist_ok=True)
+        with open(new_config, mode='w', encoding='utf-8') as new_out:
+            new_yaml().dump({DEFAULT_TAG: {'listen': DEFAULT_LISTEN, 'port': DEFAULT_PORT}}, new_out)
 
     def _create_app(self) -> FastAPI:
         """Create the FastAPI app and install the admin web shell on it.
@@ -204,11 +224,29 @@ class WebService(Service):
         # factory reads too).
         if frontend_enabled(self.get_config()):
             self.upgrade_task = asyncio.create_task(self._poll_upgrades())
+            # THE DCS UPDATE POLL: the sibling of the upgrade poll, for each node's DCS
+            # installation (branch, version, newer build on that branch) — the node's OWN API,
+            # never a page render. The four triggers live in ``services/webservice/dcs_update.py``
+            # (start = the poller's first, full sweep); a node coming online is a newcomer the
+            # sampler notices, and a re-check after an accepted update is that module's
+            # ``check_node``.
+            self.dcs_task = asyncio.create_task(self._poll_dcs_updates())
+            # THE UPDATE'S OWN DOOR: a DCS update that runs in THIS process tells us nothing by any
+            # cached state — the node's files change under a cache the console filled before it
+            # started. The node fires its ``after_dcs_update`` hook when the updater returns, and this
+            # registers the console on it, so the pre-update answer is replaced at once instead of
+            # waiting for the amber beat or the six-hour sweep. Registered only with the frontend on:
+            # there is no console to refresh otherwise.
+            self.node.register_callback('after_dcs_update', self.name, self.after_dcs_update)
             # THE RENDER WARM-UP: the first page after a boot paid the whole schema parse (measured
             # 781 ms for a node click against 39 ms once the caches were warm). Ask for the same
             # things a page will ask for, ONCE, in a THREAD — so the FIRST click costs what the rest
             # cost, and nothing here delays the console becoming available.
             self.warm_task = asyncio.create_task(self._warm_render_caches())
+            # THE SCOPE AUDIT: it compares every server's managed_by against the LIVE guild roles,
+            # and that cache exists only after Discord's READY — later than this service is built
+            # (which is why the install-time audit defers). One shot, once the bot is ready.
+            self.scope_task = asyncio.create_task(self._audit_scope_when_ready())
 
     async def _poll_upgrades(self) -> None:
         """Sample the cluster for pending upgrades and refresh the cache the render reads.
@@ -230,6 +268,55 @@ class WebService(Service):
             except Exception:
                 self.log.exception("WebService: the upgrade check sweep failed.")
             await asyncio.sleep(poller.sample_seconds)
+
+    async def _poll_dcs_updates(self) -> None:
+        """Sample every node's DCS installation and refresh the cache the render reads.
+
+        The task lives for the service's lifetime and does NOTHING but the poll: each tick asks
+        :func:`services.webservice.dcs_update.console_nodes` for the current registry, passes the
+        CONFIGURATION's declared DCS blocks (so a node without an installation costs no call at all),
+        and lets the poller decide which nodes to check (newcomers, and every node on a due sweep).
+        Every failure is contained — a poll that raises must never take the webservice down with it,
+        and the cache simply keeps its last honest value.
+        """
+        from services.webservice import dcs_update
+
+        poller = dcs_update.DcsUpdatePoller()
+        while True:
+            try:
+                await poller.tick(dcs_update.console_nodes(), dcs_update.console_declared_dcs())
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.log.exception("WebService: the DCS update check sweep failed.")
+            await asyncio.sleep(poller.sample_seconds)
+
+    async def after_dcs_update(self) -> None:
+        """Re-check this node's DCS facts once an update has RETURNED — the node's own hook.
+
+        SCHEDULED, never awaited: the node calls its ``after_dcs_update`` hooks inside the update's
+        ``finally`` block, and a check makes two node calls (one of them an HTTP fetch to the
+        publisher). Awaiting it here would hold the update open for the check's duration, so the
+        node's "update finished" is not delayed by the console's own bookkeeping.
+        """
+        task = asyncio.create_task(self._recheck_dcs(self.node))
+        self.dcs_tasks.add(task)
+        task.add_done_callback(self.dcs_tasks.discard)
+
+    async def _recheck_dcs(self, node) -> None:
+        """Refresh the cached DCS answer for *node*, containing every failure.
+
+        The node declared a DCS installation — it just updated one — so this states that fact instead
+        of reading it back from the configuration.
+        """
+        from services.webservice import dcs_update
+
+        try:
+            await dcs_update.check_node(node, declared=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.log.debug("WebService: the post-update DCS check failed.", exc_info=True)
 
     async def _warm_render_caches(self) -> None:
         """Pre-pay the first render: parse the schemas and run the notice checks, off the boot path.
@@ -255,8 +342,42 @@ class WebService(Service):
         self.log.info(f"WebService: render warm-up done — {parsed} schemas parsed, "
                       f"{checked} notices checked, {templates} templates compiled in {seconds:.1f}s.")
 
+    async def _audit_scope_when_ready(self) -> None:
+        """Run the per-server scope audit once the bot is READY.
+
+        The audit compares free-text ``managed_by`` values against the LIVE guild role names and ids.
+        Discord's READY comes AFTER this service is built, so the install-time audit defers
+        (``auth.audit_scope_declarations``) and this is what finally runs it — without it, the
+        diagnostic would never fire at all. READY is the gate, not a guild cache: the audit runs with
+        or without one, and only its ``managed_by`` half is skipped when no guild is cached (the
+        local-scope half still runs; see ``auth._live_scope_inputs``). One shot, and every failure
+        contained: a console whose audit cannot run is the console we had before.
+        """
+        from .auth.discord_oauth import current_bot
+
+        try:
+            bot = current_bot()
+            wait = getattr(bot, "wait_until_ready", None)
+            if callable(wait):
+                await wait()
+            from . import auth as auth_api
+            auth_api.audit_scope_declarations(self.app)
+        except asyncio.CancelledError:
+            # Not a rescue: cancellation propagates on its own, because ``CancelledError`` is a
+            # ``BaseException`` and the blanket ``except Exception`` below cannot catch it. This
+            # clause documents the intent for a reader, as the poller and the warm-up task do.
+            raise
+        except Exception:
+            self.log.debug("WebService: the ready-time scope audit could not run.", exc_info=True)
+
     @override
     async def stop(self):
+        if self.scope_task:
+            # one-shot, like the warm-up: end the WAIT for READY if the service stops first
+            self.scope_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.scope_task
+            self.scope_task = None
         if self.warm_task:
             # the warm-up is a one-shot: if the service stops while it runs, end the WAIT for it (the
             # thread itself finishes harmlessly in the background).
@@ -271,6 +392,19 @@ class WebService(Service):
             with suppress(asyncio.CancelledError):
                 await self.upgrade_task
             self.upgrade_task = None
+        if self.dcs_task:
+            # the DCS poll is the same lifetime shape: end it with the service, and wait for the
+            # cancellation so no poller keeps sampling a stopped app.
+            self.dcs_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.dcs_task
+            self.dcs_task = None
+        # the node hook is registered only when the frontend ran, but unregistering an absent name is
+        # a no-op — so this does not have to repeat the condition that created it.
+        self.node.unregister_callback('after_dcs_update', self.name)
+        for task in list(self.dcs_tasks):
+            task.cancel()
+        self.dcs_tasks.clear()
         if self.task:
             self.server.should_exit = True
             # Explicitly trigger the shutdown of the uvicorn server

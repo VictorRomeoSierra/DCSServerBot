@@ -2,7 +2,7 @@ import discord
 import hashlib
 import os
 
-from core import Plugin, get_translation, Group, Server, utils, Status
+from core import Plugin, get_translation, Group, Server, utils, Status, DISCORD_FILE_SIZE_LIMIT
 from datetime import datetime, timezone
 from discord import app_commands
 from extensions.tacview import TACVIEW_DEFAULT_DIR
@@ -49,12 +49,12 @@ async def get_tacview_files(interaction: discord.Interaction, server: Server) ->
         if not row:
             return []
         path, files = await server.node.list_directory(
-            os.path.join(path, utils.slugify(row[0])), pattern='*.acmi', is_dir=False
+            os.path.join(path, utils.slugify(row[0])), pattern='*.zip.acmi', is_dir=False
         )
         # make the files relative to the export path, not the player directory
         path = os.path.dirname(path)
     else:
-        path, files = await server.node.list_directory(path, pattern='*.acmi', is_dir=False, traverse=True)
+        path, files = await server.node.list_directory(path, pattern='*.zip.acmi', is_dir=False, traverse=True)
     return [os.path.relpath(x, path) for x in files]
 
 
@@ -104,6 +104,10 @@ class Tacview(Plugin):
                 await interaction.followup.send(_("Tacview file not found."), ephemeral=True)
                 return
         file_data = await self.node.read_file(os.path.join(path, file))
+        if len(file_data) > DISCORD_FILE_SIZE_LIMIT:
+            await interaction.followup.send(_("The file exceeds the maximum allowed size on Discord. Aborted."),
+                                            ephemeral=True)
+            return
         try:
             if config.get('upload', {}).get('channel'):
                 channel_id = config['upload']['channel']

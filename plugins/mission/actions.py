@@ -8,13 +8,18 @@ wrap into their response formats.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
+import tempfile
+import types
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterable, TypeVar, cast
 
-from core import Coalition, Status, UploadStatus, utils, get_translation
+from core import (Coalition, MizFile, Status, UnsupportedMizFileException, UploadStatus, utils,
+                  get_translation)
 from core.actions import (
     TRANSPORT_DISCORD,
     TRANSPORT_SERVICE,
@@ -32,6 +37,7 @@ from core.action_results import (
     PlayerActionResult,
     PlayerScreenshotResult,
     ServerControlResult,
+    ServerInfoResult,
 )
 
 log = logging.getLogger(__name__)
@@ -46,40 +52,51 @@ _ = get_translation(__name__.split('.')[1])
 
 @action
 async def start_server(ctx: Any, server_name: str) -> ServerControlResult:
-    """Start a stopped DCS server instance."""
+    """Start a server whose instance is STOPPED. A SHUTDOWN server needs startup_server."""
     server = ctx.resolve_server(server_name)
     if server is None:
-        return ServerControlResult(
+        result = ServerControlResult(
             success=False,
             message=f"Server '{server_name}' not found.",
             server_name=server_name,
         )
+        return await _audited(ctx, result, server)
     if server.status != Status.STOPPED:
-        return ServerControlResult(
+        label = _server_label(server, server_name)
+        # The refusal names the tool that CAN start this instance: a SHUTDOWN server is started by
+        # the DCS-level Startup, never by the process-level Start.
+        message = (f"Server '{label}' is Shutdown - use startup_server."
+                   if server.status == Status.SHUTDOWN
+                   else f"Server '{label}' is {server.status.value}, not stopped.")
+        result = ServerControlResult(
             success=False,
-            message=f"Server '{_server_label(server, server_name)}' is {server.status.value}, not stopped.",
+            message=message,
             server_name=server_name,
         )
+        return await _audited(ctx, result, server)
     try:
         await server.start()
-        return ServerControlResult(
+        result = ServerControlResult(
             success=True,
             message=f"Server '{_server_label(server, server_name)}' started.",
             server_name=server_name,
         )
+        return await _audited(ctx, result, server)
     except (TimeoutError, asyncio.TimeoutError):
-        return ServerControlResult(
+        result = ServerControlResult(
             success=False,
             message=f"Timeout while starting server '{_server_label(server, server_name)}'.",
             server_name=server_name,
         )
+        return await _audited(ctx, result, server)
     except Exception as ex:
         log.exception("start_server failed")
-        return ServerControlResult(
+        result = ServerControlResult(
             success=False,
             message=f"Failed to start server: {ex}",
             server_name=server_name,
         )
+        return await _audited(ctx, result, server)
 
 
 @action
@@ -87,37 +104,42 @@ async def stop_server(ctx: Any, server_name: str) -> ServerControlResult:
     """Stop a running or paused DCS server instance."""
     server = ctx.resolve_server(server_name)
     if server is None:
-        return ServerControlResult(
+        result = ServerControlResult(
             success=False,
             message=f"Server '{server_name}' not found.",
             server_name=server_name,
         )
+        return await _audited(ctx, result, server)
     if server.status not in (Status.RUNNING, Status.PAUSED):
-        return ServerControlResult(
+        result = ServerControlResult(
             success=False,
             message=f"Server '{_server_label(server, server_name)}' is {server.status.value}, not running or paused.",
             server_name=server_name,
         )
+        return await _audited(ctx, result, server)
     try:
         await server.stop()
-        return ServerControlResult(
+        result = ServerControlResult(
             success=True,
             message=f"Server '{_server_label(server, server_name)}' stopped.",
             server_name=server_name,
         )
+        return await _audited(ctx, result, server)
     except (TimeoutError, asyncio.TimeoutError):
-        return ServerControlResult(
+        result = ServerControlResult(
             success=False,
             message=f"Timeout while stopping server '{_server_label(server, server_name)}'.",
             server_name=server_name,
         )
+        return await _audited(ctx, result, server)
     except Exception as ex:
         log.exception("stop_server failed")
-        return ServerControlResult(
+        result = ServerControlResult(
             success=False,
             message=f"Failed to stop server: {ex}",
             server_name=server_name,
         )
+        return await _audited(ctx, result, server)
 
 
 # TEMPORARY-REDUNDANCY(W-R3): the console's Restart is THIS action (a plain stop + start) while
@@ -127,42 +149,130 @@ async def stop_server(ctx: Any, server_name: str) -> ServerControlResult:
 # maintenance/delay/popup flow and moves the command onto it removes both markers.
 @action
 async def restart_server(ctx: Any, server_name: str) -> ServerControlResult:
-    """Restart a DCS server instance (stop then start)."""
+    """Restart a running, paused or stopped server. A SHUTDOWN server needs startup_server."""
     server = ctx.resolve_server(server_name)
     if server is None:
-        return ServerControlResult(
+        result = ServerControlResult(
             success=False,
             message=f"Server '{server_name}' not found.",
             server_name=server_name,
         )
+        return await _audited(ctx, result, server)
     if server.status not in (Status.RUNNING, Status.PAUSED, Status.STOPPED):
-        return ServerControlResult(
+        label = _server_label(server, server_name)
+        # A restart is stop + start, and a SHUTDOWN instance has no process to stop: the DCS-level
+        # Startup is the tool that brings it back, so the refusal names it.
+        message = (f"Server '{label}' is Shutdown - use startup_server."
+                   if server.status == Status.SHUTDOWN
+                   else f"Server '{label}' is {server.status.value}.")
+        result = ServerControlResult(
             success=False,
-            message=f"Server '{_server_label(server, server_name)}' is {server.status.value}.",
+            message=message,
             server_name=server_name,
         )
+        return await _audited(ctx, result, server)
     try:
         if server.status in (Status.RUNNING, Status.PAUSED):
             await server.stop()
         await server.start()
-        return ServerControlResult(
+        result = ServerControlResult(
             success=True,
             message=f"Server '{_server_label(server, server_name)}' restarted.",
             server_name=server_name,
         )
+        return await _audited(ctx, result, server)
     except (TimeoutError, asyncio.TimeoutError):
-        return ServerControlResult(
+        result = ServerControlResult(
             success=False,
             message=f"Timeout while restarting server '{_server_label(server, server_name)}'.",
             server_name=server_name,
         )
+        return await _audited(ctx, result, server)
     except Exception as ex:
         log.exception("restart_server failed")
-        return ServerControlResult(
+        result = ServerControlResult(
             success=False,
             message=f"Failed to restart server: {ex}",
             server_name=server_name,
         )
+        return await _audited(ctx, result, server)
+
+
+# ── Fleet reads ─────────────────────────────────────────────────────────────
+
+@dataclass
+class ServerListResult(ActionResult):
+    """Result for the fleet read (``list_servers``).
+
+    ``servers`` is the same row list ``data["servers"]`` carries: the envelope carries the wire
+    shape, the field is the typed view an in-process caller reads.
+    """
+    servers: list[dict[str, Any]] = field(default_factory=list)
+
+
+def _server_row(server: Any) -> dict[str, Any]:
+    """One server as the fleet reads expose it: name, status, running mission, its map, players.
+
+    ONE row shape for both reads, so ``list_servers`` and ``get_server_status`` can never describe
+    the same server differently. Both names are read through the label helpers, which is the only
+    place an ESCAPED name may be touched — the row carries the plain one. The status is read as its
+    enum VALUE (a plain string double answers as it is), and a server without a running mission
+    answers ``None`` for both mission and map rather than an empty string, which would be
+    indistinguishable from a mission named "".
+    """
+    status = getattr(server, "status", "")
+    mission = getattr(server, "current_mission", None)
+    return {
+        "name": _server_label(server, ""),
+        "status": getattr(status, "value", str(status or "")),
+        "mission": _mission_label(mission, "") if mission else None,
+        "map": getattr(mission, "map", None) if mission else None,
+        "players_online": len(_active_players(server)),
+    }
+
+
+@action(kind="read")
+async def list_servers(ctx: Any) -> ServerListResult:
+    """List every server this process knows, with its status and running mission.
+
+    ``ctx.servers`` is the caller's own view of the cluster, so a scoped caller lists exactly the
+    servers it may see. The rows ride under ``data["servers"]``: a TOP-LEVEL ``status`` key would
+    overwrite the envelope's own ``ok``/``error``.
+    """
+    rows = [_server_row(server) for server in (ctx.servers or {}).values()]
+    return ServerListResult(
+        success=True,
+        message=f"{len(rows)} servers.",
+        data={"servers": rows},
+        servers=rows,
+    )
+
+
+@action(kind="read")
+async def get_server_status(ctx: Any, server_name: str) -> ServerInfoResult:
+    """One server's status, mission, map and player count.
+
+    The row rides under ``data["server"]`` for the same reason ``list_servers`` nests its list: the
+    envelope's ``status`` is the outcome, not the server's state. The typed fields carry the same
+    facts for a caller that holds the dataclass instead of the wire body.
+    """
+    server = ctx.resolve_server(server_name)
+    if server is None:
+        return ServerInfoResult(
+            success=False,
+            message=f"Server '{server_name}' not found.",
+            server_name=server_name,
+        )
+    row = _server_row(server)
+    return ServerInfoResult(
+        success=True,
+        message=f"Server '{_server_label(server, server_name)}' is {row['status']}.",
+        data={"server": row},
+        server_name=row["name"] or server_name,
+        status=row["status"],
+        mission_name=row["mission"] or "",
+        players_online=row["players_online"],
+    )
 
 
 # ── DCS-level server control (startup / shutdown) ───────────────────────────
@@ -193,10 +303,48 @@ def _set_maintenance(server: Any, maintenance: bool) -> str | None:
     return None
 
 
+#: The sentence a launch that states a weather pick AND "do not run the extensions" is refused with.
+#: A weather pick is a REQUEST TO APPLY, and only a launch that runs the extensions applies one; on a
+#: ``modify_mission=False`` launch the node's ``preset`` means "this was already applied, record it"
+#: (the scheduler's statement). A pick must therefore never travel into a launch that will not apply
+#: it, or the node's record — and the label the server page renders off it — would claim weather no
+#: launch produced. The launch is refused as a whole rather than run with the pick dropped: the
+#: operator asked for two things that contradict each other, and silently honouring one of them is
+#: how the false label was produced.
+WEATHER_NEEDS_EXTENSIONS = (
+    "Not done (a weather preset was picked and the extensions are off, so nothing would apply it — "
+    "tick \"Run extensions on the mission\", or clear the weather pick)."
+)
+
+
+def states_unapplied_weather(modify_mission: bool | None, preset: Any) -> bool:
+    """Whether this launch states a weather pick that its own extensions will not apply.
+
+    The ONE predicate for the condition: the action guards on it (the backstop for direct / REST / MCP
+    callers) and the console's launch routes reach it through this public name rather than re-stating
+    the boolean — a second copy is exactly the drift this refusal exists to stop.
+    """
+    return not modify_mission and bool(preset)
+
+
 @action
 async def startup_server(ctx: Any, server_name: str, modify_mission: bool = True,
-                         use_orig: bool = True, maintenance: bool = True) -> ServerControlResult:
-    """Start up a SHUTDOWN DCS server (the DCS-level Startup; process-level Start is another action).
+                         use_orig: bool = True, maintenance: bool = True,
+                         preset: str | dict | list | None = "",
+                         preset_name: str | None = None,
+                         announce: bool = False,
+                         mission: int | str | None = None) -> ServerControlResult:
+    """Boot a SHUTDOWN server (the DCS-level Startup). For a STOPPED server use start_server.
+
+    ``mission`` names what this launch loads — the 1-based ``missionList`` index or the mission's
+    logical name (:func:`_resolve_mission_id`, the resolver its siblings use). It is honoured by
+    moving the rotation pointer with the bot's own ``Server.setStartIndex`` BEFORE the launch, which
+    is the only way a launch selects its mission: ``Server.startup`` loads ``listStartIndex``. That
+    is the same pair ``/server startup mission:`` performs (``plugins/scheduler/commands.py``), so the
+    two transports start the same mission the same way. A name that resolves to nothing is REFUSED and
+    nothing starts — the bot's own ``setStartIndex`` would silently clamp an out-of-range index to 1,
+    which would launch the wrong mission. Unstated (``None`` / empty) leaves the pointer alone, which
+    is what the operator's rotation already said.
 
     ``modify_mission`` / ``use_orig`` mirror the arguments ``Server.startup`` takes and the Discord
     command passes (``plugins/scheduler/commands.py``), and both are REPRODUCED here: the values reach
@@ -204,6 +352,30 @@ async def startup_server(ctx: Any, server_name: str, modify_mission: bool = True
     ``/server startup`` does. The console's Startup dialog declares the two as its own checkboxes
     (``services/webservice/pages/actions.py``), so the operator makes the choice rather than the
     route deciding it.
+
+    ``preset`` is the launch dialog's weather pick, and there are TWO shapes of it because the pick
+    offers two ways to make ONE choice: a preset NAME (``str``) the NODE resolves against its own
+    preset file (the node, not the master, owns that file), or a temporary preset DOCUMENT
+    (``dict``/``list``) the console built from the dialog's weather fields for this launch alone.
+    ``""`` — the dialog's empty option with no field filled — is passed on as ``None``, so a launch
+    nobody picked a preset for behaves exactly as before. A name the instance does not carry is
+    logged and ignored by the extension, as it always was; a document is applied as it stands and
+    writes nothing to the node's preset file.
+
+    ``preset_name`` names a preset whose ``preset`` VALUE is a DOCUMENT — a preset read out of a preset
+    file carries the change itself and no name in it, so the name travels beside it and the NODE's
+    record takes it (``launched_preset``) instead of recording a temporary preset. ``None`` (every
+    caller that states a name or no pick at all) derives the record from ``preset`` exactly as before.
+
+    The pick travels ONLY into a launch that applies it: with ``modify_mission`` off the extensions
+    do not run, so the launch is REFUSED (:data:`WEATHER_NEEDS_EXTENSIONS`) instead of launching
+    with the weather silently dropped. On that path the node's ``preset`` means "already applied,
+    record it" (what the scheduler states), and a console pick sent there would be recorded as
+    weather no launch produced.
+
+    ``announce`` rides with the weather pick (the dialog's own ``announce`` box, OFF by default) and is
+    handed to ``Server.startup`` unchanged: the NODE tells the players, and only when it really applied
+    a preset. A launch that requests a NAME the instance does not carry announces nothing.
 
     ``maintenance`` mirrors ``/server startup``'s own default: a TRUE value
     CLEARS the maintenance flag on a successful start, so the server rejoins the rotation — a server
@@ -220,13 +392,88 @@ async def startup_server(ctx: Any, server_name: str, modify_mission: bool = True
             server_name=server_name,
         )
     if server.status != Status.SHUTDOWN:
+        label = _server_label(server, server_name)
+        # A STOPPED instance has no shutdown state to boot: the process-level Start is its tool.
+        message = (f"Server '{label}' is Stopped - use start_server."
+                   if server.status == Status.STOPPED
+                   else f"Server '{label}' is {server.status.value}, not shut down.")
         return ServerControlResult(
             success=False,
-            message=f"Server '{_server_label(server, server_name)}' is {server.status.value}, not shut down.",
+            message=message,
             server_name=server_name,
         )
+    if states_unapplied_weather(modify_mission, preset):
+        return ServerControlResult(
+            success=False,
+            message=WEATHER_NEEDS_EXTENSIONS,
+            server_name=server_name,
+        )
+    # THE MISSION THIS LAUNCH LOADS. A stated one moves the rotation pointer FIRST, because
+    # ``Server.startup`` loads ``listStartIndex`` and there is no other way to name the mission: that
+    # is the pair ``/server startup mission:`` performs. Resolution happens against a FRESH list, so a
+    # name the page outlived is refused here rather than starting whatever its index now means — and a
+    # refused mission starts NOTHING, never a launch with the wrong one.
+    mission_name = ""
+    mission_moved = False
+    if mission is not None and not isinstance(mission, bool) and str(mission).strip():
+        try:
+            missions = await server.getMissionList()
+        except Exception as ex:
+            log.exception("startup_server failed")
+            return ServerControlResult(
+                success=False,
+                message=f"Failed to list missions: {ex}",
+                server_name=server_name,
+            )
+        index = _resolve_mission_id(missions, mission)
+        if index is None:
+            return ServerControlResult(
+                success=False,
+                message=f"Mission '{mission}' not found on server '{_server_label(server, server_name)}'.",
+                server_name=server_name,
+            )
+        mission_name = os.path.basename(_logical_mission(missions[index - 1]))
+        # THE POINTER MOVES ONLY WHEN THE CHOICE DIFFERS: the dialog always posts the mission it
+        # shows, whose default is the configured start one, so a launch nobody changed writes nothing
+        # — "doing nothing changes nothing" is literally true here, not merely equivalent.
+        current_index = 0
+        try:
+            current_index = int(await server.getStartIndex() or 0)
+        except Exception:  # noqa: BLE001 - an unreadable pointer still launches the chosen mission
+            current_index = 0
+        if index != current_index:
+            try:
+                await server.setStartIndex(index)
+            except (TimeoutError, asyncio.TimeoutError):
+                return ServerControlResult(
+                    success=False,
+                    message=f"Timeout while making mission '{mission_name}' the start mission.",
+                    server_name=server_name,
+                )
+            except Exception as ex:
+                log.exception("startup_server failed")
+                return ServerControlResult(
+                    success=False,
+                    message=f"Failed to make mission '{mission_name}' the start mission: {ex}",
+                    server_name=server_name,
+                )
+            mission_moved = True
+    # The pick travels ONLY into a launch that applies it: with the extensions off the node treats
+    # ``preset`` as "already applied, record it", so a pick sent there would be recorded as weather
+    # no extension produced. ``None`` is what such a launch states — it clears the record.
+    weather_pick = (preset or None) if modify_mission else None
+    # ``announce`` travels only when it is asked for: a launch nobody ticked the box on calls
+    # ``Server.startup`` exactly as it did before the box existed.
+    startup_args: dict[str, Any] = dict(modify_mission=modify_mission, use_orig=use_orig,
+                                        preset=weather_pick)
+    # ``preset_name`` names a DOCUMENT, so it travels only beside a pick the launch really carries —
+    # and only when it is stated, so a launch with no name is the same call as before the keyword.
+    if preset_name is not None and weather_pick is not None:
+        startup_args["preset_name"] = preset_name
+    if announce:
+        startup_args["announce"] = True
     try:
-        await server.startup(modify_mission=modify_mission, use_orig=use_orig)
+        await server.startup(**startup_args)
     except (TimeoutError, asyncio.TimeoutError):
         return ServerControlResult(
             success=False,
@@ -250,9 +497,26 @@ async def startup_server(ctx: Any, server_name: str, modify_mission: bool = True
                          f"could not be cleared: {failure}"),
                 server_name=server_name,
             )
+    label = _server_label(server, server_name)
+    # THE MESSAGE IS THE AUDIT TEXT (``call_action`` -> ``audit_action``), so naming the mission the
+    # launch was pointed at and the preset it requested here is the whole trail — there is no second
+    # record to write. The console cannot know whether the NODE really applied a NAME (one the
+    # instance does not carry is ignored there), so a name is reported as the launch's REQUEST, never
+    # as an applied fact; the record the node writes is the truth, and the server page renders it. A
+    # temporary preset document is applied as it stands, so it is named as applied; a launch nobody
+    # picked a mission or a preset for keeps the sentence it always had.
+    started = f"Server '{label}' started up" + (f" for mission '{mission_name}'" if mission_moved else "")
+    if preset_name and weather_pick:
+        message = f"{started} — weather preset '{preset_name}' requested."
+    elif isinstance(weather_pick, str) and weather_pick:
+        message = f"{started} — weather preset '{weather_pick}' requested."
+    elif weather_pick:
+        message = f"{started} with a temporary weather preset."
+    else:
+        message = f"{started}."
     return ServerControlResult(
         success=True,
-        message=f"Server '{_server_label(server, server_name)}' started up.",
+        message=message,
         server_name=server_name,
     )
 
@@ -260,7 +524,7 @@ async def startup_server(ctx: Any, server_name: str, modify_mission: bool = True
 @action
 async def shutdown_server(ctx: Any, server_name: str, force: bool = False,
                           maintenance: bool = True) -> ServerControlResult:
-    """Shut down a running or paused DCS server gracefully (the DCS-level Shutdown).
+    """Shut a running or paused server down to SHUTDOWN. stop_server ends the process instead.
 
     The DCS-level counterpart of ``stop_server``: the server stays registered and reads SHUTDOWN
     until a Startup brings it back, where a Stop ends the process and leaves it STOPPED.
@@ -326,37 +590,42 @@ async def pause_mission(ctx: Any, server_name: str) -> MissionControlResult:
     """Pause the running mission on a DCS server."""
     server = ctx.resolve_server(server_name)
     if server is None:
-        return MissionControlResult(
+        result = MissionControlResult(
             success=False,
             message=f"Server '{server_name}' not found.",
             server_name=server_name,
         )
+        return await _audited(ctx, result, server)
     if server.status != Status.RUNNING:
-        return MissionControlResult(
+        result = MissionControlResult(
             success=False,
             message=f"Server '{_server_label(server, server_name)}' is {server.status.value}, not running.",
             server_name=server_name,
         )
+        return await _audited(ctx, result, server)
     if server.current_mission is None:
-        return MissionControlResult(
+        result = MissionControlResult(
             success=False,
             message=f"No active mission on server '{_server_label(server, server_name)}'.",
             server_name=server_name,
         )
+        return await _audited(ctx, result, server)
     try:
         await server.current_mission.pause()
-        return MissionControlResult(
+        result = MissionControlResult(
             success=True,
             message=f"Mission on server '{_server_label(server, server_name)}' paused.",
             server_name=server_name,
         )
+        return await _audited(ctx, result, server)
     except Exception as ex:
         log.exception("pause_mission failed")
-        return MissionControlResult(
+        result = MissionControlResult(
             success=False,
             message=f"Failed to pause mission: {ex}",
             server_name=server_name,
         )
+        return await _audited(ctx, result, server)
 
 
 @action
@@ -364,37 +633,42 @@ async def unpause_mission(ctx: Any, server_name: str) -> MissionControlResult:
     """Unpause the paused mission on a DCS server."""
     server = ctx.resolve_server(server_name)
     if server is None:
-        return MissionControlResult(
+        result = MissionControlResult(
             success=False,
             message=f"Server '{server_name}' not found.",
             server_name=server_name,
         )
+        return await _audited(ctx, result, server)
     if server.status != Status.PAUSED:
-        return MissionControlResult(
+        result = MissionControlResult(
             success=False,
             message=f"Server '{_server_label(server, server_name)}' is {server.status.value}, not paused.",
             server_name=server_name,
         )
+        return await _audited(ctx, result, server)
     if server.current_mission is None:
-        return MissionControlResult(
+        result = MissionControlResult(
             success=False,
             message=f"No active mission on server '{_server_label(server, server_name)}'.",
             server_name=server_name,
         )
+        return await _audited(ctx, result, server)
     try:
         await server.current_mission.unpause()
-        return MissionControlResult(
+        result = MissionControlResult(
             success=True,
             message=f"Mission on server '{_server_label(server, server_name)}' unpaused.",
             server_name=server_name,
         )
+        return await _audited(ctx, result, server)
     except Exception as ex:
         log.exception("unpause_mission failed")
-        return MissionControlResult(
+        result = MissionControlResult(
             success=False,
             message=f"Failed to unpause mission: {ex}",
             server_name=server_name,
         )
+        return await _audited(ctx, result, server)
 
 
 @action
@@ -407,45 +681,51 @@ async def restart_mission(
     """Restart the current mission on a DCS server."""
     server = ctx.resolve_server(server_name)
     if server is None:
-        return MissionControlResult(
+        result = MissionControlResult(
             success=False,
             message=f"Server '{server_name}' not found.",
             server_name=server_name,
         )
+        return await _audited(ctx, result, server)
     if server.status not in (Status.RUNNING, Status.PAUSED, Status.STOPPED):
-        return MissionControlResult(
+        result = MissionControlResult(
             success=False,
             message=f"Server '{_server_label(server, server_name)}' is {server.status.value}.",
             server_name=server_name,
         )
+        return await _audited(ctx, result, server)
     if server.current_mission is None:
-        return MissionControlResult(
+        result = MissionControlResult(
             success=False,
             message=f"No active mission on server '{_server_label(server, server_name)}'.",
             server_name=server_name,
         )
+        return await _audited(ctx, result, server)
     try:
         if not server.locals.get("mission_rewrite", True) and server.status != Status.STOPPED:
             await server.stop()
         await server.restart(modify_mission=modify_mission)
-        return MissionControlResult(
+        result = MissionControlResult(
             success=True,
             message=f"Mission on server '{_server_label(server, server_name)}' restarted.",
             server_name=server_name,
         )
+        return await _audited(ctx, result, server)
     except (TimeoutError, asyncio.TimeoutError):
-        return MissionControlResult(
+        result = MissionControlResult(
             success=False,
             message=f"Timeout while restarting mission on '{_server_label(server, server_name)}'.",
             server_name=server_name,
         )
+        return await _audited(ctx, result, server)
     except Exception as ex:
         log.exception("restart_mission failed")
-        return MissionControlResult(
+        result = MissionControlResult(
             success=False,
             message=f"Failed to restart mission: {ex}",
             server_name=server_name,
         )
+        return await _audited(ctx, result, server)
 
 
 @action
@@ -458,39 +738,63 @@ async def rotate_mission(
     """Rotate to the next mission in the rotation list."""
     server = ctx.resolve_server(server_name)
     if server is None:
-        return MissionControlResult(
+        result = MissionControlResult(
             success=False,
             message=f"Server '{server_name}' not found.",
             server_name=server_name,
         )
+        return await _audited(ctx, result, server)
     if server.status not in (Status.RUNNING, Status.PAUSED, Status.STOPPED):
-        return MissionControlResult(
+        result = MissionControlResult(
             success=False,
             message=f"Server '{_server_label(server, server_name)}' is {server.status.value}.",
             server_name=server_name,
         )
+        return await _audited(ctx, result, server)
     try:
         if not server.locals.get("mission_rewrite", True) and server.status != Status.STOPPED:
             await server.stop()
         await server.loadNextMission(modify_mission=modify_mission, use_orig=use_orig)
-        return MissionControlResult(
+        result = MissionControlResult(
             success=True,
             message=f"Mission rotated on server '{_server_label(server, server_name)}'.",
             server_name=server_name,
         )
+        return await _audited(ctx, result, server)
     except (TimeoutError, asyncio.TimeoutError):
-        return MissionControlResult(
+        result = MissionControlResult(
             success=False,
             message=f"Timeout while rotating mission on '{_server_label(server, server_name)}'.",
             server_name=server_name,
         )
+        return await _audited(ctx, result, server)
     except Exception as ex:
         log.exception("rotate_mission failed")
-        return MissionControlResult(
+        result = MissionControlResult(
             success=False,
             message=f"Failed to rotate mission: {ex}",
             server_name=server_name,
         )
+        return await _audited(ctx, result, server)
+
+
+def _loaded_message(mission_name: str, verb: str, preset, preset_name: str | None = None) -> str:
+    """The load action's result sentence — and, because the result IS the audit text, the whole trail.
+
+    A weather preset picked on the Load dialog is NAMED here, exactly as ``startup_server`` names one.
+    A preset NAME is reported as the load's REQUEST, never as an applied fact: the console cannot know
+    whether the NODE really applied it (a name the instance does not carry is logged and ignored
+    there). A preset DOCUMENT built on the spot (``preset_name`` absent) is applied as it stands, so
+    it is named as applied; a document read out of a preset file is NAMED by the key it came from,
+    which ``preset_name`` carries. No pick keeps the sentence the load has always had.
+    """
+    if preset_name and preset:
+        return f"Mission '{mission_name}' {verb} — weather preset '{preset_name}' requested."
+    if isinstance(preset, str) and preset:
+        return f"Mission '{mission_name}' {verb} — weather preset '{preset}' requested."
+    if preset:
+        return f"Mission '{mission_name}' {verb} with a temporary weather preset."
+    return f"Mission '{mission_name}' {verb}."
 
 
 @action
@@ -501,31 +805,70 @@ async def load_mission(
     modify_mission: bool = True,
     use_orig: bool = True,
     expected_name: str = "",
+    preset: str | dict | list | None = "",
+    preset_name: str | None = None,
+    announce: bool = False,
 ) -> MissionLoadResult:
-    """Load a specific mission on a DCS server."""
+    """Load a specific mission on a DCS server.
+
+    ``preset`` / ``announce`` are the LAUNCH FORM the console's Load dialog carries — the SAME
+    weather pick and announce box the Startup dialog declares (``services/webservice/pages/
+    actions.py``). ``preset`` has TWO shapes because the pick offers two ways to make ONE choice: a
+    preset NAME (``str``) the NODE resolves against its own preset file, or a temporary preset
+    DOCUMENT (``dict``/``list``) the console built for this load alone; ``""`` means no pick and
+    behaves exactly as before. ``announce`` is the dialog's own box (``False`` by default) and the
+    NODE tells the players, and only when it really applied a preset. Both are threaded through BOTH
+    of the action's load paths — ``loadMission`` and the ``restart`` branch for the mission that is
+    ALREADY running — so a preset picked on Load is never silently dropped.
+
+    ``preset_name`` names a preset whose ``preset`` VALUE is a DOCUMENT: the name travels beside the
+    document so the NODE's record takes the name instead of recording a temporary preset, and it is
+    threaded through BOTH branches for the same reason ``preset`` is.
+
+    The pick travels ONLY into a load that applies it: with ``modify_mission`` off the extensions do
+    not run, so the load is REFUSED (:data:`WEATHER_NEEDS_EXTENSIONS`) instead of loading with the
+    weather silently dropped. On that path the node's ``preset`` means "already applied, record it"
+    (what the scheduler states), and a console pick sent there would be recorded as weather no load
+    produced.
+    """
     server = ctx.resolve_server(server_name)
     if server is None:
-        return MissionLoadResult(
+        result = MissionLoadResult(
             success=False,
             message=f"Server '{server_name}' not found.",
             server_name=server_name,
         )
+        return await _audited(ctx, result, server)
     if server.status not in (Status.RUNNING, Status.PAUSED, Status.STOPPED):
-        return MissionLoadResult(
+        result = MissionLoadResult(
             success=False,
             message=f"Server '{_server_label(server, server_name)}' is {server.status.value}.",
             server_name=server_name,
         )
+        return await _audited(ctx, result, server)
+    if states_unapplied_weather(modify_mission, preset):
+        result = MissionLoadResult(
+            success=False,
+            message=WEATHER_NEEDS_EXTENSIONS,
+            server_name=server_name,
+        )
+        return await _audited(ctx, result, server)
+    # The pick travels ONLY into a load that applies it: with the extensions off the node treats
+    # ``preset`` as "already applied, record it", so a pick sent there would be recorded as weather
+    # no extension produced. ``None`` is what such a load states — it clears the record.
+    weather_pick = (preset or None) if modify_mission else None
+    weather_name = preset_name if weather_pick is not None else None
 
     # Resolve mission identifier to filename
     mission_list = await server.getMissionList()
     if isinstance(mission, int):
         if mission < 0 or mission >= len(mission_list):
-            return MissionLoadResult(
+            result = MissionLoadResult(
                 success=False,
                 message=f"Mission index {mission} out of range (0-{len(mission_list)-1}).",
                 server_name=server_name,
             )
+            return await _audited(ctx, result, server)
         mission_file = mission_list[mission]
         mission_name = os.path.basename(mission_file[:-4])
         # STALE-PAGE GUARD: the console posts the row's LOGICAL name beside its index, so a row whose
@@ -533,7 +876,8 @@ async def load_mission(
         if expected_name:
             reason = await _stale_mission_refusal(server, mission_file, expected_name)
             if reason:
-                return MissionLoadResult(success=False, message=reason, server_name=server_name)
+                result = MissionLoadResult(success=False, message=reason, server_name=server_name)
+                return await _audited(ctx, result, server)
     else:
         mission_file = os.path.join(await server.get_missions_dir(), mission)
         if mission_file not in mission_list:
@@ -544,56 +888,68 @@ async def load_mission(
 
     if server.current_mission and mission_file == server.current_mission.filename:
         try:
-            await server.restart(modify_mission=modify_mission)
-            return MissionLoadResult(
+            # THE ALREADY-RUNNING MISSION: the load is a RESTART. ``preset`` / ``preset_name`` /
+            # ``announce`` are threaded through ``restart`` too (``core/data``), so a weather pick
+            # made for the mission that is already running is APPLIED by the same path — never
+            # silently dropped — and its NAME reaches the record on that branch as well.
+            await server.restart(modify_mission=modify_mission, preset=weather_pick,
+                                 preset_name=weather_name, announce=announce)
+            result = MissionLoadResult(
                 success=True,
-                message=f"Mission '{mission_name}' restarted.",
+                message=_loaded_message(mission_name, "restarted", weather_pick, weather_name),
                 server_name=server_name,
                 mission_name=mission_name,
             )
+            return await _audited(ctx, result, server)
         except Exception as ex:
             log.exception("load_mission (restart current) failed")
-            return MissionLoadResult(
+            result = MissionLoadResult(
                 success=False,
                 message=f"Failed to restart current mission: {ex}",
                 server_name=server_name,
                 mission_name=mission_name,
             )
+            return await _audited(ctx, result, server)
 
     try:
         if not server.locals.get("mission_rewrite", True) and server.status != Status.STOPPED:
             await server.stop()
         success = await server.loadMission(
-            mission_file, modify_mission=modify_mission, use_orig=use_orig
+            mission_file, modify_mission=modify_mission, use_orig=use_orig,
+            preset=weather_pick, preset_name=weather_name, announce=announce
         )
         if not success:
-            return MissionLoadResult(
+            result = MissionLoadResult(
                 success=False,
                 message=f"Mission '{mission_name}' NOT loaded. Check installed terrains/mods.",
                 server_name=server_name,
                 mission_name=mission_name,
             )
-        return MissionLoadResult(
+            return await _audited(ctx, result, server)
+        result = MissionLoadResult(
             success=True,
-            message=f"Mission '{mission_name}' loaded.",
+            message=_loaded_message(mission_name, "loaded", weather_pick),
             server_name=server_name,
             mission_name=mission_name,
         )
+        return await _audited(ctx, result, server)
     except (TimeoutError, asyncio.TimeoutError):
-        return MissionLoadResult(
+        result = MissionLoadResult(
             success=False,
             message=f"Timeout while loading mission '{mission_name}'.",
             server_name=server_name,
             mission_name=mission_name,
         )
+        return await _audited(ctx, result, server)
     except Exception as ex:
         log.exception("load_mission failed")
-        return MissionLoadResult(
+        result = MissionLoadResult(
             success=False,
             message=f"Failed to load mission: {ex}",
             server_name=server_name,
             mission_name=mission_name,
         )
+        return await _audited(ctx, result, server)
 
 
 # ── Mission rotation: making a configured mission the START one ──────────────
@@ -881,9 +1237,11 @@ _R = TypeVar("_R", bound=ActionResult)
 async def _audited(ctx: Any, result: _R, server: Any = None) -> _R:
     """Write the trail for *result* and return it (design §5.3 D1).
 
-    ONE place, so every exit of :func:`message_player` and :func:`message_server` — the successes,
-    the typed refusals and the failed sends — leaves exactly one entry, and none of them can forget
-    the one mechanism.
+    ONE place, so every exit of :func:`message_player`, :func:`message_server` and the eight
+    lifecycle actions (``start_server`` / ``stop_server`` / ``restart_server`` / ``pause_mission`` /
+    ``unpause_mission`` / ``restart_mission`` / ``rotate_mission`` / ``load_mission``) — the
+    successes, the typed refusals and the failed sends — leaves exactly one entry, and none of them
+    can forget the one mechanism.
     """
     await audit_action(ctx, result, server=server)
     return result
@@ -1547,7 +1905,7 @@ async def ban_ucid(ctx: Any, ucid: str, reason: str, days: str | int | None = No
     return await _audited(ctx, result)
 
 
-@action
+@action(kind="read")
 async def list_bans(ctx: Any) -> ActionResult:
     """The bans the caller may see, built FROM the caller's target set.
 
@@ -1578,6 +1936,811 @@ async def list_bans(ctx: Any) -> ActionResult:
         return ActionResult(success=False, message=_("The ban list could not be read: {}").format(ex))
     return ActionResult(success=True, data={"bans": entries, "targets": tuple(targets),
                                             "servers": tuple(servers)})
+
+
+# ── The player reads: the directory, one player, one player's statistics ──
+#
+# All three are CONSOLE-TRANSPORT ONLY, for the reason the ban reads are: their scope rule is
+# ``ctx._scope`` (through :func:`_caller_ban_targets` / :func:`_caller_ban_unrestricted`), and a
+# transport that carries no scope — REST, MCP — would read as GLOBAL, i.e. every player of the
+# installation. They refuse such a caller instead of guessing, and the refusal is typed.
+#
+# A PLAYER IS A DISCORD LINK, NOT A UCID: ``players`` holds one row per UCID, and every UCID the
+# same ``discord_id`` names is the same person (an unlinked UCID, ``discord_id = -1``, is its own).
+# The rows are grouped in the SAME statement that paginates them, so "one row per player" and "50
+# rows a page" cannot disagree — the total comes back with the page (``count(*) OVER ()``).
+#
+# SCOPE. ``players`` carries no server column, so the only reading of "a player of mine" the schema
+# can express is "seen on a server of my set" — the ``statistics`` rows joined to ``missions``. That
+# is the same presence bound the console's player search is held to, and it is a WHERE term, never a
+# filter applied after the read. A narrowed caller whose own set is EMPTY therefore reads nothing
+# (``servers = []``), which is what tells it apart from an unscoped caller (``servers = None``).
+
+#: The refusal a non-console caller of a player read meets. Untranslated on purpose: a msgid with no
+#: catalog entry would read as English anyway, and this module's catalogs are not this read's to
+#: extend.
+PLAYERS_CONSOLE_ONLY = "The player list is only available in the web console."
+
+#: The refusal when this process has no connection pool to read from.
+PLAYERS_UNAVAILABLE = "The player list is not available in this installation."
+
+#: How many players one directory page holds. The console's view layer publishes the same number for
+#: its pager (``readmodels.views.PLAYER_DIRECTORY_PAGE_SIZE``); a test pins the two equal rather than
+#: letting one move without the other.
+PLAYER_DIRECTORY_PAGE_SIZE = 50
+
+#: How many of a player's last sessions the statistics read returns.
+PLAYER_RECENT_SESSIONS = 10
+
+#: How many of a player's most recent infraction events the infractions read returns — the report's
+#: own ``limit`` input, and the same ten its Discord render draws.
+PLAYER_INFRACTION_EVENTS = 10
+
+#: The SHAPE of a UCID: 32 hexadecimal characters, which is what every player key is. Checked before
+#: a UCID reaches a statement, and the only shape the console's player page accepts either.
+_PLAYER_UCID_SHAPE = re.compile(r"[0-9a-f]{32}")
+
+#: The directory table's own key in the console's view layer (``readmodels.views.PAGE_COLUMNS``).
+_DIRECTORY_TABLE = "player_directory"
+
+#: The directory's ORDER BY, keyed by the SORTABLE COLUMN KEYS of ``_DIRECTORY_TABLE``. The value is
+#: the closed lookup: a ``?sort=`` that is not one of these keys never reaches the statement (the
+#: read normalises it against the SAME allow-list first, and the fallback here is the default column).
+_DIRECTORY_ORDER: dict[str, str] = {
+    "name": "lower((g.names)[1])",
+    "ucid": "lower((g.ucids)[1])",
+    "discord": "g.discord_id",
+    "last_seen": "g.last_seen",
+    "playtime": "g.playtime",
+    "state": "lower(g.state)",
+}
+
+#: The directory page. Parameterised everywhere except the ORDER BY, whose expression comes from
+#: :data:`_DIRECTORY_ORDER` and whose direction is ``ASC``/``DESC`` from the validated pair.
+#
+# The playtime aggregate runs over ``statistics`` ONCE, grouped per UCID, and is summed per player by
+# the grouping CTE — the same aggregate answers the column, and nothing re-queries per row. A player
+# with no statistics row keeps a NULL playtime (never ``0``), so the page can render an empty cell.
+_DIRECTORY_SQL = """
+WITH playtime AS (
+    SELECT s.player_ucid AS ucid,
+           SUM(EXTRACT(EPOCH FROM (COALESCE(s.hop_off, (now() AT TIME ZONE 'utc')) - s.hop_on)))
+               ::bigint AS seconds
+      FROM statistics s
+     GROUP BY s.player_ucid
+),
+scoped AS (
+    SELECT DISTINCT s.player_ucid AS ucid
+      FROM statistics s
+      JOIN missions m ON m.id = s.mission_id
+     WHERE m.server_name = ANY(%(servers)s::text[])
+),
+per_ucid AS (
+    SELECT p.ucid, p.name, p.discord_id, p.first_seen, p.last_seen, p.vip,
+           pt.seconds AS playtime,
+           EXISTS (SELECT 1 FROM bans b
+                    WHERE b.ucid = p.ucid
+                      AND b.banned_until >= (now() AT TIME ZONE 'utc')
+                      AND (%(servers)s::text[] IS NULL
+                           OR b.server_name = ANY(%(servers)s::text[]))) AS banned,
+           EXISTS (SELECT 1 FROM watchlist w WHERE w.player_ucid = p.ucid) AS watched
+      FROM players p
+      LEFT OUTER JOIN playtime pt ON pt.ucid = p.ucid
+     WHERE %(servers)s::text[] IS NULL OR p.ucid IN (SELECT ucid FROM scoped)
+),
+grouped AS (
+    SELECT COALESCE(NULLIF(discord_id, -1)::text, ucid) AS player_key,
+           array_agg(name ORDER BY last_seen DESC NULLS LAST) AS names,
+           array_agg(DISTINCT ucid) AS ucids,
+           MAX(discord_id) AS discord_id,
+           MIN(first_seen) AS first_seen,
+           MAX(last_seen) AS last_seen,
+           bool_or(vip) AS vip,
+           bool_or(banned) AS banned,
+           bool_or(watched) AS watched,
+           SUM(playtime) AS playtime,
+           concat_ws(' ', CASE WHEN bool_or(banned) THEN 'banned' END,
+                          CASE WHEN bool_or(watched) THEN 'watched' END,
+                          CASE WHEN bool_or(vip) THEN 'vip' END) AS state
+      FROM per_ucid
+     GROUP BY 1
+)
+SELECT g.player_key, g.names, g.ucids, g.discord_id, g.first_seen, g.last_seen,
+       g.vip, g.banned, g.watched, g.playtime, g.state,
+       count(*) OVER () AS total
+  FROM grouped g
+ WHERE (%(needle)s = ''
+    OR EXISTS (SELECT 1 FROM unnest(g.ucids) AS u WHERE u ILIKE %(pattern)s ESCAPE '\\')
+    OR EXISTS (SELECT 1 FROM unnest(g.names) AS n WHERE n ILIKE %(pattern)s ESCAPE '\\'))
+{state} ORDER BY {order}
+ LIMIT %(limit)s OFFSET %(offset)s
+"""
+
+#: The directory's STATE views, keyed by the ``?show=`` vocabulary the console serves. The
+#: value is the predicate ADDED to the statement's WHERE, BEFORE the page is cut, so the rows,
+#: the total, the count sentence and the pager all describe the FILTERED set. ``all`` adds
+#: nothing, i.e. the whole directory; a key outside this allow-list never reaches the SQL.
+_DIRECTORY_STATES: dict[str, str] = {
+    "all": "",
+    "banned": "   AND g.banned\n",
+    "watched": "   AND g.watched\n",
+}
+
+#: The player's own row, by the ucid the page asked for.
+_PLAYER_SQL = """
+SELECT ucid, name, discord_id, manual, first_seen, last_seen, vip
+  FROM players
+ WHERE ucid = %(ucid)s
+"""
+
+#: Every UCID of ONE Discord link, most recently seen first — the identity list of a player page.
+_PLAYER_UCIDS_SQL = """
+SELECT ucid, name, manual
+  FROM players
+ WHERE discord_id = %(discord_id)s
+ ORDER BY last_seen DESC NULLS LAST, ucid
+"""
+
+#: The presence bound, for a NARROWED caller: is any UCID of this player seen on a server of the set?
+_PLAYER_SCOPE_SQL = """
+SELECT EXISTS (
+    SELECT 1
+      FROM statistics s
+      JOIN missions m ON m.id = s.mission_id
+     WHERE s.player_ucid = ANY(%(ucids)s::text[])
+       AND m.server_name = ANY(%(servers)s::text[])
+) AS present
+"""
+
+#: A player's playtime and session count over every UCID of the link.
+_PLAYER_TOTALS_SQL = """
+SELECT SUM(EXTRACT(EPOCH FROM (COALESCE(s.hop_off, (now() AT TIME ZONE 'utc')) - s.hop_on)))
+           ::bigint AS playtime,
+       COUNT(*) AS sessions
+  FROM statistics s
+ WHERE s.player_ucid = ANY(%(ucids)s::text[])
+"""
+
+#: The player's watchlist entry — one row per UCID, so the newest of the link's rows is the entry.
+_WATCH_SQL = """
+SELECT player_ucid AS ucid, reason, created_by, created_at
+  FROM watchlist
+ WHERE player_ucid = ANY(%(ucids)s::text[])
+ ORDER BY created_at DESC NULLS LAST
+ LIMIT 1
+"""
+
+# ── the player's infractions ────────────────────────────────────────────────
+#
+# THE DEFINITIONS ARE THE PUNISHMENT PLUGIN'S, NOT THIS MODULE'S. "An infraction" is the report the
+# plugin renders (``plugins/punishment/reports/events.json``) and "a penalty point" is the row the
+# ``/penalty`` command lists (``plugins/punishment/commands.py``). Both are read from their own
+# owners and only FORMATTED here, so the website cannot drift from Discord about what counts:
+#
+# * the friendly-fire and the ban-history statements are the report file's OWN SQL strings, loaded
+#   where the bot's report loader looks for them (a deployment's ``reports/punishment/`` override
+#   first, the shipped file second) and formatted with the same two placeholders the report fills;
+# * the penalty statement is the ``/penalty`` command's query, verbatim.
+#
+# The report's colour escapes are Discord EMBED presentation (``ansi_colors``), so they are stripped
+# where the rows reach the console.
+
+#: The punishment plugin's report that defines the infractions, and its shipped location.
+_PUNISHMENT_REPORT_PLUGIN = "punishment"
+_PUNISHMENT_REPORT_FILE = "events.json"
+
+#: Which statement of that report answers which list, keyed by a fragment every one of its bodies
+#: carries. The report's own element ORDER is what the lookup walks, so a reordered file still
+#: resolves to the same two readings.
+_REPORT_MARKERS: tuple[tuple[str, str], ...] = (("infractions", "missionstats"),
+                                                ("ban_history", " FROM bans "))
+
+#: The ``/penalty`` command's query, verbatim: one row per decayed event, newest first.
+_PENALTY_SQL = """
+SELECT event, points, time
+  FROM pu_events
+ WHERE init_id = %(ucid)s
+ ORDER BY time DESC
+"""
+
+#: Discord's ANSI colouring, as the report's SQL builds it — an escape sequence, an embed concern.
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _punishment_report() -> dict:
+    """The punishment plugin's infraction report, parsed.
+
+    Read the way the bot's own report loader resolves a report: a deployment's
+    ``reports/<plugin>/<file>`` override wins over the shipped ``plugins/<plugin>/reports/<file>``,
+    and the source tree is the last resort (so a console started from another working directory
+    still finds the file it ships with). Raises for a file that is absent or not JSON — the caller
+    turns that into a failed read, never into a page that invents infractions.
+    """
+    from pathlib import Path
+
+    candidates = (Path("reports") / _PUNISHMENT_REPORT_PLUGIN / _PUNISHMENT_REPORT_FILE,
+                  Path("plugins") / _PUNISHMENT_REPORT_PLUGIN / "reports" / _PUNISHMENT_REPORT_FILE,
+                  Path(__file__).resolve().parents[2] / "plugins" / _PUNISHMENT_REPORT_PLUGIN
+                  / "reports" / _PUNISHMENT_REPORT_FILE)
+    for candidate in candidates:
+        if candidate.is_file():
+            with candidate.open(encoding="utf-8") as handle:
+                return json.load(handle)
+    raise FileNotFoundError(_PUNISHMENT_REPORT_FILE)
+
+
+def _punishment_active(ctx: Any) -> bool:
+    """Whether the punishment plugin is loaded on this process's node."""
+    node = getattr(ctx, "node", None)
+    if node is None:
+        return False
+    try:
+        from core.plugin_manager import PluginManager
+
+        names = list(PluginManager(node).plugins)
+    except Exception:  # noqa: BLE001 - a node that cannot answer holds no plugin
+        names = list(getattr(node, "plugins", None) or ())
+    return "punishment" in {str(name).lower() for name in names}
+
+
+def report_statements(report: dict) -> dict[str, str]:
+    """The report's two player statements, keyed ``infractions`` / ``ban_history``.
+
+    Every ``SQLTable`` element of the report is a candidate and the marker decides which list it
+    answers, so the two readings are found by what their SQL is ABOUT rather than by an index a
+    report edit would move.
+    """
+    found: dict[str, str] = {}
+    for element in report.get("elements") or ():
+        if not isinstance(element, dict) or element.get("type") != "SQLTable":
+            continue
+        sql = str((element.get("params") or {}).get("sql") or "")
+        for name, marker in _REPORT_MARKERS:
+            if marker in sql:
+                found.setdefault(name, sql)
+    missing = [name for name, _ in _REPORT_MARKERS if name not in found]
+    if missing:
+        raise ValueError(f"the infraction report carries no {', '.join(missing)} statement")
+    return found
+
+#: The statistics totals. Every figure is the bot's own definition (``plugins/userstats``): the AI
+#: and player kill/death split, and ``selfkills`` as the deaths no listed cause explains.
+_STATS_TOTALS_SQL = """
+SELECT SUM(EXTRACT(EPOCH FROM (COALESCE(s.hop_off, (now() AT TIME ZONE 'utc')) - s.hop_on)))
+           ::bigint AS playtime,
+       COUNT(*) AS sessions,
+       COALESCE(SUM(s.kills), 0) AS kills,
+       COALESCE(SUM(s.pvp), 0) AS pvp,
+       COALESCE(SUM(s.deaths), 0) AS deaths,
+       COALESCE(SUM(s.ejections), 0) AS ejections,
+       COALESCE(SUM(s.crashes), 0) AS crashes,
+       COALESCE(SUM(s.takeoffs), 0) AS takeoffs,
+       COALESCE(SUM(s.landings), 0) AS landings,
+       COALESCE(SUM(s.teamkills), 0) AS teamkills,
+       COALESCE(SUM(s.deaths_planes + s.deaths_helicopters + s.deaths_ships + s.deaths_sams
+                    + s.deaths_ground - s.deaths_pvp), 0) AS deaths_ai,
+       COALESCE(SUM(s.deaths_pvp), 0) AS deaths_pvp,
+       COALESCE(SUM(GREATEST(s.deaths, s.crashes) - s.deaths_planes - s.deaths_helicopters
+                    - s.deaths_ships - s.deaths_sams - s.deaths_ground), 0) AS selfkills
+  FROM statistics s
+  JOIN missions m ON m.id = s.mission_id
+ WHERE s.player_ucid = ANY(%(ucids)s::text[]) AND {period}
+"""
+
+#: Kills by the TYPE of the target, as the Discord chart groups them.
+_STATS_KILL_TYPES_SQL = """
+SELECT COALESCE(SUM(s.kills_planes), 0) AS planes,
+       COALESCE(SUM(s.kills_helicopters), 0) AS helicopters,
+       COALESCE(SUM(s.kills_ships), 0) AS ships,
+       COALESCE(SUM(s.kills_sams), 0) AS sams,
+       COALESCE(SUM(s.kills_ground), 0) AS ground
+  FROM statistics s
+  JOIN missions m ON m.id = s.mission_id
+ WHERE s.player_ucid = ANY(%(ucids)s::text[]) AND {period}
+"""
+
+#: One playtime breakdown. ``{column}`` is ONE of the three closed group-by expressions below, never
+#: a value from the request.
+_STATS_PLAYTIME_SQL = """
+SELECT {column} AS label,
+       SUM(EXTRACT(EPOCH FROM (COALESCE(s.hop_off, (now() AT TIME ZONE 'utc')) - s.hop_on)))
+           ::bigint AS playtime
+  FROM statistics s
+  JOIN missions m ON m.id = s.mission_id
+ WHERE s.player_ucid = ANY(%(ucids)s::text[]) AND {period}
+ GROUP BY 1
+ ORDER BY 2 DESC NULLS LAST, 1
+"""
+
+#: The closed set of breakdown columns, keyed by the name the action reports them under.
+_STATS_BREAKDOWNS: dict[str, str] = {"per_module": "s.slot", "per_server": "m.server_name",
+                                     "per_map": "m.mission_theatre"}
+
+#: The player's last sessions, newest first.
+_STATS_RECENT_SQL = """
+SELECT s.hop_on, s.hop_off, s.slot, m.server_name, m.mission_theatre,
+       EXTRACT(EPOCH FROM (COALESCE(s.hop_off, (now() AT TIME ZONE 'utc')) - s.hop_on))::bigint
+           AS playtime
+  FROM statistics s
+  JOIN missions m ON m.id = s.mission_id
+ WHERE s.player_ucid = ANY(%(ucids)s::text[]) AND {period}
+ ORDER BY s.hop_on DESC
+ LIMIT %(limit)s
+"""
+
+
+def _like_escape(value: str) -> str:
+    """*value* with the LIKE metacharacters escaped, for a BOUND ``ILIKE`` parameter.
+
+    The statement declares ``ESCAPE '\\'``, so a search for ``%`` or ``_`` matches those characters
+    instead of acting as a wildcard. Escaping is a formatting concern of the PATTERN, not of the
+    value: the value itself still travels as a bound parameter.
+    """
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _directory_order(key: str, direction: str) -> str:
+    """The directory's ORDER BY clause: a closed-lookup expression and a validated direction.
+
+    Nothing from the request is interpolated: *key* is already normalised against the table's column
+    allow-list and *direction* is one of ``asc``/``desc``, so the clause can only be one this module
+    wrote. The player key is the tie-break, so paging cannot repeat or skip a row.
+    """
+    expression = _DIRECTORY_ORDER.get(key) or _DIRECTORY_ORDER["name"]
+    return f"{expression} {direction.upper()} NULLS LAST, g.player_key"
+
+
+def _directory_state(value: Any) -> str:
+    """The directory's state view in force: a key of :data:`_DIRECTORY_STATES`.
+
+    A closed vocabulary like the sort keys: a value the console does not serve is the whole
+    directory, so no request text ever reaches the statement.
+    """
+    wanted = str(value or "").strip().lower()
+    return wanted if wanted in _DIRECTORY_STATES else "all"
+
+
+async def _fetch_all(conn: Any, statement: str, params: Any) -> list[dict]:
+    """Every row of *statement* as a plain dict (the read models must not see driver row objects)."""
+    from psycopg.rows import dict_row
+
+    async with conn.cursor(row_factory=dict_row) as cursor:
+        await cursor.execute(statement, params)
+        return [dict(row) async for row in cursor]
+
+
+async def _fetch_one(conn: Any, statement: str, params: Any) -> dict:
+    """The first row of *statement* as a dict, or ``{}`` when it answered none."""
+    rows = await _fetch_all(conn, statement, params)
+    return rows[0] if rows else {}
+
+
+def _player_pool(ctx: Any) -> Any:
+    """The pool the player reads run on: this process node's ``apool``, or ``None``."""
+    return getattr(getattr(ctx, "node", None), "apool", None)
+
+
+async def _member_names(ctx: Any, discord_ids: Iterable[Any], fetch: bool = False) -> dict[int, str]:
+    """The Discord member names for *discord_ids*, keyed by id.
+
+    The value is the member's SHOWN name (nickname, else global name, else username). Names are UI,
+    not data: a member this process cannot resolve is an ABSENT entry, never an error, so a caller
+    without a Discord connection renders the same page with the id alone.
+
+    ``fetch`` True allows a bounded REST lookup for ids the cache does not hold; it is for reads of
+    ONE player. A list keeps it False so a page render never becomes a burst of API calls.
+    """
+    from services.webservice.readmodels.serverconfig import live_bot
+
+    wanted: set[int] = set()
+    for item in discord_ids:
+        try:
+            value = int(item)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            wanted.add(value)
+    if not wanted:
+        return {}
+    bot = live_bot()
+    if bot is None:
+        return {}
+    try:
+        members = await bot.get_members(wanted, fetch=fetch)
+    except Exception:
+        log.exception("player read: the linked members could not be read")
+        return {}
+    return {int(user_id): str(getattr(member, "display_name", "") or "")
+            for user_id, member in (members or {}).items() if member is not None}
+
+
+def _player_servers(ctx: Any) -> list[str] | None:
+    """The server names a player read is bound to: ``None`` for an unscoped caller, else the set."""
+    return None if _caller_ban_unrestricted(ctx) else _caller_ban_targets(ctx)
+
+
+async def _player_ucids(conn: Any, row: dict) -> list[dict]:
+    """Every UCID of the player *row* names, most recently seen first (the row itself if unlinked)."""
+    try:
+        discord_id = int(row.get("discord_id"))
+    except (TypeError, ValueError):
+        discord_id = -1
+    if discord_id <= 0:
+        return [{"ucid": row.get("ucid"), "name": row.get("name"), "manual": row.get("manual")}]
+    linked = await _fetch_all(conn, _PLAYER_UCIDS_SQL, {"discord_id": discord_id})
+    if not any(entry.get("ucid") == row.get("ucid") for entry in linked):
+        linked.insert(0, {"ucid": row.get("ucid"), "name": row.get("name"),
+                          "manual": row.get("manual")})
+    return linked
+
+
+async def _player_in_scope(conn: Any, ucids: list[str], servers: list[str] | None) -> bool:
+    """Whether a player the caller may see: always for an unscoped caller, presence-bound otherwise.
+
+    ``players`` carries no server column, so the bound is the player's ``statistics`` rows joined to
+    ``missions`` — the same reading of "a player of mine" the directory uses. A narrowed caller whose
+    set is empty reaches nobody.
+    """
+    if servers is None:
+        return True
+    if not servers or not ucids:
+        return False
+    found = await _fetch_one(conn, _PLAYER_SCOPE_SQL, {"ucids": ucids, "servers": servers})
+    return bool(found.get("present"))
+
+
+def _period_filter(node: Any, period: str) -> Any:
+    """The bot's OWN period filter for *period*, and the period name it resolved to.
+
+    ``StatisticsFilter.detect`` is the bot's one definition of a period, so the console reads it
+    rather than inventing a second one. Only the PLAIN period vocabulary is accepted here (the names
+    ``PeriodFilter.list()`` publishes): a mission/campaign/month/theatre name would need the bot's
+    pools and would mean something different from what the page's switch offers, so anything detect
+    answers with a non-period filter — or with a name outside the vocabulary — is the ``all`` period.
+
+    Returns ``(filter, name)``.
+    """
+    from plugins.userstats.filter import PeriodFilter, StatisticsFilter
+
+    wanted = (period or "").strip().lower()
+    known = PeriodFilter.list(node)
+    if wanted not in known:
+        wanted = "all"
+    try:
+        # the adapter is what ``detect`` expects of a bot: a ``node`` (some filters read its pools).
+        # A context that cannot answer that raises nothing out of this function — the plain period
+        # filter is the same answer for every name this action accepts.
+        detected = StatisticsFilter.detect(cast(Any, types.SimpleNamespace(node=node)), wanted)
+    except Exception:
+        log.warning("player statistics: the period filter could not be detected, using '%s'", wanted)
+        detected = None
+    if type(detected) is not PeriodFilter or detected.period != wanted:
+        detected = PeriodFilter(wanted)
+    return detected, wanted
+
+
+@action(kind="read")
+async def list_player_directory(ctx: Any, q: str = "", page: str | int | None = None,
+                                sort: str = "", direction: str = "",
+                                state: str = "all") -> ActionResult:
+    """One row per PLAYER of the caller's scope, one PAGE at a time — the directory's read.
+
+    *q* is the ONE search box: it matches a DCS name or a UCID, trimmed and capped by the console's
+    own ``readmodels.views.normalise_query`` (never a second trimming rule) and matched as a BOUND
+    parameter. *page* is resolved by ``readmodels.views.normalise_page``: a non-numeric, negative or
+    past-the-end value is page 1, and the answer states the page it actually served.
+
+    *sort*/*direction* are validated against the ``player_directory`` table's own column allow-list,
+    and the ORDER BY is a closed lookup on that allow-list — the request never reaches the statement.
+
+    *state* is the restriction view in force (``all``/``banned``/``watched``), a closed lookup of
+    predicates ADDED to the same statement, so a restricted page is cut from the restricted set:
+    the rows, the total and the page count all describe what the view shows.
+
+    The answer carries the page's rows AND the total behind them (``total``, ``pages``,
+    ``per_page``), so the page can state "50 of 1,284" without a second read, and every row carries
+    the moderation state the row's chips are drawn from.
+    """
+    if ctx.transport != TRANSPORT_WEB:
+        return ActionResult(success=False, message=PLAYERS_CONSOLE_ONLY)
+    try:
+        from services.webservice.readmodels import views as view_layer
+    except Exception as ex:
+        log.exception("list_player_directory: the console's view layer could not be imported")
+        return ActionResult(success=False, message=f"The player list could not be read: {ex}")
+    query = view_layer.normalise_query(q)
+    key = view_layer.normalise_sort(_DIRECTORY_TABLE, sort)
+    wanted_direction = view_layer.normalise_direction(direction)
+    requested = view_layer.normalise_page(page)
+    pool = _player_pool(ctx)
+    if pool is None:
+        return ActionResult(success=False, message=PLAYERS_UNAVAILABLE)
+
+    servers = _player_servers(ctx)
+    wanted_state = _directory_state(state)
+    statement = _DIRECTORY_SQL.format(order=_directory_order(key, wanted_direction),
+                                      state=_DIRECTORY_STATES[wanted_state])
+    params = {"needle": query,
+              "pattern": f"%{_like_escape(query)}%" if query else "%",
+              "servers": servers, "limit": PLAYER_DIRECTORY_PAGE_SIZE}
+    served = requested
+    rows: list[dict] = []
+    total = 0
+    try:
+        async with pool.connection() as conn:
+            # the CLOSED RANGE: a page past the end is answered with the first one, so the reader is
+            # never handed an empty table for a number they typed. Only that case costs a second
+            # statement.
+            for attempt in dict.fromkeys((requested, 1)):
+                page_rows = await _fetch_all(conn, statement,
+                                             {**params, "offset": (attempt - 1) * PLAYER_DIRECTORY_PAGE_SIZE})
+                served = attempt
+                if page_rows:
+                    rows, total = page_rows, int(page_rows[0].get("total") or 0)
+                    break
+    except Exception as ex:
+        log.exception("list_player_directory failed")
+        return ActionResult(success=False, message=f"The player list could not be read: {ex}")
+
+    for row in rows:
+        row.pop("total", None)
+        row["ucid"] = (row.get("ucids") or [""])[0]
+    pages = max((total + PLAYER_DIRECTORY_PAGE_SIZE - 1) // PLAYER_DIRECTORY_PAGE_SIZE, 1)
+    return ActionResult(success=True, data={
+        "rows": rows, "total": total, "page": served, "pages": pages,
+        "per_page": PLAYER_DIRECTORY_PAGE_SIZE, "query": query,
+        "sort": key, "direction": wanted_direction, "state": wanted_state})
+
+
+@action(kind="read")
+async def get_player_detail(ctx: Any, ucid: str) -> ActionResult:
+    """ONE player by UCID: identity, link, presence, totals, and both moderation states.
+
+    The ucids the player's Discord link groups are read together, so a player with two UCIDs answers
+    with both (identity list, playtime summed, bans and watch searched over all of them).
+
+    The ACTIVE ban is the entry ``ServiceBus.bans`` already groups — its ``server_name`` is the list
+    of servers the ban covers, or ``None`` for a bot-wide one — and the ban read is SCOPED the way
+    the Bans page's is, so a manager sees the bans of their own servers and no others. The watch
+    entry is the newest ``watchlist`` row of the link (the table holds one per UCID and no expiry).
+
+    A player who is not found, or is outside a narrowed caller's scope, answers ``found`` False with
+    the SAME keys as a found one: the page renders one shape for every state, and a name outside the
+    caller's scope is not disclosed either way.
+    """
+    if ctx.transport != TRANSPORT_WEB:
+        return ActionResult(success=False, message=PLAYERS_CONSOLE_ONLY)
+    wanted = (ucid or "").strip()
+    if not wanted:
+        return ActionResult(success=False, message="A UCID is required.")
+    pool = _player_pool(ctx)
+    if pool is None:
+        return ActionResult(success=False, message=PLAYERS_UNAVAILABLE)
+
+    empty = {"ucid": wanted, "found": False, "identity": [], "name": "", "discord_id": -1,
+             "member": "", "vip": False, "first_seen": None, "last_seen": None,
+             "playtime": None, "sessions": None, "ban": None, "watch": None}
+    try:
+        async with pool.connection() as conn:
+            row = await _fetch_one(conn, _PLAYER_SQL, {"ucid": wanted})
+            if not row:
+                return ActionResult(success=True, data=empty)
+            identity = await _player_ucids(conn, row)
+            ucids = [entry["ucid"] for entry in identity if entry.get("ucid")]
+            servers = _player_servers(ctx)
+            if not await _player_in_scope(conn, ucids, servers):
+                return ActionResult(success=True, data=empty)
+            totals = await _fetch_one(conn, _PLAYER_TOTALS_SQL, {"ucids": ucids})
+            watch = await _fetch_one(conn, _WATCH_SQL, {"ucids": ucids})
+    except Exception as ex:
+        log.exception("get_player_detail failed")
+        return ActionResult(success=False, message=f"The player could not be read: {ex}")
+
+    ban = await _active_ban(ctx, ucids, servers)
+    names = await _member_names(ctx, [row.get("discord_id")], fetch=True)
+    return ActionResult(success=True, data={
+        "ucid": wanted,
+        "found": True,
+        "identity": identity,
+        "name": (identity[0].get("name") if identity else "") or row.get("name") or "",
+        "discord_id": row.get("discord_id", -1),
+        "member": names.get(int(row.get("discord_id") or -1), ""),
+        "vip": bool(row.get("vip")),
+        "first_seen": row.get("first_seen"),
+        "last_seen": row.get("last_seen"),
+        "playtime": totals.get("playtime"),
+        "sessions": totals.get("sessions"),
+        "ban": ban,
+        "watch": watch or None,
+    })
+
+
+async def _active_ban(ctx: Any, ucids: list[str], servers: list[str] | None) -> dict | None:
+    """The player's ACTIVE ban entry, grouped and scoped by the bus — ``None`` when there is none.
+
+    The ban list itself is the bus's own read, so the grouping of a ban's rows into one entry (its
+    ``server_name`` as a list, or ``None`` for a bot-wide ban) is not restated here. A ban list this
+    process cannot reach is an ABSENT ban, never a failed player page.
+    """
+    service = _ban_service(ctx)
+    if service is None:
+        return None
+    try:
+        entries = await service.bans(servers=tuple(servers) if servers is not None else None)
+    except Exception:
+        log.exception("get_player_detail: the ban list could not be read")
+        return None
+    mine = [entry for entry in entries if _entry_field(entry, "ucid") in ucids]
+    if not mine:
+        return None
+    return max(mine, key=lambda entry: _entry_field(entry, "banned_at") or datetime.min)
+
+
+@action(kind="read")
+async def get_player_statistics(ctx: Any, ucid: str, period: str = "all") -> ActionResult:
+    """The ``/statistics`` numbers of ONE player for ONE period — the statistics tab's read.
+
+    A SEPARATE action from :func:`get_player_detail` on purpose: the period re-reads on every switch,
+    so it must not drag the identity, the link and the moderation reads along with it.
+
+    *period* accepts exactly the names :meth:`plugins.userstats.filter.PeriodFilter.list` publishes
+    (``all``, ``today``, ``yesterday``, ``day``, ``week``, ``month``, ``quarter``, ``halfyear``,
+    ``year``) and ANYTHING else is ``all``; the filter itself is the bot's own
+    :func:`_period_filter`, so the console has no second definition of "a period".
+
+    Every figure is the bot's own (``plugins/userstats``): kills and the AI/player split, deaths by
+    AI/player/self, teamkills, the flight figures, kills by target type, the playtime breakdowns by
+    module/server/map, and the last ``PLAYER_RECENT_SESSIONS`` sessions.
+    """
+    if ctx.transport != TRANSPORT_WEB:
+        return ActionResult(success=False, message=PLAYERS_CONSOLE_ONLY)
+    wanted = (ucid or "").strip()
+    if not wanted:
+        return ActionResult(success=False, message="A UCID is required.")
+    pool = _player_pool(ctx)
+    if pool is None:
+        return ActionResult(success=False, message=PLAYERS_UNAVAILABLE)
+
+    node = getattr(ctx, "node", None)
+    flt, resolved = _period_filter(node, period)
+    clause = flt.filter(node)
+    try:
+        async with pool.connection() as conn:
+            row = await _fetch_one(conn, _PLAYER_SQL, {"ucid": wanted})
+            if not row:
+                return ActionResult(success=True, data={"ucid": wanted, "period": resolved,
+                                                        "totals": {}, "found": False})
+            identity = await _player_ucids(conn, row)
+            ucids = [entry["ucid"] for entry in identity if entry.get("ucid")]
+            if not await _player_in_scope(conn, ucids, _player_servers(ctx)):
+                return ActionResult(success=True, data={"ucid": wanted, "period": resolved,
+                                                        "totals": {}, "found": False})
+            params = {"ucids": ucids}
+            totals = await _fetch_one(conn, _STATS_TOTALS_SQL.format(period=clause), params)
+            kill_types = await _fetch_one(conn, _STATS_KILL_TYPES_SQL.format(period=clause), params)
+            breakdowns = {}
+            for name, column in _STATS_BREAKDOWNS.items():
+                breakdowns[name] = await _fetch_all(
+                    conn, _STATS_PLAYTIME_SQL.format(column=column, period=clause), params)
+            recent = await _fetch_all(conn, _STATS_RECENT_SQL.format(period=clause),
+                                      {**params, "limit": PLAYER_RECENT_SESSIONS})
+    except Exception as ex:
+        log.exception("get_player_statistics failed")
+        return ActionResult(success=False, message=f"The statistics could not be read: {ex}")
+
+    kills = int(totals.get("kills") or 0)
+    pvp = int(totals.get("pvp") or 0)
+    crashes = int(totals.get("crashes") or 0)
+    ejections = int(totals.get("ejections") or 0)
+    figures = {
+        "playtime": totals.get("playtime"),
+        "sessions": int(totals.get("sessions") or 0),
+        "kills": kills,
+        "ai_kills": kills - pvp,
+        "player_kills": pvp,
+        "deaths": int(totals.get("deaths") or 0),
+        "deaths_ai": int(totals.get("deaths_ai") or 0),
+        "deaths_player": int(totals.get("deaths_pvp") or 0),
+        "selfkills": int(totals.get("selfkills") or 0),
+        "teamkills": int(totals.get("teamkills") or 0),
+        "takeoffs": int(totals.get("takeoffs") or 0),
+        "landings": int(totals.get("landings") or 0),
+        "ejections": ejections,
+        # the pilot-dead count the Discord embed draws: a crash that never left the aircraft
+        "crashes": max(crashes - ejections, 0),
+    }
+    return ActionResult(success=True, data={
+        "ucid": wanted, "period": resolved, "found": True, "totals": figures,
+        "kills_by_type": [{"label": label, "count": int(kill_types.get(label) or 0)}
+                          for label in ("planes", "helicopters", "ships", "sams", "ground")],
+        **breakdowns,
+        "recent": recent,
+    })
+
+
+@action(kind="read")
+async def get_player_infractions(ctx: Any, ucid: str) -> ActionResult:
+    """ONE player's infractions: the friendly-fire events, the penalty log and the ban history.
+
+    THE THREE LISTS COME FROM THE PUNISHMENT PLUGIN'S OWN DEFINITIONS — the report file for the
+    events and the ban history, the ``/penalty`` command's statement for the points (see the module
+    constants above), so the console and Discord cannot disagree about what an infraction is.
+
+    The report reads ONE UCID (``init_id``), so this reads the page's UCID and nothing wider: a
+    player's other UCIDs are other rows in every one of these tables.
+
+    ``penalties_available`` states whether ``pu_events`` could be read at all: the penalty log is the
+    punishment plugin's table, so with that plugin unloaded the statement does not run, the two
+    lists the plugin does not own still answer, and the flag is ``False``.
+
+    The scope is the player read's own bound (``_player_in_scope``): a player outside a narrowed
+    caller's servers answers the same empty answer a UCID nothing knows does, so infractions are not
+    a way around the directory's scope.
+
+    ``penalty_total`` is the SUM of the log's own rows, exactly as ``/penalty`` computes it — the
+    points decay over time, so the total is today's value and the page says so.
+    """
+    if ctx.transport != TRANSPORT_WEB:
+        return ActionResult(success=False, message=PLAYERS_CONSOLE_ONLY)
+    wanted = (ucid or "").strip().lower()
+    if not _PLAYER_UCID_SHAPE.fullmatch(wanted):
+        return ActionResult(success=False, message="A UCID is 32 hexadecimal characters.")
+    pool = _player_pool(ctx)
+    if pool is None:
+        return ActionResult(success=False, message=PLAYERS_UNAVAILABLE)
+    # ``pu_events`` is the OPTIONAL punishment plugin's table (its own migrations create it), so the
+    # penalty statement may only run while that plugin is loaded on this node.
+    active = _punishment_active(ctx)
+    empty = {"ucid": wanted, "found": False, "infractions": [], "penalties": [],
+             "penalty_total": 0.0, "penalties_available": active, "ban_history": []}
+    try:
+        statements = report_statements(_punishment_report())
+        infractions_sql = statements["infractions"].format(ucid=wanted,
+                                                           limit=PLAYER_INFRACTION_EVENTS)
+        history_sql = statements["ban_history"].format(ucid=wanted)
+        async with pool.connection() as conn:
+            row = await _fetch_one(conn, _PLAYER_SQL, {"ucid": wanted})
+            if not row:
+                return ActionResult(success=True, data=empty)
+            identity = await _player_ucids(conn, row)
+            ucids = [entry["ucid"] for entry in identity if entry.get("ucid")]
+            if not await _player_in_scope(conn, ucids, _player_servers(ctx)):
+                return ActionResult(success=True, data=empty)
+            events = await _fetch_all(conn, infractions_sql, None)
+            penalties = await _fetch_all(conn, _PENALTY_SQL, {"ucid": wanted}) if active else []
+            history = await _fetch_all(conn, history_sql, None)
+    except Exception as ex:
+        log.exception("get_player_infractions failed")
+        return ActionResult(success=False, message=f"The infractions could not be read: {ex}")
+
+    total = 0.0
+    for penalty in penalties:
+        try:
+            total += float(penalty.get("points") or 0)
+        except (TypeError, ValueError):
+            continue
+    return ActionResult(success=True, data={
+        "ucid": wanted,
+        "found": True,
+        "infractions": [{"time": item.get("Time"), "infraction": _plain(item.get("Infraction")),
+                         "count": item.get("Count")} for item in events],
+        "penalties": [{"time": item.get("time"), "event": _plain(item.get("event")),
+                       "points": item.get("points")} for item in penalties],
+        "penalty_total": total,
+        "penalties_available": active,
+        "ban_history": [{"timeframe": _plain(item.get("Timeframe")),
+                         "reason": _plain(item.get("Reason")),
+                         "status": _plain(item.get("Status"))} for item in history],
+    })
+
+
+def _plain(value: Any) -> str:
+    """One report cell as the console renders it: Discord's colour escapes removed, whitespace folded.
+
+    The report's SQL paints its columns for a Discord embed; the console's tables are plain text, so
+    the escapes are dropped here rather than in a second copy of the query.
+    """
+    return " ".join(_ANSI.sub("", str(value or "")).split())
 
 
 def _active_players(server: Any) -> list[Any]:
@@ -1623,7 +2786,7 @@ def _present_ucids(ctx: Any) -> list[str]:
     return out
 
 
-@action
+@action(kind="read")
 async def search_players(ctx: Any, query: str = "") -> ActionResult:
     """The players whose NAME or UCID matches *query* — the console's ban ADD autocompletes on it.
 
@@ -1801,6 +2964,208 @@ async def edit_ban(ctx: Any, ucid: str, banned_at: str, reason: str,
     return await _audited(ctx, result)
 
 
+# ── The watchlist writes ────────────────────────────────────────────────────
+#
+# A watch ENTRY is ONE row per UCID (``plugins/mission/db/tables.sql``): ``reason``, ``created_by``,
+# ``created_at`` — and NO expiry, so no write here states one. The trio mirrors the ban entry's
+# add/lift/edit: the ADD inserts the row, the REMOVE deletes it, and the EDIT rewrites ``reason``
+# alone, because ``created_by``/``created_at`` record who watched the player and when (re-stamping
+# them on an edit would rewrite that history).
+#
+# NONE OF THEM needs a server or a live session: a watch entry is a bot-wide fact keyed on the UCID,
+# so all three work for a player who is OFFLINE.
+#
+# BOTH TRANSPORTS: the console's three controls and the Discord ``watch`` group call these SAME
+# functions (``plugins/mission/views.py``), so one write path serves both surfaces and the one that
+# needs no Discord at all is not the poorer one.
+
+#: The longest watch REASON a write accepts — the limit the Discord modal's own field carries
+#: (``plugins/mission/views.py``), so a typed reason and a posted one are bounded alike.
+MAX_WATCH_REASON_LENGTH = 80
+
+#: The statement the REMOVE and the EDIT refusals share: an entry that does not exist, a player
+#: outside the caller's scope and a crafted UCID must be indistinguishable, or the capability becomes
+#: a probe.
+_WATCH_NO_ENTRY = "No watch entry for {} in your scope."
+
+
+async def _watch_scope_refusal(conn: Any, ctx: Any, ucid: str, refusal: str = "") -> str:
+    """The refusal for a watch write *ctx* may not make, or ``""`` when it may run.
+
+    An UNSCOPED caller passes unconditionally — it may watch a player this installation has never
+    seen, which is the case the ADD exists for. A NARROWED one is bound to the players seen on the
+    servers of its own view (:func:`_player_in_scope`): ``players`` carries no server column, so
+    presence is the only reading of "a player of mine" the schema can express.
+
+    *refusal* is the sentence this write answers when the player is unknown or outside the scope;
+    empty means the REMOVE/EDIT wording, which is the same for both so a holder of the capability
+    cannot probe what exists.
+    """
+    servers = _player_servers(ctx)
+    if servers is None:
+        return ""
+    message = refusal or _(_WATCH_NO_ENTRY).format(ucid)
+    row = await _fetch_one(conn, _PLAYER_SQL, {"ucid": ucid})
+    if not row:
+        return message
+    ucids = [entry["ucid"] for entry in await _player_ucids(conn, row) if entry.get("ucid")]
+    if not await _player_in_scope(conn, ucids, servers):
+        return message
+    return ""
+
+
+@action
+async def watch_player(ctx: Any, ucid: str, reason: str, sender: str = "") -> PlayerActionResult:
+    """Put ONE player on the watchlist — the console's Add and Discord's ``watch add``.
+
+    The CREATE path, and the only one: the INSERT is a single statement with
+    ``ON CONFLICT (player_ucid) DO NOTHING``, so its affected-row count IS the answer to "was this
+    player already on the list" — no read-then-write window, and no ``UniqueViolation`` for a caller
+    to catch. A UCID that already holds an entry is refused with a sentence and nothing is rewritten.
+
+    ``created_by`` records who watched the player and when the row is stamped: the acting person's
+    shown name (*sender*, read off the request's identity on the console and never from the body), or
+    the transport's own audit actor when the caller states none.
+    """
+    value = (ucid or "").strip()
+    body = (reason or "").strip()
+    if not value:
+        return await _audited(ctx, PlayerActionResult(
+            success=False, message=_("A UCID is required."), ucid=value))
+    if not body:
+        return await _audited(ctx, PlayerActionResult(
+            success=False,
+            message=_("A reason is required to put a player on the watchlist."), ucid=value))
+    if len(body) > MAX_WATCH_REASON_LENGTH:
+        return await _audited(ctx, PlayerActionResult(
+            success=False,
+            message=_("The watch reason is longer than {} characters.")
+                        .format(MAX_WATCH_REASON_LENGTH),
+            ucid=value))
+    pool = _player_pool(ctx)
+    if pool is None:
+        return await _audited(ctx, PlayerActionResult(
+            success=False, message=PLAYERS_UNAVAILABLE, ucid=value))
+    created_by = (sender or "").strip() or ctx.audit_actor
+    try:
+        async with pool.connection() as conn:
+            refusal = await _watch_scope_refusal(
+                conn, ctx, value, _("Player {} is not one of your players.").format(value))
+            if refusal:
+                return await _audited(ctx, PlayerActionResult(
+                    success=False, message=refusal, ucid=value))
+            cursor = await conn.execute(
+                "INSERT INTO watchlist (player_ucid, reason, created_by) VALUES (%s, %s, %s) "
+                "ON CONFLICT (player_ucid) DO NOTHING",
+                (value, body, created_by))
+            added = cursor.rowcount or 0
+    except Exception as ex:
+        log.exception("watch_player failed")
+        return await _audited(ctx, PlayerActionResult(
+            success=False, message=_("The watchlist could not be written: {}").format(ex),
+            ucid=value))
+    if not added:
+        return await _audited(ctx, PlayerActionResult(
+            success=False,
+            message=_("Player {} was already on the watchlist.").format(value), ucid=value))
+    return await _audited(ctx, PlayerActionResult(
+        success=True, message=_("Player {} is now on the watchlist.").format(value), ucid=value))
+
+
+@action
+async def unwatch_player(ctx: Any, ucid: str) -> PlayerActionResult:
+    """Remove ONE player's watchlist entry — the console's Remove and Discord's watch removal.
+
+    ONE row per UCID, so the delete names the clicked UCID and leaves the player's other UCIDs
+    untouched. A caller bound to its own servers may only change an entry of a player it may see
+    (:func:`_watch_scope_refusal`).
+
+    A refusal writes NOTHING: an empty UCID, a player this caller may not see, and a UCID holding no
+    watch entry all answer the same sentence, and every outcome — refusals included — leaves exactly
+    one audit entry.
+    """
+    value = (ucid or "").strip()
+    pool = _player_pool(ctx)
+    if not value:
+        return await _audited(ctx, PlayerActionResult(
+            success=False, message=_("A UCID is required."), ucid=value))
+    if pool is None:
+        return await _audited(ctx, PlayerActionResult(
+            success=False, message=PLAYERS_UNAVAILABLE, ucid=value))
+    try:
+        async with pool.connection() as conn:
+            refusal = await _watch_scope_refusal(conn, ctx, value)
+            if refusal:
+                return await _audited(ctx, PlayerActionResult(
+                    success=False, message=refusal, ucid=value))
+            cursor = await conn.execute("DELETE FROM watchlist WHERE player_ucid = %s", (value,))
+            removed = cursor.rowcount or 0
+    except Exception as ex:
+        log.exception("unwatch_player failed")
+        return await _audited(ctx, PlayerActionResult(
+            success=False, message=_("The watchlist could not be written: {}").format(ex),
+            ucid=value))
+    if not removed:
+        return await _audited(ctx, PlayerActionResult(
+            success=False, message=_(_WATCH_NO_ENTRY).format(value), ucid=value))
+    return await _audited(ctx, PlayerActionResult(
+        success=True, message=_("Watch entry for {} removed.").format(value), ucid=value))
+
+
+@action
+async def edit_watch(ctx: Any, ucid: str, reason: str) -> PlayerActionResult:
+    """Change ONE watch entry's REASON — the console's Edit and Discord's ``watch edit``.
+
+    ``reason`` travels as a BOUND parameter and the statement names the ``reason`` column alone, so
+    ``created_by``, ``created_at`` and the entry's UCID come out of the write byte-identical: an edit
+    corrects what the watchlist says, never who watched the player or when.
+
+    An EMPTY reason is refused rather than written: an empty watch entry is not an edit, it is a
+    removal, and the sentence says so. Everything else refuses the way :func:`unwatch_player` does —
+    same sentence for a missing entry and a player outside the caller's scope, nothing written, one
+    audit entry per outcome.
+    """
+    value = (ucid or "").strip()
+    body = (reason or "").strip()
+    if not value:
+        return await _audited(ctx, PlayerActionResult(
+            success=False, message=_("A UCID is required."), ucid=value))
+    if not body:
+        return await _audited(ctx, PlayerActionResult(
+            success=False,
+            message=_("An empty reason is not an edit — remove the watch entry instead."),
+            ucid=value))
+    if len(body) > MAX_WATCH_REASON_LENGTH:
+        return await _audited(ctx, PlayerActionResult(
+            success=False,
+            message=_("The watch reason is longer than {} characters.")
+                        .format(MAX_WATCH_REASON_LENGTH),
+            ucid=value))
+    pool = _player_pool(ctx)
+    if pool is None:
+        return await _audited(ctx, PlayerActionResult(
+            success=False, message=PLAYERS_UNAVAILABLE, ucid=value))
+    try:
+        async with pool.connection() as conn:
+            refusal = await _watch_scope_refusal(conn, ctx, value)
+            if refusal:
+                return await _audited(ctx, PlayerActionResult(
+                    success=False, message=refusal, ucid=value))
+            cursor = await conn.execute(
+                "UPDATE watchlist SET reason = %s WHERE player_ucid = %s", (body, value))
+            changed = cursor.rowcount or 0
+    except Exception as ex:
+        log.exception("edit_watch failed")
+        return await _audited(ctx, PlayerActionResult(
+            success=False, message=_("The watchlist could not be written: {}").format(ex),
+            ucid=value))
+    if not changed:
+        return await _audited(ctx, PlayerActionResult(
+            success=False, message=_(_WATCH_NO_ENTRY).format(value), ucid=value))
+    return await _audited(ctx, PlayerActionResult(
+        success=True, message=_("The watch reason for {} was updated.").format(value), ucid=value))
+
+
 async def _set_muted(ctx: Any, server_name: str, ucid: str, mute: bool) -> PlayerActionResult:
     """The shared body of the mute pair — ONE implementation, because they differ by one word.
 
@@ -1863,7 +3228,7 @@ async def unmute_player(ctx: Any, server_name: str, ucid: str) -> PlayerActionRe
 
 # ── Queries ─────────────────────────────────────────────────────────────────
 
-@action
+@action(kind="read")
 async def list_missions(ctx: Any, server_name: str) -> MissionListResult:
     """List all available missions on a DCS server."""
     server = ctx.resolve_server(server_name)
@@ -1908,7 +3273,7 @@ async def list_missions(ctx: Any, server_name: str) -> MissionListResult:
         )
 
 
-@action
+@action(kind="read")
 async def get_mission_info(ctx: Any, server_name: str) -> MissionListResult:
     """Get info about the currently running mission."""
     server = ctx.resolve_server(server_name)
@@ -2405,7 +3770,7 @@ async def upload_mission(ctx: Any, server_name: str, name: str, source: bytes | 
         filename=leaf, upload_status=status), server=server)
 
 
-@action
+@action(kind="read")
 async def download_mission(ctx: Any, server_name: str, mission: int | str) -> MissionDownloadResult:
     """Read ONE mission's BYTES — resolved by the newest-copy rule and validated before any read.
 
@@ -2474,7 +3839,7 @@ async def download_mission(ctx: Any, server_name: str, mission: int | str) -> Mi
         filename=os.path.basename(chosen["name"]), content=content)
 
 
-@action
+@action(kind="read")
 async def get_mission_list(ctx: Any, server_name: str) -> MissionListResult:
     """The Missions tab's list — 1-based, the newest copy named, and the rotation state.
 
@@ -2516,7 +3881,7 @@ async def get_mission_list(ctx: Any, server_name: str) -> MissionListResult:
         configured = await server.getMissionList()
         files = await server.getAllMissionFiles()
         start = int(await server.getStartIndex() or 1)
-        current_file = await server.get_current_mission_file() or ""
+        current_file = await _running_mission_file(server)
     except Exception as ex:
         log.exception("get_mission_list failed")
         return MissionListResult(success=False, message=f"Failed to list missions: {ex}",
@@ -2563,6 +3928,216 @@ async def get_mission_list(ctx: Any, server_name: str) -> MissionListResult:
               "active": active_index, "next": next_index})
 
 
+# ── Mission WEATHER: reading the current mission's own weather ──────────────
+# The console's launch dialog reads the mission it is about to apply a preset to, so the operator
+# starts from the mission's OWN weather instead of a blank form. The read is a READ action (a sibling
+# of ``get_mission_list``): it resolves the mission against the SERVER'S OWN list, reads the bytes
+# over the node, parses them with ``MizFile`` and builds the preset document through the SAME mapping
+# ``/mission save_preset`` writes (``MizFile.preset_document``) — ONE mapping home.
+
+#: every failure is its OWN plain sentence. The node-read failures mirror the console's node-read
+#: routes (``services/webservice/pages/server_detail.py``); the action states WHAT failed and the
+#: route renders it with its own status code.
+MISSION_WEATHER_NO_MISSION = "Server '{server}' has no current mission to read."
+MISSION_WEATHER_PATH_REFUSED = ("A mission is named by index or logical name, never by a path: "
+                                "'{mission}' was refused.")
+MISSION_WEATHER_UNKNOWN = "Mission '{mission}' not found on server '{server}'."
+MISSION_WEATHER_INDEX_RANGE = "Mission index {mission} out of range (1-{last})."
+MISSION_WEATHER_MISSING = ("Mission '{mission}' was gone before it could be read "
+                           "(looked for '{path}').")
+MISSION_WEATHER_PERMISSION = "Node '{node}' could not read mission '{mission}' (permission denied)."
+MISSION_WEATHER_TIMEOUT = "Node '{node}' did not answer in time, so mission '{mission}' was not read."
+MISSION_WEATHER_RAISED = "Node '{node}' could not hand over mission '{mission}' ({error})."
+MISSION_WEATHER_FAILURE_CODE = ("Node '{node}' answered with a failure code instead of mission "
+                                "'{mission}'.")
+MISSION_WEATHER_UNSUPPORTED = ("The mission '{mission}' on server '{server}' is not a DCS mission "
+                               "file this console can read.")
+MISSION_WEATHER_UNREADABLE = ("The mission '{mission}' on server '{server}' carries no weather this "
+                              "console can read.")
+
+
+@dataclass
+class MissionWeatherResult(ActionResult):
+    """Result for the mission-weather READ (``read_mission_weather``).
+
+    ``mission_name`` is the resolved mission's FILE name (what the launch dialog's line names) and
+    ``document`` the mission's own weather as a MizEdit preset document — the SAME document
+    ``/mission save_preset`` writes. ``status`` is the HTTP status a console route answers a FAILURE
+    with, so no caller has to parse the sentence to pick one.
+    """
+    server_name: str = ""
+    mission_name: str = ""
+    document: dict[str, Any] = field(default_factory=dict)
+    status: int = 200
+
+
+def _plain_mission_name(value: str) -> bool:
+    """Whether *value* is a mission NAME and not a PATH — one leaf, no directory component.
+
+    The read names a mission by index or logical name; a value carrying either separator, an absolute
+    lead or a bare ``.``/``..`` is a PATH and is refused before anything is resolved, so nothing a
+    request states is ever joined to a directory.
+    """
+    if not value or value in (".", ".."):
+        return False
+    if "/" in value or "\\" in value:
+        return False
+    if os.path.isabs(value):
+        return False
+    return True
+
+
+def _mission_file_name(path: Any) -> str:
+    """The mission's FILE name — its basename with the ``.orig`` marker and ``.dcssb`` copy stripped."""
+    return os.path.basename(utils.logical_mission_path(str(path)))
+
+
+def _parse_mission_document(payload: bytes, node: Any) -> dict:
+    """Parse *payload* — a mission archive's bytes — into its preset document, or raise.
+
+    ``MizFile`` opens a LOCAL ``zipfile``, so the bytes are materialised to a temp file that is
+    deleted after the parse. The file's weather is read against the SERVER's own DCS version (fog
+    lives in ``fog2`` from 2.9.10 on), so ``node`` is the server's node. Raises
+    :class:`UnsupportedMizFileException` for an archive ``MizFile`` cannot open and any other error
+    for a mission whose weather cannot be read.
+    """
+    fd, tmp = tempfile.mkstemp(suffix=".miz")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+        miz = MizFile(tmp)
+        miz.node = node
+        return miz.preset_document()
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+@action(kind="read")
+async def read_mission_weather(ctx: Any, server_name: str, mission: int | str = "",
+                               original: bool = False) -> MissionWeatherResult:
+    """The CURRENT mission's own weather, as a MizEdit preset document — a READ, never audited.
+
+    ``mission`` is the LOGICAL mission: a 1-based INDEX into the server's ``missionList`` (the
+    position :func:`_resolve_mission_id` / :func:`set_active_mission` take; a NUMERIC STRING is the
+    same index, because a route query parameter is always a string) or a NAME (the logical name or
+    its basename, with or without the ``.miz`` extension, case-insensitive), resolved against the
+    server's OWN list. Empty reads the mission ``server.get_current_mission_file()`` names. A PATH is
+    never accepted: nothing a request states is joined to a directory.
+
+    ``original`` reads the mission's ORIGINAL file instead of the copy the server is on — the file a
+    launch with "apply them to the original mission" bases its rewrite on
+    (``ServerImpl.apply_mission_changes``: ``get_orig_file(selected) if use_orig else selected``). A
+    mission that has no ``.orig`` yet is read as it stands, which is what the launch would create the
+    original from.
+
+    The bytes come over ``server.node.read_file`` and are materialised to a temp file for the parse,
+    which is deleted afterwards. The document is built by ``MizFile.preset_document`` — the SAME
+    mapping ``/mission save_preset`` writes — and handed to the preset reader by the caller. Every
+    failure answers a typed refusal with its own sentence, never a document of zeros or defaults.
+    """
+    server = ctx.resolve_server(server_name)
+    if server is None:
+        return MissionWeatherResult(success=False, status=404,
+                                    message=f"Server '{server_name}' not found.",
+                                    server_name=server_name)
+    display = _server_label(server, server_name)
+    node = getattr(server, "node", None)
+    node_name = str(getattr(node, "name", "") or display)
+    if node is None:
+        return MissionWeatherResult(
+            success=False, status=404, server_name=server_name,
+            message=f"Node '{node_name}' is offline or unknown, so the mission cannot be read "
+                    f"from this console.")
+    try:
+        mission_list = await server.getMissionList()
+    except Exception as ex:
+        log.exception("read_mission_weather failed")
+        return MissionWeatherResult(success=False, status=502,
+                                    message=f"Failed to list missions: {ex}",
+                                    server_name=server_name)
+    if isinstance(mission, bool):
+        mission = ""
+    elif isinstance(mission, str) and mission.strip().isdigit():
+        # THE INDEX OVER HTTP: a route query parameter is ALWAYS a string, so a numeric string is the
+        # 1-based INDEX itself — without this, ``?mission=2`` would fall down the NAME path and be
+        # refused as an unknown name. ONE convention: 1-based, the one ``_resolve_mission_id`` and the
+        # Missions tab's rows carry.
+        mission = int(mission.strip())
+    if isinstance(mission, int):
+        if mission < 1 or mission > len(mission_list):
+            return MissionWeatherResult(
+                success=False, status=404, server_name=server_name,
+                message=MISSION_WEATHER_INDEX_RANGE.format(mission=mission,
+                                                           last=len(mission_list)))
+        mission_file = str(mission_list[mission - 1])
+    elif not mission:
+        current = await server.get_current_mission_file()
+        if not current:
+            return MissionWeatherResult(success=False, status=404, server_name=server_name,
+                                        message=MISSION_WEATHER_NO_MISSION.format(server=display))
+        mission_file = os.path.normpath(str(current))
+    else:
+        wanted = str(mission).strip()
+        if not _plain_mission_name(wanted):
+            return MissionWeatherResult(
+                success=False, status=400, server_name=server_name,
+                message=MISSION_WEATHER_PATH_REFUSED.format(mission=mission))
+        index = _resolve_mission_id(mission_list, wanted)
+        if index is None:
+            return MissionWeatherResult(
+                success=False, status=404, server_name=server_name,
+                message=MISSION_WEATHER_UNKNOWN.format(mission=wanted, server=display))
+        mission_file = str(mission_list[index - 1])
+    if original:
+        # THE ORIGINAL: what a launch with "apply them to the original mission" rewrites — the
+        # ``.orig`` twin when one exists, else the file itself (the launch creates the original by
+        # copying it). A READ never creates anything, so ``create_file=False`` answers None instead.
+        mission_file = utils.get_orig_file(mission_file, create_file=False) or mission_file
+    name = _mission_file_name(mission_file)
+    try:
+        content = await node.read_file(str(mission_file))
+    except FileNotFoundError:
+        return MissionWeatherResult(
+            success=False, status=404, server_name=server_name,
+            message=MISSION_WEATHER_MISSING.format(mission=name, path=mission_file))
+    except PermissionError:
+        return MissionWeatherResult(
+            success=False, status=403, server_name=server_name,
+            message=MISSION_WEATHER_PERMISSION.format(node=node_name, mission=name))
+    except (TimeoutError, asyncio.TimeoutError):
+        return MissionWeatherResult(
+            success=False, status=504, server_name=server_name,
+            message=MISSION_WEATHER_TIMEOUT.format(node=node_name, mission=name))
+    except Exception as ex:
+        log.exception("read_mission_weather failed")
+        return MissionWeatherResult(
+            success=False, status=502, server_name=server_name,
+            message=MISSION_WEATHER_RAISED.format(node=node_name, mission=name,
+                                                  error=type(ex).__name__))
+    if not isinstance(content, (bytes, bytearray)):
+        # ``read_file`` is ``bytes | int`` and an ``int`` is a FAILURE CODE, never content.
+        return MissionWeatherResult(
+            success=False, status=502, server_name=server_name,
+            message=MISSION_WEATHER_FAILURE_CODE.format(node=node_name, mission=name))
+    try:
+        document = await asyncio.to_thread(_parse_mission_document, bytes(content), node)
+    except UnsupportedMizFileException:
+        return MissionWeatherResult(
+            success=False, status=422, server_name=server_name,
+            message=MISSION_WEATHER_UNSUPPORTED.format(mission=name, server=display))
+    except Exception:
+        log.exception("read_mission_weather failed")
+        return MissionWeatherResult(
+            success=False, status=422, server_name=server_name,
+            message=MISSION_WEATHER_UNREADABLE.format(mission=name, server=display))
+    return MissionWeatherResult(
+        success=True, status=200, server_name=server_name, mission_name=name, document=document,
+        message=f"Mission '{name}' on server '{display}'.")
+
+
 # ── Mission LIST maintenance: the file picker, add, delete ──────────────────
 #
 # The console's Missions tab mirrors ``plugins/mission/commands.py``'s ``/mission add`` and
@@ -2576,7 +4151,7 @@ async def get_mission_list(ctx: Any, server_name: str) -> MissionListResult:
 _ADDABLE_SUFFIXES = (".miz", ".sav")
 
 
-@action
+@action(kind="read")
 async def get_addable_missions(ctx: Any, server_name: str) -> MissionListResult:
     """The missions in ``missions_dir`` that are NOT yet configured — the ADD picker's own list.
 
@@ -2749,9 +4324,8 @@ async def delete_mission(ctx: Any, server_name: str, mission: int | str, *,
             return MissionListResult(success=False, message=reason, server_name=server_name,
                                      missions=missions)
     name = os.path.basename(_configured_name(filename, os.path.dirname(str(filename)) or ""))
-    if server.status in (Status.RUNNING, Status.PAUSED, Status.STOPPED) and server.current_mission \
-            and os.path.normpath(str(filename)) == os.path.normpath(
-                str(getattr(server.current_mission, "filename", "") or "")):
+    running = await _running_mission_file(server)
+    if running and os.path.normpath(str(filename)) == os.path.normpath(running):
         return MissionListResult(success=False, message="You can't delete the running mission.",
                                  server_name=server_name, missions=missions)
     try:
@@ -2862,6 +4436,12 @@ MISSION_DELETE_LOADING_REFUSAL = "Missions cannot be removed while the server is
 MISSION_LIST_CHANGED = ("The mission list has changed since this page was loaded. "
                         "Reload the page and try again.")
 
+#: The refusal a dropped FULL order is answered with when it is not a PERMUTATION of the fresh
+#: snapshot — a member missing, an extra member, or a member named twice. The specific cause travels
+#: in the sentence after this clause, so the operator reads WHY rather than only that it failed.
+MISSION_ORDER_NOT_A_PERMUTATION = ("Not moved: the new order must name every mission in the list "
+                                   "exactly once.")
+
 
 async def _stale_mission_refusal(server: Any, configured: str, wanted: Any) -> str:
     """The :data:`MISSION_LIST_CHANGED` sentence when *wanted* no longer names the mission the FRESH
@@ -2901,6 +4481,22 @@ def _logical_mission(path: Any) -> str:
     substring: ``foo.dcssbbar`` is NOT the same mission as ``foobar``.
     """
     return utils.logical_mission_path(str(path))
+
+
+async def _running_mission_file(server: Any) -> str:
+    """The mission the server is RUNNING right now — ``""`` when it is not running one.
+
+    ``get_current_mission_file`` alone cannot answer this: when no mission is loaded it FALLS BACK to
+    the START mission (``missionList`` at ``listStartIndex``), which is the right answer for "what
+    would start" and the wrong one for "what is running". Used as the running marker, that fallback
+    kept the last mission flagged — and therefore undeletable — on a server that was stopped.
+
+    So the STATUS gates it: only ``RUNNING`` and ``PAUSED`` have a mission loaded. ``LOADING`` has
+    none yet, ``SHUTTING_DOWN`` is losing it, and the three down states have nothing loaded at all.
+    """
+    if server.status not in (Status.RUNNING, Status.PAUSED):
+        return ""
+    return await server.get_current_mission_file() or ""
 
 
 def _mission_list_online(server: Any) -> bool:
@@ -2983,7 +4579,7 @@ async def delete_missions(ctx: Any, server_name: str, missions: list[int], *,
         if reason:
             return MissionListResult(success=False, message=reason, server_name=server_name,
                                      missions=current)
-    current_file = await server.get_current_mission_file()
+    current_file = await _running_mission_file(server)
     current_logical = _logical_mission(current_file) if current_file else ""
     # DESCENDING — the largest index first: removing one cannot shift the index of another still to
     # come, in the list or in the disk step (which reads its filename from the SAME snapshot).
@@ -3047,20 +4643,29 @@ async def delete_missions(ctx: Any, server_name: str, missions: list[int], *,
 
 
 @action
-async def reorder_mission(ctx: Any, server_name: str, mission: int | str,
-                          direction: str, expected_name: str = "") -> MissionListResult:
-    """Move ONE mission up or down the ``missionList`` — the offline-only reorder.
+async def reorder_mission(ctx: Any, server_name: str, mission: int | str | None = None,
+                          direction: str = "", expected_name: str = "",
+                          order: list[int | str] | None = None) -> MissionListResult:
+    """Reorder the ``missionList`` — one step by direction, or a whole new order in one write.
 
-    ``mission`` is the 1-based ``missionList`` index (or its logical name); ``direction`` is ``"up"``
-    or ``"down"``. The action takes ONE snapshot, resolves the mission, and builds the PERMUTED list
-    (same members, new order) which it hands to ``Server.setMissionList`` — so the rotation pointer
-    follows the mission, computed by path inside the writer.
+    THE TWO FORMS, one writer. ``order`` is the FULL new order the row drag posted: identifiers read
+    exactly as ``mission`` is (a 1-based index or the logical name), and they must be a PERMUTATION of
+    the FRESH snapshot — every mission once, nothing added, nothing missing, no duplicate. A set that
+    no longer matches the list (a mission added or removed meanwhile) is REFUSED with
+    :data:`MISSION_ORDER_NOT_A_PERMUTATION` and the reason, never written partially. One snapshot, one
+    ``Server.setMissionList``, one audit entry.
+
+    ``mission`` + ``direction`` is the single-step form (``"up"`` / ``"down"``) — the keyboard /
+    no-JavaScript path. The action takes ONE snapshot, resolves the mission, and builds the PERMUTED
+    list (same members, new order) which it hands to ``Server.setMissionList`` — so the rotation
+    pointer follows the mission, computed by path inside the writer.
 
     An ``up`` on the first row and a ``down`` on the last are NO-OPS, not errors. A WRITE, so it
     writes its own audit entry.
 
     ``expected_name`` is the row's LOGICAL name the console posts beside its index: a mismatch against
-    the FRESH snapshot refuses the move with :data:`MISSION_LIST_CHANGED`. Empty → no such check.
+    the FRESH snapshot refuses the move with :data:`MISSION_LIST_CHANGED`. Empty → no such check. It
+    guards the SINGLE-STEP form only: a full order names its members itself.
     """
     server = ctx.resolve_server(server_name)
     if server is None:
@@ -3076,6 +4681,16 @@ async def reorder_mission(ctx: Any, server_name: str, mission: int | str,
         log.exception("reorder_mission failed")
         return MissionListResult(success=False, message=f"Failed to list missions: {ex}",
                                  server_name=server_name)
+    if order is not None:
+        # THE FULL-ORDER FORM: the dropped rows ARE the intent, so the permutation check is the
+        # stale-page guard — a set that no longer matches the fresh snapshot is refused whole.
+        reordered = _mission_order(current, order)
+        if isinstance(reordered, str):
+            return MissionListResult(success=False, message=reordered, server_name=server_name,
+                                     missions=current)
+        return await _write_mission_order(
+            server, server_name, current, reordered,
+            f"Reordered {len(reordered)} mission(s) on server '{display}'.")
     index = _resolve_mission_id(current, mission)
     if index is None:
         return MissionListResult(success=False,
@@ -3103,6 +4718,46 @@ async def reorder_mission(ctx: Any, server_name: str, mission: int | str,
                                  data={"missions": current, "index": index})
     reordered = list(current)
     reordered.insert(target - 1, reordered.pop(index - 1))
+    return await _write_mission_order(server, server_name, current, reordered,
+                                      f"Moved '{name}' {move}.")
+
+
+def _mission_order(current: list[str], order: Any) -> list[str] | str:
+    """The permuted list *order* names, or the refusal sentence when it is not a permutation.
+
+    *order* names its members the way ``mission`` does — a 1-based index or the logical name — and
+    must name EVERY mission of *current* EXACTLY once: a member that resolves to nothing, a count that
+    differs, or a member named twice is refused (:data:`MISSION_ORDER_NOT_A_PERMUTATION` plus the
+    cause). Nothing is written on a refusal, so a dropped set that no longer matches the list can never
+    produce a partial write.
+    """
+    if not isinstance(order, (list, tuple)) or not order:
+        return f"{MISSION_ORDER_NOT_A_PERMUTATION} The order is empty."
+    positions: list[int] = []
+    for entry in order:
+        index = _resolve_mission_id(current, entry)
+        if index is None:
+            return f"{MISSION_ORDER_NOT_A_PERMUTATION} '{entry}' is not in the list."
+        positions.append(index)
+    if len(positions) != len(current):
+        return (f"{MISSION_ORDER_NOT_A_PERMUTATION} The order names {len(positions)} mission(s), "
+                f"the list has {len(current)}.")
+    seen: set[int] = set()
+    for index in positions:
+        if index in seen:
+            return (f"{MISSION_ORDER_NOT_A_PERMUTATION} "
+                    f"'{os.path.basename(_logical_mission(current[index - 1]))}' is named twice.")
+        seen.add(index)
+    return [current[index - 1] for index in positions]
+
+
+async def _write_mission_order(server: Any, server_name: str, current: list[str],
+                               reordered: list[str], message: str) -> MissionListResult:
+    """Hand ONE already-permuted list to ``Server.setMissionList`` — the single write of both forms.
+
+    ``message`` is the SUCCESS sentence the form owns; the failure paths are shared, so neither form
+    can report a write the other would have refused.
+    """
     try:
         result_list = await server.setMissionList(reordered)
     except AttributeError as ex:
@@ -3116,9 +4771,9 @@ async def reorder_mission(ctx: Any, server_name: str, mission: int | str,
     except Exception as ex:
         log.exception("reorder_mission failed")
         return MissionListResult(success=False,
-                                 message=f"Failed to move mission '{name}': {ex}",
+                                 message=f"Failed to reorder the missions: {ex}",
                                  server_name=server_name)
     return MissionListResult(
-        success=True, message=f"Moved '{name}' {move}.", server_name=server_name,
-        missions=result_list, data={"missions": result_list, "index": target})
+        success=True, message=message, server_name=server_name,
+        missions=result_list, data={"missions": result_list, "order": reordered})
 

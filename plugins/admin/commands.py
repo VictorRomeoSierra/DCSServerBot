@@ -11,6 +11,7 @@ from core import utils, Plugin, Server, command, Node, UploadStatus, Group, Inst
     InstallException, InstallableExtension, ConfigView, ServerUploadHandler
 from core.actions import ActionContext, call_action
 from core.data.maintenance import ServerMaintenanceManager
+from core.data.node import UPDATE_SERVERS_UP, UPDATE_STOOD_BY
 from discord import app_commands
 from discord.ext import commands, tasks
 from discord.ui import TextInput, Modal
@@ -18,6 +19,7 @@ from datetime import datetime, timezone
 from io import BytesIO
 from plugins.admin.listener import AdminEventListener
 from plugins.admin.views import CleanupView
+from plugins.admin.webadmin import webadmin_group
 from plugins.modmanager.commands import get_installed_mods
 from plugins.scheduler.views import ServerConfigView
 from services.bot import DCSServerBot
@@ -316,15 +318,17 @@ class Admin(Plugin[AdminEventListener]):
         return config
 
     dcs = Group(name="dcs", description=_("Commands to manage your DCS installations"))
+    webadmin = webadmin_group
 
     @dcs.command(description=_('Bans a user by name or ucid'))
     @app_commands.guild_only()
     @utils.app_has_role('DCS Admin')
-    @app_commands.describe(server=_("Server to ban on (empty = all of your servers, or every server)"))
+    @app_commands.rename(_server="server")
+    @app_commands.describe(_server=_("Server to ban on (empty = all of your servers, or every server)"))
     async def ban(self, interaction: discord.Interaction,
                   user: app_commands.Transform[discord.Member | str, utils.UserTransformer(
                       sel_type=PlayerType.PLAYER)],
-                  server: app_commands.Transform[Server, BanServerTransformer] | None = None):
+                  _server: app_commands.Transform[Server, BanServerTransformer] | None = None):
 
         class BanModal(Modal):
             reason = TextInput(label=_("Reason"), max_length=80, required=True)
@@ -356,7 +360,7 @@ class Admin(Plugin[AdminEventListener]):
                     await interaction.response.send_message(_("{} is not a valid UCID!").format(user),
                                                             ephemeral=ephemeral)
                     return
-                targets: list[str] = [server.name] if server else _ban_targets(
+                targets: list[str] = [_server.name] if _server else _ban_targets(
                     interaction.user, self.bot.servers, self.bot.roles['Admin'])
                 stamp = datetime.now(tz=timezone.utc)
                 for target in targets or [None]:
@@ -493,6 +497,16 @@ class Admin(Plugin[AdminEventListener]):
                                          ).format(version=new_version, branch=branch, name=node.name))
                 await self.bot.audit(f"updated DCS from {old_version} to {new_version} on node {node.name}.",
                                      user=interaction.user)
+            elif rc == UPDATE_STOOD_BY:
+                await msg.edit(
+                    content=_("DCS World on node {name} was not updated: another cluster is updating the shared "
+                              "DCS installation right now.").format(name=node.name)
+                )
+            elif rc == UPDATE_SERVERS_UP:
+                await msg.edit(
+                    content=_("DCS World on node {name} was not updated: servers on the shared DCS installation "
+                              "were still running, so the installer was not started.").format(name=node.name)
+                )
             elif rc == 2:
                 await msg.edit(
                     content=_("DCS World update on node {name} was aborted (check disk space)!").format(name=node.name)

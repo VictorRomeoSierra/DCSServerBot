@@ -53,6 +53,7 @@ from .. import permissions
 # venv) and CONSUMES the one shared rule instead of keeping a second copy. The direction is pinned
 # by ``tests/test_layering_direction.py``.
 from ..scope import ADMIN_ROLE, CLUSTER_ROLES, Scope
+from .throttle import LoginThrottle
 
 __all__ = [
     "SESSION_IDENTITY_KEY",
@@ -63,9 +64,11 @@ __all__ = [
     "AuthBackend",
     "AuthManager",
     "install_auth",
+    "audit_scope_declarations",
     "session_identity_ref",
     "set_session_identity",
     "clear_session_identity",
+    "login_throttle",
 ]
 
 log = logging.getLogger(__name__)
@@ -74,6 +77,14 @@ log = logging.getLogger(__name__)
 SESSION_IDENTITY_KEY = "webui_identity"
 
 _STATE_ATTR = "webui_auth"
+
+#: the app-state key holding the local accounts' declared scopes (``auth.local.users[].scope``).
+#: ``install_auth`` records them so the ready-time audit (``audit_scope_declarations``) derives
+#: nothing a second time.
+_SCOPE_DECLARATIONS_ATTR = "webui_scope_declarations"
+
+#: the app-state attribute holding the failed-login throttle (see :func:`login_throttle`)
+_LOGIN_THROTTLE_ATTR = "webui_login_throttle"
 
 #: the label for a RESOLVED identity that carries no display name. Never the subject: a Discord
 #: subject is a numeric id, and the id is precisely what the console stopped showing. Never empty
@@ -160,6 +171,22 @@ def set_session_identity(request: Request, identity: Identity) -> None:
 
 def clear_session_identity(request: Request) -> None:
     request.session.pop(SESSION_IDENTITY_KEY, None)
+
+
+def login_throttle(source) -> "LoginThrottle":
+    """The application's failed-login throttle, created on first need.
+
+    *source* is the request (``request.app``) or the application itself, so the route and the install
+    share one accessor. It is stored per APPLICATION: a rebuilt app (a takeover, a stop/start) starts
+    from a clean count instead of inheriting another app's lockouts.
+    """
+    app = getattr(source, "app", None) or source
+    state = app.state
+    throttle = getattr(state, _LOGIN_THROTTLE_ATTR, None)
+    if throttle is None:
+        throttle = LoginThrottle()
+        setattr(state, _LOGIN_THROTTLE_ATTR, throttle)
+    return throttle
 
 
 # ------------------------------------------------------------------------------- the backend
@@ -400,12 +427,19 @@ def install_auth(app, node=None, config: dict | None = None, *,
     # whole identity — and so no page can answer the question for itself.
     permissions.set_manager_resolver(manager.manages_any_server)
     setattr(app.state, _STATE_ATTR, manager)
+    # the failed-login throttle, created with the identity layer so the login route always finds one
+    login_throttle(app)
 
     log.info("Admin web UI auth: backend(s) %s, password backend(s) %s, config dir '%s', "
              "public base url '%s'.", ", ".join(manager.describe()["backends"]) or "-",
              ", ".join(manager.describe()["password_backends"]) or "-", resolved_config_dir,
              auth_config.get("public_base_url") or "-")
-    _audit_scope_declarations(local.declared_scopes() if local is not None else {})
+    # The declared scopes are recorded on the app: the audit can only compare against the guild's
+    # roles once Discord has seen READY (see audit_scope_declarations), and the ready-time run must
+    # not re-derive them.
+    setattr(app.state, _SCOPE_DECLARATIONS_ATTR,
+            dict(local.declared_scopes() if local is not None else {}))
+    audit_scope_declarations(app)
     if not backends:
         # CRITICAL, not a warning: the login page has no door at all, so nobody can sign in. This is
         # a legitimate state while an installation is being configured (and the console also serves
@@ -417,7 +451,24 @@ def install_auth(app, node=None, config: dict | None = None, *,
     return manager
 
 
-def _audit_scope_declarations(declared_by_user: dict[str, tuple[str, ...]]) -> None:
+def audit_scope_declarations(app) -> None:
+    """Run the two startup WARNINGs for an app whose auth is installed.
+
+    Called at install time AND again once Discord is ready (``WebService._audit_scope_when_ready``):
+    both audits compare free-text ``managed_by`` values against the LIVE guild role names and ids,
+    and that cache only exists after READY — the moment the web service is being built is earlier
+    than that. Each audit logs once per condition (``scope.audit_*``), so running them twice cannot
+    double-log.
+
+    The declared local scopes are read back off the app, where ``install_auth`` recorded them, so the
+    ready-time run derives nothing a second time.
+    """
+    declarations = getattr(getattr(app, "state", None), _SCOPE_DECLARATIONS_ATTR, None) or {}
+    _audit_scope_declarations(declarations)
+
+
+def _audit_scope_declarations(declared_by_user: dict[str, tuple[str, ...]], *,
+                             bot=None) -> None:
     """The two startup WARNINGs for the per-server scope (spec §10.6), each logged ONCE.
 
     Both compare a free-text ``managed_by`` world against the live installation, and both describe a
@@ -427,10 +478,22 @@ def _audit_scope_declarations(declared_by_user: dict[str, tuple[str, ...]]) -> N
     with no bot object (early start, a takeover, a headless install) it says so at DEBUG and the
     console installs anyway. Safe to call again after a server-config reload: the audit re-reports
     its findings and the log stays quiet (``scope.audit_*`` logs one line per condition).
+
+    *bot* is the running bot, or ``None`` to resolve it from the ServiceRegistry (the production
+    path; a test hands one in). The two inputs are read through :func:`_live_scope_inputs`, the ONE
+    tolerant seam: a bot that has not seen Discord's READY is refused there, like a bot object that
+    cannot supply them at all.
+
+    The two halves do not need the same inputs, so each is gated separately: the ``managed_by``
+    audit compares against the LIVE guild role names/ids, which a bot in no guild cannot supply, so
+    :func:`_live_scope_inputs` reports the guild cache as absent (``guild_roles is None``) and that
+    half is skipped — a headless (``no_discord``) install has no guild to supply them at all, and
+    reports the same absence; the local-scope audit compares against the SERVERS' ``managed_by``
+    values only, so it runs whenever READY has been seen, headless or not.
     """
     from .. import scope as scope_api
 
-    bot = _current_bot()
+    bot = bot if bot is not None else _current_bot()
     if bot is None:
         log.debug("Admin web UI scope: no bot object, so the scope declarations and the servers' "
                   "managed_by values are not audited at startup (this is a diagnostic, not a "
@@ -441,6 +504,8 @@ def _audit_scope_declarations(declared_by_user: dict[str, tuple[str, ...]]) -> N
         return
     server_values = {value for _, values in by_server for value in values}
     scope_api.audit_local_scopes(declared_by_user, server_values)
+    if guild_roles is None:
+        return
     scope_api.audit_server_managed_by(by_server, guild_roles)
 
 
@@ -451,14 +516,85 @@ def _live_scope_inputs(scope_api, bot):
     the bot object cannot supply (an early start, a takeover, a test double that deliberately forbids
     an attribute, a headless install) ends in ``(None, None)`` and a DEBUG line rather than a
     half-installed identity layer.
+
+    The inputs are read only once the bot has seen Discord's READY (:func:`_discord_ready`); an
+    unfinished boot has an incomplete SERVER list too, so a valid declaration could look unmatched.
+    READY with an EMPTY guild cache is a different state: the servers are known, so the tail is
+    returned with ``guild_roles`` set to ``None`` — the one signal that the ``managed_by`` half must
+    not run, because comparing against an empty role list reports EVERY tagged server as unmatched.
+    A HEADLESS install (``no_discord``) reports the same absent role list for its own reason: there
+    is no Discord guild and no role holder at all, so no ``managed_by`` value can ever match. Both
+    states keep the local-scope half, which compares SERVER names, running on the known servers.
+
+    Both facts and the inputs are obtained INSIDE the ``try``, so a bot double whose ``__getattr__``
+    raises for any name cannot propagate out of ``install_auth``/``install_shell``.
     """
     try:
-        return scope_api.gather_live_scope(bot)
+        if not _discord_ready(bot):
+            log.debug("Admin web UI scope: Discord is not connected yet, so neither scope audit "
+                      "runs now - an unfinished boot has an incomplete server list and an empty "
+                      "guild cache. The audit runs again once the bot is ready "
+                      "(WebService._audit_scope_when_ready).")
+            return None, None
+        servers, roles = scope_api.gather_live_scope(bot)
+        if _headless(bot):
+            log.debug("Admin web UI scope: this is a no_discord (headless) install, so there are "
+                      "no Discord roles to match a server's managed_by against and that half is "
+                      "never audited - the only roles present are the configured names, and no "
+                      "role exists to create or rename in answer. The local-scope audit still runs "
+                      "against the known servers.")
+            roles = None
+        elif not _guild_cache_loaded(bot):
+            log.debug("Admin web UI scope: the bot is ready but in no guild, so the servers' "
+                      "managed_by values are not audited now - an empty guild cache would report "
+                      "EVERY tagged server as unmatched. The local-scope audit still runs against "
+                      "the known servers. The managed_by half is not re-run when a guild appears "
+                      "later: the ready-time audit is one-shot and has already fired, so a bot "
+                      "ready in no guild and joined to one later is never audited for the life of "
+                      "this process - the next start, with the guild cached at READY, audits it.")
+            roles = None
+        return servers, roles
     except Exception as ex:
         log.debug("Admin web UI scope: the bot object could not supply the live scope inputs (%s), "
                   "so the servers' managed_by values are not audited at startup.",
                   type(ex).__name__)
         return None, None
+
+
+def _discord_ready(bot) -> bool:
+    """Whether *bot* has seen Discord's READY -- the gateway handshake finished.
+
+    A bot object exists from ``login()`` on, but it is READY only after the gateway sends it; before
+    that neither its server list nor its guild cache is complete, so neither scope audit may run. A
+    double without ``is_ready`` (the headless ``DummyBot``, a test stub) counts as ready, so its
+    install is audited exactly as before.
+    """
+    is_ready = getattr(bot, "is_ready", None)
+    if callable(is_ready) and not is_ready():
+        return False
+    return True
+
+
+def _guild_cache_loaded(bot) -> bool:
+    """Whether *bot*'s guild cache holds at least one guild.
+
+    ``Client.guilds`` is filled by the gateway READY and is the only source of the guild role
+    names/ids the ``managed_by`` audit compares against. An empty cache has no role to compare
+    against, so the ``managed_by`` half must skip it; the local-scope half does not read it at all.
+    """
+    return bool(getattr(bot, "guilds", None))
+
+
+def _headless(bot) -> bool:
+    """Whether *bot* is a ``no_discord`` (headless) install.
+
+    A headless install runs no Discord bot at all, so there is no guild and no role holder: the
+    ``managed_by`` audit would compare a server's tag against only the CONFIGURED role names and
+    report every tag as unmatched, with no role to create or rename in answer. The predicate reads
+    ``bot.locals`` tolerantly — a bot object that cannot supply ``locals`` (a strict test double) is
+    NOT headless, so nothing changes for it.
+    """
+    return bool((getattr(bot, "locals", None) or {}).get("no_discord"))
 
 
 def _console_servers(request) -> tuple:

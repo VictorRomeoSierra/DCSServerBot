@@ -12,7 +12,6 @@ from core import (Plugin, DEFAULT_TAG, Side, DataObjectFactory, utils, Status, S
                   PluginInstallationError, Server, async_cache, const)
 from core.actions import ActionContext, call_action
 from datetime import datetime, timedelta, timezone
-from discord.ext import tasks
 from fastapi import (FastAPI, APIRouter, Form, Query, HTTPException, Depends, File, UploadFile, Response,
                      BackgroundTasks)
 from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
@@ -106,12 +105,9 @@ class RestAPI(Plugin):
 
     async def cog_load(self) -> None:
         await super().cog_load()
-        self.refresh_views.add_exception_type(psycopg.DatabaseError)
-        utils.safe_start(self.refresh_views)
         asyncio.create_task(self.init_webservice())
 
     async def cog_unload(self) -> None:
-        await utils.safe_cancel(self.refresh_views)
         if self.app and self.router:
             for route in self.router.routes:
                 if route in self.app.routes:
@@ -2704,7 +2700,8 @@ class RestAPI(Plugin):
                         join = ""
                         where = "WHERE t.player_ucid = %(ucid)s"
                     await cursor.execute(f"""
-                        SELECT t.id, t.unit_type, t.grade, t.comment, t.place, t.trapcase, t.wire, t.night, t.points, t.time
+                        SELECT t.id, t.unit_type, t.grade, t.comment, t.place, t.trapcase, t.wire, t.night, t.points, 
+                               t.time, t.trapdata, t.tgroove, t.landingdist, t.wind
                         FROM traps t
                         {join}
                         {where}
@@ -3169,23 +3166,6 @@ class RestAPI(Plugin):
                 f"({server.current_mission.map}) up {hours}h{mins:02d}m  B:{blue} R:{red}"
             )
         return lines
-
-    @tasks.loop(hours=1)
-    async def refresh_views(self):
-        try:
-            async with self.apool.connection() as conn:
-                await conn.execute("""
-                    REFRESH MATERIALIZED VIEW CONCURRENTLY mv_serverstats;
-                """)
-        except psycopg.errors.FeatureNotSupported:
-            async with self.apool.connection() as conn:
-                await conn.execute("""
-                    REFRESH MATERIALIZED VIEW mv_serverstats;
-                """)
-
-    @refresh_views.before_loop
-    async def before_refresh_views(self):
-        await self.bot.wait_until_ready()
 
 
 async def setup(bot: DCSServerBot):

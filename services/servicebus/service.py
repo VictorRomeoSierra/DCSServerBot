@@ -12,6 +12,7 @@ from copy import deepcopy
 from core import Server, Mission, Node, Status, utils, Instance, FatalException, Port, PortType
 from core.autoexec import Autoexec
 from core.data.dataobject import DataObjectFactory
+from core.data.file_staging import sweep_staged_uploads
 from core.data.impl.instanceimpl import InstanceImpl
 from core.data.impl.serverimpl import ServerImpl, RenameError
 from core.data.proxy.serverproxy import ServerProxy
@@ -98,13 +99,8 @@ class ServiceBus(Service):
             # clean up the intercom and broadcast channels
             await self.intercom_channel.clear()
             await self.broadcasts_channel.clear()
-            # clean up the files
-            async with self.node.cpool.connection() as conn:
-                await conn.execute("""
-                    DELETE FROM files 
-                    WHERE guild_id = %s 
-                      AND created < ((now() AT TIME ZONE 'utc') - interval '300 seconds')
-                """, (self.node.guild_id, ))
+            # clean up the files: the staged upload rows a killed process left behind
+            await sweep_staged_uploads(self.node.apool, guild_id=self.node.guild_id)
 
             # subscribe to the intercom and broadcast channels
             self.intercom_subscribe_task = self.intercom_channel.observe_task(asyncio.create_task(
@@ -722,7 +718,7 @@ class ServiceBus(Service):
                 server.instance.locals['webgui_port'] = webgui_port
                 self.servers[server_name] = server
             server.maintenance = maintenance
-            server.status = Status(status)
+            server.reconcile_status(status)
             server.settings = settings
             server.options = options
             # to support remote channel configs (for remote testing)
@@ -970,6 +966,13 @@ class ServiceBus(Service):
             if instance_key and func_signature and func_signature['instance'].annotation != 'str':
                 kwargs['instance'] = self.node.instances.get(instance_key)
 
+            # A node name is resolved on the answering process too: ``all_nodes`` always holds that
+            # process's own node, so a master->agent call naming the agent resolves to the node object
+            # instead of reaching the method as a plain string.
+            node_key = kwargs.get('node')
+            if node_key and func_signature and func_signature['node'].annotation != 'str':
+                kwargs['node'] = self.node.all_nodes.get(node_key, None)
+
             # Handle master-specific mappings
             if self.master:
                 member_key = kwargs.get('member')
@@ -986,10 +989,6 @@ class ServiceBus(Service):
                     except ValueError:
                         kwargs['user'] = None
 
-                node_key = kwargs.get('node')
-                if node_key and func_signature and func_signature['node'].annotation != 'str':
-                    kwargs['node'] = self.node.all_nodes.get(node_key, None)
-
             # Log performance and execute the function
             with PerformanceLog(f"RPC: {obj.__class__.__name__}.{method_name}()"):
                 result = func(**kwargs)
@@ -999,6 +998,11 @@ class ServiceBus(Service):
 
         elif 'params' in data:
             for key, value in data['params'].items():
+                # ``Unregistered`` states that the SENDER does not know yet, so an inbound one never
+                # lowers a status this side already holds. Every other key is written as it arrives.
+                if key == 'status' and value == Status.UNREGISTERED.value and \
+                        getattr(obj, 'status', Status.UNREGISTERED) != Status.UNREGISTERED:
+                    continue
                 setattr(obj, key, value)
 
         return None

@@ -22,17 +22,20 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import datetime
 
 __all__ = [
     "STATUS_WORDS", "DEFAULT_STATUS", "RAW_LABELS",
     "raw_status", "status_view", "StatusView",
-    "SourceStatus", "NodeView", "InstanceView", "ServerView", "PlayerView", "WeatherView",
+    "SourceStatus", "NodeView", "DcsView", "InstanceView", "ServerView", "PlayerView", "WeatherView",
+    "LaunchedPresetView",
     "ExtensionView", "LimitView", "ValuePart", "value_parts",
     "LogLine", "LogTail", "Overview",
     "NO_LIVE_REASON", "NO_SERVERS_MESSAGE", "NO_PLAYERS_MESSAGE", "NO_NODES_MESSAGE",
     "NO_INSTANCES_MESSAGE", "NO_NODE_INSTANCES_MESSAGE", "LOG_MISSING_MESSAGE",
     "LOG_EMPTY_MESSAGE", "LOG_LEVEL_EMPTY_MESSAGE", "SCOPED_EMPTY_MESSAGE",
     "NO_MISSION_MESSAGE", "NO_WEATHER_MESSAGE", "NOT_RUNNING_MESSAGE",
+    "DCS_CHIP_CURRENT", "DCS_CHIP_UPDATE", "DCS_CHIP_UNCHECKED", "DCS_CHIP_ABSENT", "dcs_chip",
 ]
 
 
@@ -99,6 +102,19 @@ NO_WEATHER_MESSAGE = _("No weather is reported.")
 #: up: those facts do not exist for a server that is not running, and zeroes would read as figures
 NOT_RUNNING_MESSAGE = _("This server is not running.")
 
+# --- the node row's DCS chip: one label per state (see :func:`dcs_chip`). The version, branch and
+# latest build are OPERATOR DATA, so the msgids carry placeholders and the values are interpolated
+# at render (the row's other sentence records work the same way).
+#: checked, and the installed build is the newest on its branch
+DCS_CHIP_CURRENT = _("DCS {version} @ {branch}")
+#: checked, and a newer build exists on the installed branch (the chip wears the amber styling)
+DCS_CHIP_UPDATE = _("DCS {version} → {latest}")
+#: the cache holds no answer for this node (never checked, the last check failed, or the node is
+#: offline). The literal is ``services.webservice.upgrade.NOTE_NO_CHECK``'s — one wording, one msgid.
+DCS_CHIP_UNCHECKED = _("no update check yet")
+#: the node declares no ``DCS:`` block at all — stated plainly, with no version and no claim
+DCS_CHIP_ABSENT = _("no DCS on this node")
+
 
 # --------------------------------------------------------------------------------- status
 
@@ -146,6 +162,32 @@ class SourceStatus:
 # ----------------------------------------------------------------------------------- views
 
 @dataclass(frozen=True, slots=True)
+class DcsView:
+    """One node's DCS installation, as the CACHED poll answer knows it.
+
+    The presence of this record IS the answer to "this node runs DCS" (``NodeView.dcs is None`` when
+    it does not). Every fact inside it comes from the background poll
+    (``services/webservice/dcs_update.py``) — never from a node call made while rendering.
+
+    ``available`` is three-valued: ``True`` a newer build exists, ``False`` the node is current,
+    ``None`` UNKNOWN (never checked, or the last check failed) — so a row can tell "up to date" from
+    "not checked". A node that declares a DCS installation but has never been checked, and an offline
+    node, both carry this record with empty strings and ``available is None``: the configuration says
+    the installation exists, and no version is invented for it.
+    """
+    #: the installed branch, e.g. ``"release"``, or ``''`` while unknown
+    branch: str = ""
+    #: the installed version, e.g. ``"2.9.8.110"``, or ``''`` while unknown
+    version: str = ""
+    #: the newest version on the installed branch (the installed one when the node is current), or ``''``
+    latest: str = ""
+    #: three-valued availability — see the class docstring
+    available: bool | None = None
+    #: when the cached answer was produced (aware UTC), or ``None`` while nothing was checked
+    checked_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class NodeView:
     name: str
     master: bool
@@ -153,6 +195,38 @@ class NodeView:
     instances: int
     servers: int
     players: int
+    #: the node's DCS installation (:class:`DcsView`), or ``None`` when the node DECLARES none
+    dcs: DcsView | None = None
+
+    @property
+    def dcs_chip(self) -> dict:
+        """The DCS chip this row renders beside its name (see :func:`dcs_chip`)."""
+        return dcs_chip(self.dcs)
+
+
+def dcs_chip(dcs: DcsView | None) -> dict:
+    """The node row's ONE DCS label, as a ``say`` sentence record plus its styling flag.
+
+    Four states and no others:
+
+    * ``DCS {version} → {latest}`` with ``warn`` (``available is True``);
+    * ``DCS {version} @ {branch}`` (``available is False``);
+    * ``no update check yet`` (``available is None`` — never checked, the last check failed, or the
+      node is offline, whose record carries no version by construction);
+    * ``no DCS on this node`` (``dcs is None`` — the node declares no ``DCS:`` block).
+
+    The two checked states require a version: a cache answer without one is UNKNOWN, never a claim
+    of "up to date" with a blank figure.
+    """
+    if dcs is None:
+        return {"msgid": DCS_CHIP_ABSENT, "params": {}, "warn": False}
+    if dcs.available is True and dcs.version and dcs.latest:
+        return {"msgid": DCS_CHIP_UPDATE, "params": {"version": dcs.version, "latest": dcs.latest},
+                "warn": True}
+    if dcs.available is False and dcs.version:
+        return {"msgid": DCS_CHIP_CURRENT, "params": {"version": dcs.version, "branch": dcs.branch},
+                "warn": False}
+    return {"msgid": DCS_CHIP_UNCHECKED, "params": {}, "warn": False}
 
 
 @dataclass(frozen=True, slots=True)
@@ -313,6 +387,26 @@ class LimitView:
 
 
 @dataclass(frozen=True, slots=True)
+class LaunchedPresetView:
+    """Which weather preset a running mission was LAUNCHED with, as the node recorded it.
+
+    The fact lives on the server's ``servers`` row (``launched_preset`` /
+    ``launched_preset_temporary``), written by the NODE when it applies a preset at load time — NOT
+    the mission's own reported weather (:class:`WeatherView`, which says what the sky IS, never which
+    preset was chosen). It is keyed by the NAMED server, never by the instance slot it occupies.
+    ``name`` is the preset NAME and is empty for a preset built on the spot;
+    ``temporary`` marks that case. The pair renders as a label beside the weather block, and a load
+    that applied no preset carries NO view at all (never an empty one), so the page shows nothing
+    rather than claiming a preset that was not applied.
+    """
+
+    #: the applied preset's NAME, or ``''`` for a preset built on the spot (which has none)
+    name: str = ""
+    #: whether the applied preset was built for this launch alone (nothing saved to the preset files)
+    temporary: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class ServerView:
     name: str
     node_name: str
@@ -338,8 +432,9 @@ class ServerView:
     #: :attr:`name` (the identity every route and link keys on). Defaulted for the same reason as
     #: ``maintenance``.
     display_name: str = ""
-    #: the slot ceiling (``settings.maxPlayers``), or ``None`` when the source does not carry it.
-    #: The overview card renders the player count as ``used / max`` like the embed's author line.
+    #: the slots a real player can take (``settings.maxPlayers`` less the bot's observer slot), or
+    #: ``None`` when the source does not carry it. The overview card renders the player count as
+    #: ``used / max`` like the embed's author line.
     max_players: int | None = None
     #: the current map (``Mission.map``), or ``None``. An embed field the overview card mirrors.
     map_name: str | None = None
@@ -385,6 +480,11 @@ class ServerView:
     #: the DCS build the server's node reports (``node.dcs_version``), or ``''``. Half of the embed's
     #: footer; the other half, the bot's own version, belongs to the console and is read there.
     dcs_version: str = ""
+    #: which weather preset the running mission was LAUNCHED with, or ``None`` when the load applied
+    #: none. Read off the ``servers`` record the node writes, never off the live server object;
+    #: ``None`` renders no label, so a launch nobody picked a preset for claims nothing. Defaulted for
+    #: the same reason as the other late fields.
+    launched_preset: LaunchedPresetView | None = None
 
     @property
     def running(self) -> bool:

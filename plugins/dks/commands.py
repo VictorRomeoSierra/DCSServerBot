@@ -1,13 +1,16 @@
+import aiohttp
 import asyncio
 import base64
+import certifi
 import discord
 import os
 import secrets
+import ssl
 
 from asyncio import Task
 from contextlib import suppress
 from core import (Plugin, Group, PluginRequiredError, utils, get_translation, ServiceRegistry, PluginInstallationError,
-                  ServiceProxy, DEFAULT_TAG)
+                  ServiceProxy, DEFAULT_TAG, Server)
 from discord import app_commands
 from fastapi import FastAPI, APIRouter, HTTPException, Depends
 from pathlib import Path
@@ -15,11 +18,12 @@ from plugins.dks.views import RegisterView
 from plugins.dks.auth import TokenBearer
 from plugins.restapi.commands import RestAPI
 from starlette.requests import Request
-from typing import cast
-from urllib.parse import quote
+from typing import Any, cast
+from urllib.parse import quote, urlparse
 
 from services.bot import DCSServerBot
 from services.webservice import WebService
+from services.webservice.registry import exclude_router, include_router_counted
 
 from core.utils.yaml_helper import new_yaml
 
@@ -38,6 +42,9 @@ class DKS(Plugin):
         self.web_service: WebService | None = None
         self.app: FastAPI | None = None
         self.router: APIRouter | None = None
+        #: the route object(s) THIS plugin's include appended to the app (never the router's own
+        #: routes) — the only thing that can be removed again on unload
+        self._included: list[Any] = []
         # Simple OTP handling
         self._otp: str | None = None
         self._task: Task | None = None
@@ -49,10 +56,11 @@ class DKS(Plugin):
         asyncio.create_task(self.init_webservice())
 
     async def cog_unload(self) -> None:
-        if self.app and self.router:
-            for route in self.router.routes:
-                if route in self.app.routes:
-                    self.app.routes.remove(route)
+        # remove exactly what this instance installed, by identity: the previous handler would keep
+        # answering otherwise, with its own stale auth decisions
+        if self.app and self._included:
+            exclude_router(self.app, self._included)
+            self._included = []
         await super().cog_unload()
 
     async def init_webservice(self):
@@ -82,6 +90,9 @@ class DKS(Plugin):
             return
 
     def register_routes(self):
+        app = self.app
+        if app is None:
+            return
         self.router = APIRouter(prefix=self._get_prefix())
         if not self.router:
             return
@@ -96,7 +107,22 @@ class DKS(Plugin):
             dependencies=[Depends(TokenBearer(plugin=self, jwks_url=DKS_JWKS_URL))]
         )
 
-        self.app.include_router(self.router)
+        # /install_dks_exporter
+        self.router.add_api_route(
+            "/install_dks_exporter", self.install_dks_exporter,
+            methods=["POST"],
+            summary="Install the DKS exporter.",
+            description="Install the DKS exporter on a server, replacing Tacview.",
+            tags=["DKS"],
+            dependencies=[Depends(TokenBearer(plugin=self, jwks_url=DKS_JWKS_URL, linked=True))]
+        )
+
+        # a router installed by an earlier call on THIS instance is replaced, not added to: its
+        # handlers carry that call's auth dependencies
+        if self._included:
+            exclude_router(app, self._included)
+            self._included = []
+        self._included = include_router_counted(app, self.router)
 
     @property
     def otp(self) -> str | None:
@@ -167,6 +193,60 @@ class DKS(Plugin):
             asyncio.create_task(self.update_embed(_("Error while registering with DKS: {}!").format(ex)))
             raise HTTPException(status_code=500, detail='Error while registering.')
 
+    @property
+    def linked_key(self) -> str | None:
+        restapi = cast(RestAPI, self.bot.cogs.get('RestAPI'))
+        return restapi.get_config().get('auth', {}).get('jwt', {}).get('key') if restapi else None
+
+    @staticmethod
+    async def tacview_enabled(server: Server) -> bool:
+        # From nodes.yaml: list_extensions() is cached on remote nodes.
+        config = (await server.config_extension('Tacview'))['Instance']
+        return bool(config) and config.get('enabled', True)
+
+    async def install_dks_exporter(self, request: Request):
+        """DKS asks to install its exporter. The install code is fetched from DKS over HTTPS with a single-use claim.
+        The parameters are claims of DKS's signed token, never an unsigned body. Only for servers an Admin allowed it
+        on (/dks install_permission)."""
+        payload = request.state.jwt_payload
+        server_name, claim, code = payload.get('server'), payload.get('claimUrl'), payload.get('code')
+        if not all(isinstance(x, str) and x for x in [server_name, claim, code]):
+            raise HTTPException(status_code=400, detail="server, claimUrl and code are missing")
+        server = self.bot.servers.get(server_name)
+        if not server:
+            raise HTTPException(status_code=404, detail=f"Server {server_name} not found")
+        if not self.get_config(server).get('allow_install', False):
+            raise HTTPException(status_code=409, detail=f"Installs from DKS are off for {server_name}. An Admin can "
+                                                        f"allow them with /dks install_permission in Discord.")
+        if urlparse(claim).scheme != 'https':
+            raise HTTPException(status_code=400, detail="The claim URL must be https")
+        try:
+            async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(
+                    ssl=ssl.create_default_context(cafile=certifi.where()))) as session:
+                async with session.post(claim, json={"code": code}, raise_for_status=True,
+                                        proxy=self.node.proxy, proxy_auth=self.node.proxy_auth) as response:
+                    install_code = (await response.json())['installCode']
+        except Exception as ex:
+            self.log.error(f"DKS: Couldn't fetch the install code: {ex}")
+            raise HTTPException(status_code=502, detail="The bot couldn't fetch the install code from DKS")
+
+        # The extension downloads the exporter, then disables the Tacview extension (DKS replaces it).
+        tacview_before = await self.tacview_enabled(server)
+        await server.config_extension('DKS', {"Instance": {"enabled": True, "key": install_code}})
+        try:
+            installed = await server.enable_extension('DKS')
+        except Exception as ex:
+            self.log.exception(ex)
+            installed = False
+        if not installed:
+            await server.config_extension('DKS', {"Instance": {"enabled": False}})
+            raise HTTPException(status_code=500, detail="Installing the DKS exporter failed, see the bot's log")
+        tacview_after = await self.tacview_enabled(server)
+        await self.bot.audit(f"DKS exporter installed on server {server.display_name} from DKS.")
+        return {
+            "tacviewDisabled": tacview_before and not tacview_after
+        }
+
     dks = Group(name="dks", description=_("Commands to manage Digital Kneeboard Simulator"))
 
     @dks.command(name="register")
@@ -206,6 +286,32 @@ class DKS(Plugin):
         embed.set_thumbnail(url="https://www.digitalkneeboardsimulator.com/logo.png")
         view = RegisterView(url=url)
         self.msg = await interaction.followup.send(embed=embed, view=view)
+
+
+    @dks.command(name="install_permission", description=_("Allow DKS to install its exporter on a server"))
+    @app_commands.guild_only()
+    @utils.app_has_role('Admin')
+    async def install_permission(self, interaction: discord.Interaction,
+                                 server: app_commands.Transform[Server, utils.ServerTransformer], allow: bool):
+        config = os.path.join(self.node.config_dir, 'plugins', 'dks.yaml')
+        if os.path.exists(config):
+            data = new_yaml().load(Path(config).read_text(encoding='utf-8')) or {}
+        else:
+            data = {}
+        data.setdefault(server.instance.name, {})['allow_install'] = allow
+        tmp = Path(config).with_suffix('.yaml.tmp')
+        with tmp.open('w', encoding='utf-8') as f:
+            new_yaml().dump(data, f)
+        os.replace(tmp, config)
+        self.locals = self.read_locals()
+        self._config.clear()
+        if allow:
+            await interaction.response.send_message(
+                _("DKS can now install its exporter on {}, replacing Tacview.").format(server.display_name),
+                ephemeral=True)
+        else:
+            await interaction.response.send_message(
+                _("DKS can no longer install its exporter on {}.").format(server.display_name), ephemeral=True)
 
 
 async def setup(bot: DCSServerBot):

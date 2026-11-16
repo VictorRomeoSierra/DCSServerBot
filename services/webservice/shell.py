@@ -38,7 +38,8 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from . import auth, contributors, i18n, permissions, session, templating, theme
+from . import (auth, contributors, i18n, mount, permissions, redirects, session, sites, templating,
+               theme)
 from .auth import routes as auth_routes
 from .registry import Registrar
 
@@ -54,10 +55,12 @@ SHELL_STATIC_DIR = Path(__file__).parent / "static"
 
 #: the statuses the access gate refuses with. Registered by STATUS through one factory, so a second
 #: status cannot grow its own bespoke answer (and the API face stays byte-identical for every one).
-#: TWO statuses, two faces: 403 is the definitive refusal (an HTML page for a browser, JSON
-#: otherwise); 503 is the RETRYABLE refusal — the identity could not be verified YET — whose page
-#: face retries itself. Both go through :func:`refusal_response`, which branches on the status.
-REFUSED_STATUSES: tuple[int, ...] = (403, permissions.RETRYABLE_STATUS)
+#: A PAGE for the browser, JSON for the caller that reads it. 403 is the definitive refusal; 404 is a
+#: dead link, which a person is owed a page for and which is no business of the JSON caller;
+#: :data:`permissions.RETRYABLE_STATUS` is the RETRYABLE refusal — the identity could not be verified
+#: YET — whose page face retries itself. Every one goes through :func:`refusal_response`, which
+#: branches on the status.
+REFUSED_STATUSES: tuple[int, ...] = (403, 404, permissions.RETRYABLE_STATUS)
 
 _STATE_ATTR = "webui_registrar"
 
@@ -106,7 +109,27 @@ def install_shell(app: FastAPI, node=None, config: dict | None = None) -> Regist
         log.debug("Admin web shell already installed on this application, reusing its registrar.")
         return existing
 
-    registrar = Registrar(app)
+    # THE SITE CONFIGURATION is parsed and validated BEFORE anything is installed: a block that
+    # cannot be served (an unknown tile, a group_role no server names) raises here, so the shell is
+    # never installed and the service reports why instead of serving an empty site.
+    catalog = sites.install_sites(app, config, config_dir=getattr(node, "config_dir", None))
+    # WHERE THE CONSOLE LIVES, decided once: an ENABLED root site owns the site root, so the console
+    # moves to its own mount; with no enabled root site (no catalog, or the root site switched off)
+    # the console keeps ``/``. Nothing below this line decides it again — the registrar applies the
+    # prefix to every page registration and ``mount.url`` builds the addresses pages emit.
+    console_prefix = mount.install_console_mount(app, catalog)
+
+    # The capability tables are PROCESS state and this application is not: a stop()/start() or a
+    # master/agent switch builds a NEW app in the same process, which re-declares every capability
+    # the previous install already declared. With an override still applied that re-declaration is
+    # two declarations of one name and ``declare_capability`` refuses it, so the rebuild has to start
+    # from the DECLARATIONS — the stored block is applied again below, after every page declared.
+    dropped = permissions.reset_to_declared_bases()
+    if dropped:
+        log.debug("Admin web shell install: restored %d capability(ies) to their declarations before "
+                  "the rebuild re-declares them: %s.", len(dropped), ", ".join(sorted(dropped)))
+
+    registrar = Registrar(app, console_prefix=console_prefix)
     # The service's own config, where a PAGE can read it. The log panel's default level lives in
     # webservice.yaml, and a route has no other way to reach it: the constructor argument is not
     # stored anywhere, and reading the YAML again from a request handler would bypass the schema
@@ -124,15 +147,30 @@ def install_shell(app: FastAPI, node=None, config: dict | None = None) -> Regist
     # project's own ``config`` directory.
     app.state.webui_config_dir = getattr(node, "config_dir", None) or "config"
     session.install_session_middleware(app, config)
+    # ``<path>/`` answers a 308 to ``<path>`` before routing, so a pasted address with a slash
+    # behaves like the one without (see ``redirects``). Installed here because the shell is what
+    # knows which addresses exist: without a registrar there is nothing to redirect.
+    redirects.install_trailing_slash_redirect(app)
     auth.install_auth(app, node, config)
     _install_refusal_handlers(app)
     registrar.register_assets(SHELL_ASSET_PATH, SHELL_STATIC_DIR, permissions.PUBLIC)
     core_router, core_capabilities, core_nav = _core_router()
     registrar.register_pages("shell", core_router, nav=core_nav, capabilities=core_capabilities)
+    # THE PUBLIC SITE'S PAGE TREE (see site_pages): one route per configured site page, registered
+    # under its own owner with an EMPTY prefix, so the site's addresses are exactly what the site's
+    # own prefix builds and the console's mount never moves them. An empty catalog registers nothing
+    # and the console keeps ``/``.
+    from . import site_pages as site_pages_module
+    site_pages_module.register(registrar, catalog)
     # The WRITE surface, under its own owner (see pages/actions.py): registered right after the
     # shell's pages so a path collision is refused loudly here rather than silently winning later.
     from .pages import actions as actions_page
     actions_page.register(registrar)
+    # THE APPLY DOOR (see config_apply.py): the ONE control a config save leaves, under its own
+    # owner. Registered here, beside the other write surface, so the capability it declares and the
+    # two paths it serves exist before any page renders the control that opens it.
+    from . import config_apply as apply_module
+    apply_module.register(registrar)
     # THE ACTION REGISTRY, also populated here as a belt-and-braces fallback for a shell installed
     # WITHOUT the bot's own plugin load (core/plugin_manager.py::PluginManager._discover_actions):
     # a test stub, or a web process whose plugin list never reached load_plugins. Without it
@@ -144,6 +182,13 @@ def install_shell(app: FastAPI, node=None, config: dict | None = None) -> Regist
     # after the plugin load) gets a fresh, EMPTY registrar: replay the plugin pages that were
     # recorded when the plugins loaded, or every one of them is silently missing.
     contributors.replay(registrar)
+    # THE CONFIGURED ACCESS OVERRIDE, applied ONCE here — after every page has declared (the shell's
+    # own above, the plugins' through ``replay``) and before the first request can be answered. It
+    # recomputes each effective requirement from its declared base, so a rebuilt application (a
+    # takeover, a stop/start) lands on the same matrix instead of stacking a second application.
+    # A block this installation cannot honour is refused AS A WHOLE and logged: the declarations stay
+    # exactly as shipped rather than half-applied.
+    _apply_access_override(app)
     # An ungated surface cannot be seen by the gate or by a route-table test, so say it out loud.
     permissions.audit_mounts(app, context="shell install")
 
@@ -156,6 +201,23 @@ def install_shell(app: FastAPI, node=None, config: dict | None = None) -> Regist
              "asset path '%s'.", summary["routes"], summary["capabilities"],
              ", ".join(summary["owners"]) or "-", SHELL_ASSET_PATH)
     return registrar
+
+
+def _apply_access_override(app: FastAPI) -> None:
+    """Apply the configured role → capability override, from ``pages/access``.
+
+    Imported INSIDE the call and never at module import: ``pages.access`` reads this module's pages to
+    build its matrix, so a top-level import would be a cycle. The import cannot fail in practice (the
+    install above already imported the page), and if it somehow did, the honest answer is the shipped
+    declarations — never a half-applied override — so the failure is logged and swallowed.
+    """
+    try:
+        from .pages import access as access_page
+
+        access_page.apply_from_config(app)
+    except Exception:
+        log.exception("Admin web shell: the access override could not be applied; every capability "
+                      "keeps its declared roles.")
 
 
 def _discover_actions(node=None) -> None:
@@ -210,7 +272,7 @@ def _discover_actions(node=None) -> None:
 
 
 def _core_router() -> tuple[APIRouter, dict[str, str], tuple]:
-    """The shell's own router, its capability declaration, and its navigation.
+    """The shell's router, its capability declaration and the console's navigation.
 
     The shell owns the reserved surface: ``/auth/login`` and ``/auth/logout`` plus the core
     pages here, all registered under the owner name ``shell`` — because the registrar reserves
@@ -222,21 +284,30 @@ def _core_router() -> tuple[APIRouter, dict[str, str], tuple]:
     ``PUBLIC`` explicitly: with an app-level deny-by-default gate, an undeclared route is refused,
     so the login page must name its capability or nobody could reach the door.
 
-    A page module owns its own capability, nav item and copy; this function only hands the router
-    over, which is what keeps "one owner per page" true while the shell stays the single place that
-    knows what the reserved surface consists of.
+    ONE router for both surfaces, because the registrar's mount does the selecting: the door, the
+    language switch, the message map and the theme switch are in
+    :data:`services.webservice.mount.FIXED_PATHS` and keep their installation-level addresses,
+    while every page here is mounted under the console's prefix. A page module owns its own
+    capability, nav item and copy; this function only hands the router over.
     """
+    from .pages import access as access_page
+    from .pages import audit as audit_page
     from .pages import dashboard as dashboard_page
     from .pages import bans as bans_page
     from .pages import instances as instances_page
     from .pages import live as live_page
     from .pages import logs as logs_page
+    from .pages import mods as mods_page
+    from .pages import music as music_page
     from .pages import nodes as nodes_page
     from .pages import node_settings as node_settings_page
+    from .pages import player_detail as player_detail_page
     from .pages import players as players_page
+    from .pages import presets as presets_page
     from .pages import server_detail as server_detail_page
     from .pages import servers as servers_page
     from .pages import settings as settings_page
+    from .pages import statistics as statistics_page
 
     router = APIRouter()
     auth_routes.add_routes(router)
@@ -252,16 +323,37 @@ def _core_router() -> tuple[APIRouter, dict[str, str], tuple]:
     # the PER-SERVER page and its Configuration tab: one route, no nav item (reached from a row).
     server_detail_page.add_routes(router)
     nodes_page.add_routes(router)
+    # THE STATISTICS PAGE: the strategic, period-based view. One route, one capability and one nav
+    # item, Admin-only — the read it renders is installation-wide and carries no scope.
+    statistics_page.add_routes(router)
     # THE PER-NODE SETTINGS PAGE: one route, no nav item (reached from a Node row's cogwheel).
     node_settings_page.add_routes(router)
     instances_page.add_routes(router)
     players_page.add_routes(router)
+    # THE PER-PLAYER page and its two tabs: three routes, no nav item (reached from a directory row).
+    player_detail_page.add_routes(router)
     # THE BANS PAGE: the console's scoped ban list and its LIFT. One route, one capability and one
     # nav item, registered flat like the pages above.
     bans_page.add_routes(router)
+    # THE AUDIT PAGE: the cluster's own trail, read-only and Admin-only. One route, one capability
+    # and one nav item, in the Cluster group — the table it reads is per cluster.
+    audit_page.add_routes(router)
     live_page.add_routes(router)
     # THE SETTINGS PAGE: the schema-driven config page, Admin-only.
     settings_page.add_routes(router)
+    # THE PRESETS PAGE: the MizEdit preset files this installation names. One route, one capability
+    # and one nav item, registered flat like the pages above.
+    presets_page.add_routes(router)
+    # THE MODS PAGES: a node's root mods, both owners' dialogs and their action routes. No nav item
+    # — the node page is reached from a Nodes row and the other half is a tab on the server page.
+    mods_page.add_routes(router)
+    # THE MUSIC PAGES: the playlist list and one playlist's editor, with their dialogs and writes.
+    # One route each and one nav item, registered flat like the pages above.
+    music_page.add_routes(router)
+    # THE ACCESS PAGE: the role → capability matrix. Registered LAST among the pages that join the
+    # sidebar, and it must be, because the page it renders is every OTHER page's capability — it
+    # reads the declaration, so it can only be whole once everything else has declared.
+    access_page.add_routes(router)
     capabilities = dict(auth_routes.capabilities())
     capabilities.update(i18n.capabilities())
     capabilities.update(theme.capabilities())
@@ -270,21 +362,39 @@ def _core_router() -> tuple[APIRouter, dict[str, str], tuple]:
     capabilities.update(servers_page.capabilities())
     capabilities.update(server_detail_page.capabilities())
     capabilities.update(nodes_page.capabilities())
+    capabilities.update(statistics_page.capabilities())
     capabilities.update(node_settings_page.capabilities())
     capabilities.update(instances_page.capabilities())
     capabilities.update(players_page.capabilities())
+    capabilities.update(player_detail_page.capabilities())
     capabilities.update(bans_page.capabilities())
+    capabilities.update(audit_page.capabilities())
     capabilities.update(live_page.capabilities())
     capabilities.update(settings_page.capabilities())
-    # THE MAIN MENU IS FIVE ITEMS: Dashboard, Servers, Nodes, Bans, Settings. Logs, Instances and
-    # Players are still PAGES — their routes are registered above and stay reachable/linkable —
-    # but they contribute NO nav entry: each one's content is already on the Dashboard (the
-    # Servers/Nodes/Instances/Players tabs and the log panel with its expanded mode). A page whose
+    capabilities.update(presets_page.capabilities())
+    capabilities.update(mods_page.capabilities())
+    capabilities.update(music_page.capabilities())
+    capabilities.update(access_page.capabilities())
+    # EACH ENTRY DECLARES ITS OWN GROUP AND GLYPH on its own nav item; the shell only says which pages
+    # join the sidebar, never which heading a page belongs under (``registry.NAV_GROUPS`` fixes the
+    # headings and their order, and a class of wrong grouping is refused when the item is built). The
+    # order below is the order WITHIN a heading, so a group reads the way the rail draws it: Access
+    # before Settings, as the mockup's Administration heading has them. Logs
+    # and Instances are still PAGES — their routes are registered above and stay reachable/linkable —
+    # but they contribute NO nav entry: their content is already on the Dashboard (the
+    # Servers/Nodes/Instances tabs and the log panel with its expanded mode). The Players page IS an
+    # entry: it is the database's player directory, not the Dashboard's live roster tab. A page whose
     # module declares no nav item is simply not a menu entry; it is reached the way the Dashboard
-    # presents it. See pages/instances.py, pages/players.py and pages/logs.py.
+    # presents it. See pages/instances.py and pages/logs.py.
     return router, capabilities, (dashboard_page.nav_items()
                                   + servers_page.nav_items() + nodes_page.nav_items()
+                                  + statistics_page.nav_items()
+                                  + players_page.nav_items()
+                                  + music_page.nav_items()
                                   + bans_page.nav_items()
+                                  + audit_page.nav_items()
+                                  + presets_page.nav_items()
+                                  + access_page.nav_items()
                                   + settings_page.nav_items())
 
 
@@ -349,6 +459,17 @@ def refusal_response(request, exc, *, status_code: int | None = None):
     # the standalone pages are composed in Python, so their copy is translated AT RENDER through the
     # request's own per-language environment (see :func:`_page_language_and_translator`).
     language, translate = _page_language_and_translator(request)
+    if status == 404:
+        # A MISSING ADDRESS IS NOT A REFUSAL. Nothing was denied and nothing was written, so the page
+        # carries no "was my work saved?" question and — the rule this branch exists for — the visitor
+        # is NEVER sent to a login door for it: a dead link on a public site would otherwise bounce an
+        # anonymous reader to a login page that has nothing to do with what they asked for.
+        # ``console_prefix`` answers "is a public site served at /": the console only moves under a
+        # prefix of its own while one is, so a non-empty prefix is that fact stated by the mount.
+        return HTMLResponse(refusal_page(status, language=language, translate=translate,
+                                         site_at_root=bool(mount.console_prefix(
+                                             getattr(request, "app", None)))),
+                            status_code=status)
     if status == permissions.RETRYABLE_STATUS:
         # The visitor could not be verified *right now* — the bot has just started and is
         # rebuilding its member view. The generic refusal page would wrongly say "access denied"
@@ -440,11 +561,18 @@ _REFUSAL_STYLE = """<style>
 
 
 def refusal_page(status_code: int, *, wrote: bool = False,
-                 language: str = i18n.BASE_LANGUAGE, translate=None) -> str:
+                 language: str = i18n.BASE_LANGUAGE, translate=None,
+                 site_at_root: bool = False) -> str:
     """The HTML a browser is refused with. Takes no request data — see :func:`refusal_response`.
 
     ``wrote`` swaps the sentence a person reads after SUBMITTING something: "was my work saved?" is
     the only question they have, and a refusal raised before the handler means the answer is no.
+
+    The copy is chosen by STATUS: a 404 says the address is not there and asks no question about the
+    visitor's access, every other status keeps the access refusal.
+
+    ``site_at_root`` — a public site is served at ``/`` — changes only a 404's way out: the offer is
+    the site, at ``/``. Every other case offers the console's own start page.
 
     The copy is composed in Python, so it is translated AT RENDER: ``translate`` is the request's own
     ``_`` (the per-language environment's, see :func:`_page_language_and_translator`) and ``language``
@@ -452,21 +580,38 @@ def refusal_page(status_code: int, *, wrote: bool = False,
     so the standalone document is byte-for-byte what it was when no request context exists.
     """
     _ = translate or i18n._
-    message = (_("Your request could not be completed, and nothing was saved.")
-               if wrote else
-               _("Your account does not have access to this page."))
+    if status_code == 404:
+        heading = _("Page not found")
+        title = heading
+        message = _("This address does not exist. Check the link, or use the menu to find what you "
+                    "were looking for.")
+        # THE WAY OUT IS THE SITE ROOT, NEVER THE CONSOLE'S OWN MOUNT. While a public site is served
+        # at ``/`` the console lives under a prefix of its own, and a reader who followed a dead link
+        # has no business being sent into the admin console: the offer is the public site. With no
+        # site at the root, ``/`` IS the console's start page, so one address answers both cases.
+        if site_at_root:
+            way_out = f'<p><a href="/">{_("Open the public site")}</a></p>'
+        else:
+            way_out = f'<p><a href="{mount.url("/")}">{_("Return to the dashboard")}</a></p>'
+    else:
+        heading = _("Access denied")
+        title = _("access denied")
+        message = (_("Your request could not be completed, and nothing was saved.")
+                   if wrote else
+                   _("Your account does not have access to this page."))
+        way_out = f'<p><a href="{mount.url("/")}">{_("Return to the dashboard")}</a></p>'
     return (
         "<!doctype html>\n"
         f'<html lang="{language}">\n<head>\n<meta charset="utf-8">\n'
         '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
-        f"<title>{status_code} - {_('access denied')}</title>\n"
+        f"<title>{status_code} - {title}</title>\n"
         f'<link rel="stylesheet" href="{SHELL_ASSET_PATH}/shell.css">\n'
         f"{_REFUSAL_STYLE}\n"
         '</head>\n<body>\n<main class="refusal">\n'
-        f"<h1>{_('Access denied')}</h1>\n"
+        f"<h1>{heading}</h1>\n"
         f"<p>{message}</p>\n"
         f'<p class="refusal-status">HTTP {status_code}</p>\n'
-        f'<p><a href="/">{_("Return to the dashboard")}</a></p>\n'
+        f"{way_out}\n"
         "</main>\n</body>\n</html>\n"
     )
 

@@ -25,11 +25,21 @@ __all__ = [
     "UploadStatus",
     "SortOrder",
     "InstallationException",
-    "FatalException"
+    "FatalException",
+    "UPDATE_STOOD_BY",
+    "UPDATE_SERVERS_UP"
 ]
 
 
 _ = get_translation('core')
+
+#: :meth:`Node.dcs_update` return codes for "the installer was never started". They are negative because no
+#: updater exit code is, so a real updater result can never be mistaken for one of them.
+#:
+#: the shared installation is being updated by another cluster, which powered its servers off; this node stood by.
+UPDATE_STOOD_BY = -2
+#: servers were still running on the shared installation when the window opened, so the installer was refused.
+UPDATE_SERVERS_UP = -3
 
 
 class UploadStatus(Enum):
@@ -101,22 +111,42 @@ class Node(ABC):
         raise NotImplementedError()
 
     @property
-    def proxy(self) -> str | None:
+    def _proxy_config(self) -> dict:
+        """This node's proxy settings: the node's own block in ``nodes.yaml``, else the bot service's ``bot.yaml``.
+
+        A bare URL string is read as ``{"url": …}``. A missing ``bot.yaml`` means "no proxy": that file only
+        exists where the bot service runs.
+        """
         if 'proxy' not in self.locals:
-            config = new_yaml().load(Path(os.path.join(self.config_dir, 'services', 'bot.yaml')).read_text(encoding='utf-8'))
-            self.locals['proxy'] = config.get('proxy', {}).get('url')
-        return self.locals['proxy']
+            try:
+                config = new_yaml().load(
+                    Path(os.path.join(self.config_dir, 'services', 'bot.yaml')).read_text(encoding='utf-8'))
+            except FileNotFoundError:
+                config = {}
+            self.locals['proxy'] = config.get('proxy') or {}
+        proxy = self.locals['proxy']
+        if isinstance(proxy, str):
+            proxy = self.locals['proxy'] = {'url': proxy}
+        return proxy or {}
+
+    @property
+    def proxy(self) -> str | None:
+        url = self._proxy_config.get('url')
+        return str(url) if url else None
 
     @property
     def proxy_auth(self) -> aiohttp.BasicAuth | None:
         if 'proxy_auth' not in self.locals:
-            config = new_yaml().load(Path(os.path.join(self.config_dir, 'services', 'bot.yaml')).read_text(encoding='utf-8'))
-            username = config.get('proxy', {}).get('username')
-            try:
-                password = utils.get_password('proxy', self.config_dir)
-                self.locals['proxy_auth'] = aiohttp.BasicAuth(username, password)
-            except ValueError:
-                self.locals['proxy_auth'] = None
+            proxy = self._proxy_config
+            username = proxy.get('username')
+            password = proxy.get('password') or None
+            if not password:
+                try:
+                    password = utils.get_password('proxy', self.config_dir)
+                except ValueError:
+                    password = None
+            self.locals['proxy_auth'] = (
+                aiohttp.BasicAuth(username, password) if username and password else None)
         return self.locals['proxy_auth']
 
     @property
@@ -185,6 +215,22 @@ class Node(ABC):
     @abstractmethod
     async def dcs_update(self, branch: str | None = None, version: str | None = None,
                          warn_times: list[int] = None, announce: bool | None = True):
+        """Update DCS World on this node and return the updater's exit code.
+
+        ``0`` means the installer ran and reported success. An installation that is shared between clusters is
+        updated under a window, and the installer is NOT started when the window could not be taken
+        (:data:`UPDATE_STOOD_BY`) or when servers were still running on it (:data:`UPDATE_SERVERS_UP`) — a caller
+        that reads those as success announces an update that never happened.
+        """
+        raise NotImplementedError()
+
+    @abstractmethod
+    async def is_dcs_update_available(self) -> str | None:
+        """The newer version string when the installed DCS branch has one, otherwise ``None``.
+
+        An unreachable or failing ED endpoint is answered with ``None``, never an exception: the caller
+        reports "no update" rather than propagating a publisher outage.
+        """
         raise NotImplementedError()
 
     @abstractmethod

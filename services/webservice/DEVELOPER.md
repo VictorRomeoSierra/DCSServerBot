@@ -21,9 +21,10 @@ capability and a declared action. The **Configuration tab** of a server's own pa
 writes**, declared the same way in the same file: the **DCS config write** (`SERVER_CONFIG_ACTIONS`)
 and the **channels write** (`SERVER_CHANNEL_ACTIONS`) — plus the **coalition write**
 (`SERVER_COALITION_ACTIONS`, described with the config tab's two below). The same page's **Missions
-tab** carries the **mission-list writes** (`MISSION_ACTIONS`, described below). The table below is the
-WHOLE write surface — the three tables' rows, the servers page's own *Add server*, and the two tabs'
-writes.
+tab** carries the **mission-list writes** (`MISSION_ACTIONS`, described below), and its **Mods tab**
+carries the **mod writes** (`pages/mods.py`, described below). The table below is the WHOLE write
+surface — the three tables' rows, the servers page's own *Add server*, the two tabs' writes and the
+mods writes.
 
 | Row    | Control              | Capability                  | Action (`__qualname__`) | Confirms |
 |--------|----------------------|-----------------------------|-------------------------|----------|
@@ -47,11 +48,15 @@ writes.
 | player | Mute                 | `players.mute`              | `mute_player`           | no       |
 | player | Unmute               | `players.mute`              | `unmute_player`         | no       |
 | player | Screenshot           | `players.screenshot`        | `screenshot_player`     | no       |
+| player (watch) | Add to watchlist…    | `players.watch`      | `watch_player`          | no       |
+| player (watch) | Remove from watchlist | `players.watch`      | `unwatch_player`        | **yes**  |
+| player (watch) | Edit the watch reason | `players.watch`      | `edit_watch`            | no       |
 | node   | Restart              | `nodes.restart`             | `restart_node`          | **yes**  |
 | node   | Shut down            | `nodes.shutdown`            | `shutdown_node`         | **yes**  |
 | node   | Upgrade              | `nodes.upgrade`             | `upgrade_node`          | **yes**  |
 | node   | Take servers offline | `nodes.offline`             | `take_node_offline`     | **yes**  |
 | node   | Bring servers online | `nodes.online`              | `bring_node_online`     | no       |
+| node   | Update DCS           | `nodes.dcs_update`          | `update_dcs`            | **yes**  |
 | config (tab)   | Save          | `servers.config.dcs`        | `set_server_config`     | no       |
 | channels (tab) | Save channels | `servers.config.channels`   | `set_server_channels`   | no       |
 | coalitions (tab) | Save coalition passwords | `servers.config.coalitions` | `set_coalition_password` | no |
@@ -62,6 +67,14 @@ writes.
 | mission (tab)  | Upload mission       | `missions.upload`           | `upload_mission`        | no       |
 | mission (tab)  | Move                 | `missions.reorder`          | `reorder_mission`       | no       |
 | mission (tab)  | Set as start         | `missions.activate`         | `set_active_mission`    | no       |
+| mods (node)    | Install a mod…       | `mods.manage`               | `install_mod`           | **yes**  |
+| mods (node)    | Download…            | `mods.manage`               | `download_mod`          | **yes**  |
+| mods (node)    | Change version       | `mods.manage`               | `change_mod_version`    | **yes**  |
+| mods (node)    | Remove               | `mods.manage`               | `uninstall_mod`         | **yes**  |
+| mods (tab)     | Install a mod…       | `mods.manage`               | `install_mod`           | **yes**  |
+| mods (tab)     | Download…            | `mods.manage`               | `download_mod`          | **yes**  |
+| mods (tab)     | Change version       | `mods.manage`               | `change_mod_version`    | **yes**  |
+| mods (tab)     | Remove               | `mods.manage`               | `uninstall_mod`         | **yes**  |
 
 **The Control column is the declaration's own `label`** — the wording the code gives the
 control. Where the screen words one differently, the Missions tab's writes below name both
@@ -84,9 +97,68 @@ same role on both surfaces but the same NARROWED view as Discord: the untagged s
 naming one of its roles (`Scope.cluster`), never a server tagged with a role it does not hold. A server
 with **no** `managed_by` is **not** a manager's: the scoped source leaves it out of every page, so no
 control is built for it, and a crafted POST naming it is refused exactly like a name that does not
-exist. The **node** row is another exception and stays so: its five are declared `Admin`-only and
+exist. The **node** row is another exception and stays so: its six are declared `Admin`-only and
 **without** a scope grant (`NODE_ROLES`, `pages/actions.py`), because a manager's scope is a set of
 *servers* and taking a whole node — or every server on it — out of service must never widen out of it.
+The **mods** pair splits along the same line: `mods.view` (the Mods tab's body and its installed list)
+is `Admin` + `DCS Admin` **with** a scope grant, so a hoster reads their own instance's packages,
+while `mods.manage` (every mod write, both owners' dialogs, and the node's root-mods page) is
+`Admin`-only **without** one: a root package rewrites the game files of every instance on a machine,
+and a manager's scope is a set of servers, never a machine. The node row's mods door carries
+`mods.manage` for that reason and not `nodes.settings` — an entry point into an editor takes the
+capability that owns the resource the editor writes, so the link and the page it opens read the same
+predicate and a caller refused the page is never offered its door.
+
+**The Access page (`/access`, `access.view` / `access.write`) edits the WEBSITE's role model without a
+code change.** It renders one row per declared capability and one column per role of the bot's role
+model (`bot.yaml`'s `roles:` keys plus the built-in names), Admin's column locked and a `managed_by`
+column beside the roles, and stores its edits as ONE block of `services/webservice.yaml`
+(`DEFAULT.access`, `add` / `remove` / `manager` per capability). The block EXTENDS and NARROWS the
+declaration: `permissions.apply_role_overrides` recomputes every effective pair from
+`BASE_CAPABILITIES` — the pair the code declared — so a second apply lands the same values instead of
+stacking, and the code keeps declaring the shipped behaviour. `Admin` cannot be removed, this page's
+own pair is structural, and a `managed_by` grant exists only where a server can be named
+(`permissions.MANAGER_SCOPE_NEVER`). A save is live on the next request (the gate, the sidebar and the
+tab strips all read `permissions.allows`, which reads the table per call).
+
+**The block is applied to ONE process, at install and on every save.** `install_shell` restores every
+declared capability to its base (`permissions.reset_to_declared_bases`) before the pages declare and
+then applies the stored block after they have — a rebuilt application (`WebService.stop()`/`start()`,
+the master/agent switch) must start from the DECLARATIONS, or its re-declaration of a base meets the
+previous install's applied override and `declare_capability` refuses it. Two consequences worth
+knowing before adding a capability: a capability a plugin declares **after** `install_shell` in the
+same process (a plugin that registers once the bot is ready) keeps its fresh declaration until the
+next install — no hook re-applies the block to a late declaration — and a capability that is applied
+then re-declared is idempotent only because of that restore, never because `declare_capability`
+tolerates a second pair. A `DEFAULT.access` block that is malformed (not a mapping, an entry that is
+not a mapping, an unknown key inside one, a value it cannot read) is applied as far as it can be read
+and each skipped key is logged at ERROR and listed on the page: unknown NAMES were always refused
+loudly, and unknown SHAPES are now refused the same way.
+
+It decides the website ONLY: the bot's commands keep their own decorators (`core/utils/discord.py`
+reads `bot.roles`, never the capability table), so a role narrowed here can still act in Discord.
+
+**Update DCS is ONE control for three words** — update, roll back, switch the branch — because the
+engine has one call for them: `Node.dcs_update(branch=…, version=…)`
+(`plugins/admin/actions.py`'s `update_dcs`). The dialog therefore asks *which branch* and *which
+version* (plus the players' warning time and whether the node announces the result), and the action
+resolves whatever it is not told exactly as `/dcs update` does: no branch is the INSTALLED one, no
+version is the newest build on the chosen branch. It is **offered always** on a node that declares a
+DCS installation — no state gate and no availability check — because a rollback happens precisely when
+nothing is "available", so a check-gated control would withdraw itself at the one moment it is needed.
+The only condition is the configuration fact `needs_dcs` (the node's `DCS:` block in `nodes.yaml`),
+read from the source with no node call.
+
+Its two picks come from two different places, and neither is a page render asking a node: the BRANCH
+list is `/dcs update`'s own rule applied to configuration and the CACHED DCS check
+(`dcs_branch_values` — `release`, plus `testing`/`nightly` only for a node with DCS credentials, all
+three `dcs_server.`-prefixed for a `dcs_server`-family installation), and the VERSION list is read **on
+demand** from `GET /nodes/{node}/dcs/versions?branch=…` (`nodes.dcs_update`'s own capability), which
+answers `{"versions": [...]}` newest first or `{"versions": [], "reason": "<one sentence>"}` — never a
+500 and never an invented entry. The branch query is VALIDATED against the same allow-list the picker
+offers, so a free-text branch is never forwarded to the node, and the node's name travels as ONE
+percent-encoded path segment (`dcs_versions_path`). The dialog is `templates/dcs_update.html`: the
+shared `confirm.html` plus the one script that fills that pick.
 
 The Configuration tab's three writes do **not** follow the server/player row rule, and their own
 roles/scope rules differ from each other (`NODE_ROLES` is `Admin` alone, `declare()` in
@@ -157,6 +229,29 @@ writes follow the server rows' `scope_grants` rule, so a **manager** reaches the
   two glyph buttons (up and down — each absent at the end where a move would be a no-op); there is no
   named *Move up* / *Move down* pair. It is **process-down only** — `UNREGISTERED` / `SHUTDOWN` /
   `SHUTTING_DOWN` — because a reorder made while DCS is up is reverted.
+
+**The Mods writes.** Mods are packages in one of two folders, and which folder is the OWNER, not a
+second page module: `RootFolder` is a node's DCS installation (shared by every instance on that
+machine) and `SavedGames` is one server's. So the node page (`GET /nodes/{node}/mods`, root half) and
+a server page's **Mods tab** (`SavedGames`) render ONE body, and every write lives at
+`POST /mods/{owner}/{target}/{verb}` — `install`, `download`, `change`, `remove` — with the target's
+own dialog at the same path and the write at `<path>/run`.
+
+* **Every one of them confirms**, and none uses `confirm.html`'s `<path>/confirm` shape: the DIALOG is
+  the verb's own page (the package pick, the two download fields, the version list, or the shared
+  removal confirmation), it **mints** the one-shot token for that target and verb, and `<path>/run`
+  **consumes** it — a POST that did not come through the dialog is refused with the console's 403 and
+  nothing reaches the service. That is why all eight rows above read **yes**.
+* **The gate has two halves.** The page states whether a write is possible right now — every server on
+  the node down for `RootFolder`, that one server down for `SavedGames` — read from the console's own
+  in-process state, never by asking a node; a closed gate removes the two doors, every row control and
+  the whole Actions column, and the card's chip reads `read-only`. The SERVICE re-checks it, and a
+  server that starts between the render and the POST is refused there with its own sentence.
+* **The installed list is a database read** (`list_installed_mods`), so the page renders while a node is
+  offline and asks no machine anything. The package FOLDER is a node read and happens only when a
+  dialog is requested, because its path carries variables only the node owning the disk can expand.
+* **The node row's door takes `mods.manage`**, not `nodes.settings`: the node page owns mod management on
+  that machine. The main menu is unchanged — neither surface is a place of its own on it.
 
 **Two things that look like one.** The server row's *Maintenance* / *End maintenance* is the
 MAINTENANCE FLAG (`servers.maintenance`, a persisted switch that keeps a server out of service and is
@@ -342,8 +437,10 @@ reads — does not POST its action: it POSTs to `<path>/confirm`, which renders 
 token** minted for that target. It is not only the power writes: the declarations that carry it are
 the server row's *Restart*, *Shutdown*, *Stop*, *Delete* and its *Chat*/*Popup* pair; the player
 row's *Kick*, *Ban* and its *Chat*/*Popup* pair; the node row's *Restart*, *Shut down*, *Upgrade*
-and *Take servers offline*; and the Missions tab's *Remove* and *Remove missions*. *Bring servers
-online* is the node row's one half that does NOT confirm — ending the maintenance IS the operation.
+and *Take servers offline*; the Missions tab's *Remove* and *Remove missions*; and every mod write,
+whose dialog is the verb's own page instead of `<path>/confirm` (see the Mods writes above). *Bring
+servers online* is the node row's one half that does NOT confirm — ending the maintenance IS the
+operation.
 The table's **Confirms** column and `capabilities` (which registers each confirming control's dialog
 route from the same flag) are the readings of that set, and
 `tests/test_webui_developer_controls.py` keeps the column equal to the declarations — so the column,
@@ -511,3 +608,176 @@ KEY is free text and a rename is not a typed operation; a `type: any` layout cho
 shapes and the server picks the one whose fields were posted. Anything the generator cannot give a
 faithful widget falls back to an editable value flagged **validate on save**, and the schema
 validation on the write is the final word.
+
+---
+
+## The public site
+
+The site surface is the console's separate, unauthenticated face: one route tree per site in the
+`webservice.yaml` `sites:` block, registered under the owner `site` with an EMPTY prefix
+(`site_pages.register`), so the console's mount never moves a site path. Every route below is
+declared `public` (`permissions.PUBLIC`): no session, no capability and no scope — an anonymous
+visitor and a signed-in member read the same page, and the only per-identity difference is the
+shell's chip and the figures of `/me`.
+
+`<site>` in the table is the site's own prefix: `""` for the root site and `/<slug>` for a group
+site, so `/rankings` is the root site's leaderboard page and `/group1/rankings` the same page of
+`group1`. Every path is built by `site_pages.site_url`; no page module spells a site root.
+
+No site path may be one the legacy REST API claims: `plugins/restapi` registers its surface at its
+configured `prefix:`, which defaults to `""` (the site root), and a peer's normal route WINS a shared
+path over a site page's low-priority route. The addresses in `site_pages.NAV_PATHS` therefore stay off
+that surface — the leaderboard page is at `/rankings`, not at the API's `/leaderboard` — and
+`tests/test_webui_site_public_route.py` compares every declared address with the plugin's own route
+list, so a page added on an API path fails instead of answering the API's refusal.
+
+| Page | Route | Capability | Read |
+|------|-------|------------|------|
+| Overview | `GET <site>/` | `public` | `community_totals`, `activity_over_time`, `server_board`, `leaderboard` (playtime / all) and `squadrons` (`services/webservice/site_reads.py`), all bounded to the site's servers |
+| Leaderboard | `GET <site>/rankings` | `public` | `leaderboard` (metric, period, offset, sort column and sort direction from the query string; the column and direction are whitelisted in the read) |
+| Pilot search | `GET <site>/players` | `public` | `pilot_search` (query, offset from the query string) |
+| Pilot profile | `GET <site>/player/{ucid}` | `public` | `pilot_profile` for one UCID |
+| My statistics | `GET <site>/me` | `public` | `my_statistics` for the request's own identity; anonymous visitors get the sign-in control, never a redirect |
+
+Two asset routes exist beside the pages: `GET <site>/theme.css` serves the site's palette sheet
+(the `theme.preset` sheet, or the `theme.expert` block wrapped in one `:root` rule) and
+`GET <site>/logo.png` serves `branding.logo` (a raster suffix only). Both are `public`; the logo
+route reads one file from the config directory per request.
+
+**There is NO write route on this surface.** The site reads; a visitor cannot post, change or
+store anything through it, and the only interactive element that leaves the page is the sign-in
+control, which uses the console's existing auth routes. A write belongs to the console, behind its
+capability and scope gates.
+
+The nav is declared once in `site_pages` (`NAV_PATHS`, `NAV_LABELS`, `SERVED_NAV_IDS`): a site's
+`nav:` list selects and orders the ids, and an id without a served page renders no entry.
+
+## The Statistics page (GET /statistics)
+
+The console's period view: is the community growing, do new players stay, when do they fly, which
+missions, theatres and modules do they pick. The period chips are the bot's own `PeriodFilter`
+vocabulary (all time, today, yesterday, 24 hours, 7/30/90 days, 6 months, 12 months), so the page
+can never offer a period the read does not understand.
+
+**The player series follows the chosen period.** `unique_users` takes the filter's WHERE clause — the
+same clause every other read takes — and builds its date series from its own rows, so `today` and
+`yesterday` are the filter's calendar days rather than an interval guessed at the page. Past
+`UNIQUE_USERS_WEEKLY_AFTER_DAYS` (90 days, and for `all`) the read buckets by WEEK and returns
+`unique_users_grain`, which is what lets the card change from "Players per day" to "Players per
+week" instead of drawing a year of bars.
+
+**The player card is a COLUMN chart, and the height is the count.** `daily_chart` draws one column
+per bucket, stacked returning (on the axis) under new, all against ONE y axis — the axis tops out at
+the first 1/2/5 × 10ⁿ multiple above the peak, so the busiest bucket is the tallest bar and the
+gridlines are numbers a reader divides in the head. The bucket's total is printed ABOVE its
+column, so the card is readable without measuring against the axis, and a bucket with no session
+draws a zero column rather than a gap: for a count, "nobody flew" is data. The axis THINS rather
+than turns (`_label_plan`, `DATE_PITCH`, `COUNT_PITCH`): it prints as many `MM-DD` dates as the
+width holds (a dozen or so) and a count over as many bars as fit, so a 30-day series labels every
+second date but keeps a number over every bar, and a 90-day series prints 15 dates and 30 numbers.
+Every bar keeps both figures in its tooltip, and no label is ever drawn at an angle. The geometry is
+computed here and printed by `_statistics_body.html`; no charting library ships.
+
+| Page | Route | Capability | Roles | Read |
+|------|-------|------------|-------|------|
+| Statistics | `GET /statistics` | `statistics.view` | `Admin` | `get_server_statistics` (action, `plugins/monitoring/actions.py`) |
+
+**One read, one definition of every number.** The page renders the same `get_server_statistics`
+action the Discord `/serverstats` report draws from, so the console and the report cannot disagree
+about a figure. The page opens no query of its own; the two figures it DERIVES (sessions per active
+player per week, the per-week retention share) plus the two formatting helpers are computed once, in
+`pages/statistics.py`, from the payload's own numbers.
+
+**Admin-only, and no scope of its own.** `/serverstats` is Admin-only and installation-wide, so the
+page is too: the action applies no scope, and a filter added at the page would still have counted
+rows the caller may not see. A non-Admin door has to be scoped where the server NAME is resolved,
+never by filtering this payload.
+
+**The non-Admin door is the server page's Statistics tab** (`GET /fleet/<server>?tab=statistics`).
+It renders the same body for ONE server, and the name it passes is the one the server page already
+resolved through the scoped source — so the tab adds no capability and no scope rule: whoever may
+open the page may read the figures of the server they opened, and it never reads installation-wide.
+The body is shared (`pages/statistics.statistics_body`, `templates/_statistics_body.html`), so a
+card added for the page appears in the tab with no second edit. The per-server comparison table and
+the scope selector stay on the page: one compares servers, the other picks one, and the tab is
+already a single server.
+
+**Distinct is not summable.** The KPI's unique-player figure is a `COUNT(DISTINCT …)` over the whole
+scope; the per-server table counts each player once PER SERVER. The page states the difference in
+one sentence beside the table and the KPI's qualifier carries the word "distinct".
+
+**What it deliberately does not carry.** No live figure (players online, a mission's runtime) and no
+node fact (queue depth, pool health): those answer "what is happening now" and belong to the
+dashboard and its Load tab. The page's test pins their absence.
+
+**Window.** The period chips (`All time` / `Today` / `Yesterday` / `24 hours` / `7 days` /
+`30 days` / `90 days` / `6 months` / `12 months`) are the bot's own `PeriodFilter` names (`all` /
+`today` / `yesterday` / `day` / `week` / `month` / `quarter` / `halfyear` / `year`), so the page
+offers exactly the periods the read understands. The three windowed cards (retention, sessions per
+player, hour-of-day profile) read a fixed twelve-week window (`window_days=84`), which each card
+states in its own meta line — a short period changes the period reads, not that window.
+
+**Controls are links.** Period and scope are GET parameters (`?period=`, `?server=`), so the page
+works with JavaScript off. A CSV export is not part of this page yet.
+
+## The dashboard's Load tab (`/?tab=load`)
+
+The console's operational view: how the servers are running RIGHT NOW — a fixed-width live window,
+node health, and the technical series. Nothing period-based lives here; that is `/statistics`.
+
+| Tab | Route | Capability | Read |
+|-----|-------|------------|------|
+| Load | `GET /?tab=load` | `dashboard.view` (the console's own) | `get_load_statistics` (action, `plugins/monitoring/actions.py`) |
+
+**Load is the one tab that is not a table.** The strip's other keys are read-model table names
+(`pages/dashboard.TABS` is `TABLE_COLUMNS` plus `LOAD_TAB`). Load has no table, so `tab_capability`
+returns the console's own capability for it, `_tab_count` answers `None` (the template omits the
+badge rather than printing `0`) and `_tab_problem` stays empty (no dot). `_state.html` branches on
+the key: `_load_panel.html` instead of `_table.html`. No table spec is faked.
+
+**One row per server per minute.** `services/monitoring/service.py` writes `serverstats` once a
+minute per server, so a node's series is the SUM of its servers' rows and the chart can move no
+faster than the write. The window is fixed width with its right edge on "now": 1 h = 60 × 1 min,
+6 h = 72 × 5 min, 24 h = 288 × 5 min, 7 d = 168 × 1 h, 30 d = 720 × 1 h. The buckets are
+`date_trunc`/`AVG`/`SUM` in SQL (`plugins/monitoring/stats_read.py:load_series`), never in the
+browser, and a bucket with no rows answers `None` — a gap in the line, never a zero.
+
+**The 60 s tick is the only cadence.** `pages/dashboard.LOAD_REFRESH_SECONDS` (60) governs a
+server-side cache of the payload, keyed by (scale, node, server). The live stream re-renders every
+couple of seconds while the tab is open; inside one minute every render gets the SAME payload, so the
+fragment hashes the same and `pages/live.py` sends nothing. A new sample is one frame per minute.
+
+**The chart is one more swap target.** `pages/live.py:LOAD_TARGET` (`load-panel`) carries
+`_load_panel.html`, rendered only while the Load tab is in force, by both the SSE stream and the
+polling fallback. No charting library ships: the geometry is computed in `pages/dashboard.py` and the
+template prints it. Ids inside the SVG are `zlib.crc32`-derived (`_svg_id`) — `hash()` is salted per
+process, and a gradient id that changed between two renders would resolve to nothing.
+
+**A hidden tab keeps no stream.** `static/shell.js` closes the EventSource on `visibilitychange`
+(hidden) and reopens it when the tab is shown, so a console left in the background does not hold one
+of the browser's six connections per origin. A page restored from the back/forward cache reconnects
+through `pageshow` and receives a full snapshot — which is the whole window again, read fresh. If
+the stream is unavailable the script falls back to polling `/api/dashboard/fragments`, and says so
+in words.
+
+**Scope is bounded on the ROUTE, not in the action.** The selector offers Cluster / Node / Server
+from the caller's own scoped source; a named node or server outside it is refused with the console's
+403. A RESTRICTED caller is offered SERVER scope only: a node's series sums every server on that
+node, so node (or cluster) scope would read rows they may not see. The scope TOKEN is cleaned with
+`MAX_SCOPE_TOKEN` and not with the sort-column cap: a server name is longer than a sort key, and a
+truncated name matches nothing — which reads to the reader as a 403 for a server they just picked.
+
+**Picking a card SWAPS the chart.** The big chart draws one pair of series; the four cards draw the
+other four, so a card whose graph is currently big shows the default (players/CPU) pair instead
+(`LOAD_MINI_SLOTS`, `load_minis`). Every graph is on the page exactly once, and the pair that leaves
+the big chart lands in the card just picked, so nothing has to be reloaded to get it back.
+
+**No monitoring plugin, no tab.** The tab's read (`get_load_statistics`) ships with the optional
+monitoring plugin, so `allowed_tabs` drops the tab when that action is not registered — the strip
+and the render read the same answer, and `?tab=load` falls back to the default tab rather than
+drawing a panel nothing can feed (`load_tab_available`).
+
+**The panel's own state rides on the stream URL.** The stream and the polling fallback ask for their
+fragments in a SEPARATE request, so `load_context` stores the RESOLVED scale, scope and graph on the
+request and `live.page_context` puts them on the stream URL. A URL without them re-renders the panel
+at the defaults one tick later, which makes every control look dead.

@@ -58,6 +58,7 @@ __all__ = [
     "set_password",
     "get_password",
     "delete_password",
+    "resolve_within",
     "sanitize_filename",
     "get_win32_error_message",
     "CloudRotatingFileHandler",
@@ -237,12 +238,32 @@ def create_secret_dir(config_dir='config'):
 
             # noinspection PyUnresolvedReferences
             ctypes.windll.kernel32.SetFileAttributesW(path, 2)
+    if sys.platform != 'win32':
+        # owner-only: only the account that runs the bot may enter or list the store. Applied to an
+        # existing directory too, so one an older build or a permissive umask left wide is narrowed.
+        with suppress(OSError):
+            os.chmod(path, 0o700)
 
 
 def set_password(key: str, password: str, config_dir='config'):
-    create_secret_dir()
-    with open(os.path.join(config_dir, '.secret', f'{key}.pkl'), mode='wb') as f:
-        pickle.dump(password, f)
+    create_secret_dir(config_dir)
+    path = os.path.join(config_dir, '.secret', f'{key}.pkl')
+    if sys.platform == 'win32':
+        with open(path, mode='wb') as f:
+            pickle.dump(password, f)
+        return
+    # 0600 from the first byte: the file is created owner-only (never a moment at a wider mode),
+    # and an existing file keeps its own mode through open(), so it is narrowed before the write.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with suppress(OSError):
+            os.fchmod(fd, 0o600)
+        with os.fdopen(fd, mode='wb') as f:
+            fd = -1
+            pickle.dump(password, f)
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
 
 def get_password(key: str, config_dir='config') -> str:
@@ -258,6 +279,37 @@ def delete_password(key: str, config_dir='config'):
         os.remove(os.path.join(config_dir, '.secret', f'{key}.pkl'))
     except FileNotFoundError:
         raise ValueError(key)
+
+
+def resolve_within(root: str | Path, path: str | Path) -> str | None:
+    """``path``'s REAL path when it sits inside ``root``'s real path, or ``None``.
+
+    The one containment rule of this codebase, for a READ and for a WRITE alike: both ends are
+    resolved (``realpath`` also resolves a symbolic link and a Windows junction), and the answer is
+    decided on the resolved pair — never on the joined string. A lexical ``abspath`` + ``commonpath``
+    pair, or an ``isdir`` on the parent, follows a link out of the tree while claiming the path is
+    inside it. *path* need not exist: a resolved parent plus a leaf is enough, which is what a write
+    has.
+
+    ``None`` means "not a path inside *root*": it leaves the tree, it IS the root itself, or the two
+    are on different drives (no common path exists at all). The value returned is the RESOLVED path,
+    so a caller that hands it to a writer cannot follow a different route than the one checked.
+    """
+    try:
+        base = os.path.realpath(os.path.expandvars(str(root)))
+        candidate = os.path.realpath(os.path.expandvars(str(path)))
+    except (OSError, ValueError):
+        return None
+    folded_base = os.path.normcase(base)
+    folded = os.path.normcase(candidate)
+    if folded == folded_base:
+        return None
+    try:
+        if os.path.commonpath([folded, folded_base]) != folded_base:
+            return None
+    except ValueError:                      # different drives: there is no common path at all
+        return None
+    return candidate
 
 
 def sanitize_filename(
@@ -296,20 +348,15 @@ def sanitize_filename(
     base = Path(base_directory).resolve(strict=False)
     user_path = Path(filename)
 
-    # 2. Resolve the combined path (collapse .., symlinks, etc.)
-    resolved = (
-        user_path.resolve(strict=False)
-        if user_path.is_absolute()
-        else (base / user_path).resolve(strict=False)
-    )
+    # 2. Containment is decided on the RESOLVED pair, by the ONE shared rule: a joined path, a
+    #    symbolic link or a junction that leaves *base* is refused whatever the spelling looked like
+    joined = user_path if user_path.is_absolute() else base / user_path
+    contained = resolve_within(base, joined)
+    if contained is None:
+        raise ValueError(f"Attempt to escape base directory: {filename!r}")
+    resolved = Path(contained)
 
-    # 3. Ensure containment – this is the heart of the check
-    if not resolved.is_relative_to(base):
-        raise ValueError(
-            f"Attempt to escape base directory: {filename!r} → {resolved}"
-        )
-
-    # 4. Strip OS‑specific illegal characters
+    # 3. Strip OS‑specific illegal characters
     #    Windows:  < > : " / \ | ? *   and NUL (chr(0))
     #    Linux:    /   and NUL (chr(0))
     illegal_chars = (r'/', r'<>:"/\|?*')[sys.platform.startswith("win")]
@@ -321,7 +368,7 @@ def sanitize_filename(
 
     resolved = resolved.with_name(cleaned)
 
-    # 5. Return the requested representation
+    # 4. Return the requested representation
     return resolved if return_absolute else resolved.relative_to(base)
 
 
