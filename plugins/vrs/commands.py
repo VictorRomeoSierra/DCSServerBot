@@ -12,6 +12,35 @@ from .listener import VrsEventListener
 
 WARN_TIMES = (60, 30, 10)
 
+# reset_campaign handshake. VRS.persistence.armCampaignReset sets this DCS user
+# flag only after the reset is saved to VRSPflags.lua; the command polls it
+# (gamemaster getFlag) before touching the DCS process. do_script is
+# fire-and-forget, and a shutdown straight after it lost the arm on 2026-11-15.
+ARMED_FLAG = "VRS_CAMPAIGN_RESET_ARMED"
+ARM_CONFIRM_TIMEOUT_S = 20
+# Graceful-shutdown budget. The node's own graceful path can run ~240s
+# (180s exit wait + 30s + 30s terminate), longer than the master's 180s
+# send_to_node_sync timeout in ServerProxy.shutdown -- the collision that
+# stranded Test on 2026-07-23. Cap it well below 180s, then force-kill.
+GRACEFUL_SHUTDOWN_TIMEOUT_S = 120
+
+
+async def _confirm_reset_armed(server: Server) -> bool:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + ARM_CONFIRM_TIMEOUT_S
+    while loop.time() < deadline:
+        try:
+            data = await server.send_to_dcs_sync({"command": "getFlag", "flag": ARMED_FLAG}, timeout=5)
+        except (TimeoutError, asyncio.TimeoutError):
+            data = None
+        try:
+            if data and float(data.get('value') or 0) >= 1:
+                return True
+        except (TypeError, ValueError):
+            pass
+        await asyncio.sleep(1)
+    return False
+
 # VRS .miz naming convention: VRS_<Theatre>_<Version>.miz
 # Example: "VRS_Syria_0.48.6.miz" -> theatre "Syria"
 # Used by /vrs reset_campaign to flag a theatre change in the confirm
@@ -184,8 +213,9 @@ class Vrs(Plugin[VrsEventListener]):
             await server.sendPopupMessage(Coalition.ALL, popup)
 
         ack = (
-            f"Campaign reset armed on **{server.name}**. "
-            f"Server will restart in {lead_time} seconds."
+            f"Campaign reset scheduled on **{server.name}**. Players get a "
+            f"{lead_time}-second warning; the server restarts once the mission "
+            f"confirms the reset is saved."
         )
         if reason_str:
             ack += f"\nReason: {reason_str}"
@@ -197,6 +227,21 @@ class Vrs(Plugin[VrsEventListener]):
 
         script = f"VRS.persistence.armCampaignReset({_lua_quote(reason_str)})"
         await server.send_to_dcs({"command": "do_script", "script": script})
+
+        # Nothing below runs until the mission confirms the reset is saved.
+        # Unconfirmed = abort with the server untouched, never a restart that
+        # silently keeps the old campaign.
+        if not await _confirm_reset_armed(server):
+            await server.sendPopupMessage(Coalition.ALL, "Campaign reset cancelled - the server stays up.")
+            await interaction.followup.send(
+                f"Campaign reset ABORTED on **{server.name}**: the mission did not confirm the reset "
+                f"within {ARM_CONFIRM_TIMEOUT_S}s (flag `{ARMED_FLAG}`). The server was left running "
+                f"and nothing was reset.",
+                ephemeral=utils.get_ephemeral(interaction)
+            )
+            await self.bot.audit(f"reset campaign ABORTED on {server.name} (arm not confirmed)",
+                                 user=interaction.user, server=server)
+            return
 
         # If a different mission was selected, set the start index BEFORE
         # the process cycle so startup boots into the new .miz.
@@ -210,16 +255,17 @@ class Vrs(Plugin[VrsEventListener]):
         # so any pushed mission-Lua hotfixes plus updated bot plugin glue take
         # effect on the post-reset boot. Adds ~30s of downtime vs mission reload.
         #
-        # force=True skips the node-side graceful-exit wait (up to 180s). On a
-        # busy server DCS ignores the graceful shutdown, and that node-side wait
-        # collides with the master-side 180s RPC timeout -- the command aborts
-        # mid-cycle BEFORE startup and strands the server down with the reset
-        # armed. We're wiping the campaign and restarting anyway, so a graceful
-        # in-mission save is moot. The finally guarantees startup still runs even
-        # if shutdown reports an error, so a shutdown hiccup can never leave the
-        # server down.
+        # Graceful first, bounded by GRACEFUL_SHUTDOWN_TIMEOUT_S so the master's
+        # 180s RPC timeout can't fire mid-cycle (the 2026-07-23 strand), then
+        # force-kill. The arm is already confirmed on disk, so the fallback can
+        # no longer lose it. The finally guarantees startup still runs.
         try:
-            await server.shutdown(force=True)
+            try:
+                await asyncio.wait_for(server.shutdown(), timeout=GRACEFUL_SHUTDOWN_TIMEOUT_S)
+            except (TimeoutError, asyncio.TimeoutError):
+                self.log.warning(f"reset_campaign: graceful shutdown of {server.name} exceeded "
+                                 f"{GRACEFUL_SHUTDOWN_TIMEOUT_S}s; forcing")
+                await server.shutdown(force=True)
         finally:
             await server.startup(modify_mission=True)
 
